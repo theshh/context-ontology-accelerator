@@ -22,7 +22,7 @@ export class NamespacesPage {
   async gotoList(): Promise<void> {
     await this.page.goto("/namespaces");
     await expect(
-      this.page.getByRole("heading", { name: "Namespaces", level: 1 }),
+      this.page.getByRole("heading", { name: "Context graphs", level: 1 }),
     ).toBeVisible();
   }
 
@@ -38,20 +38,25 @@ export class NamespacesPage {
     // Track up-front so teardown can remove it even if creation succeeds
     // server-side but this method fails before confirming the row.
     this.created.add(displayName);
-    await this.page.getByRole("button", { name: "Create namespace" }).click();
+    await this.page
+      .getByRole("button", { name: "Create context graph" })
+      .click();
     await expect(
-      this.page.getByRole("heading", { name: "Create namespace", level: 1 }),
+      this.page.getByRole("heading", {
+        name: "Create context graph",
+        level: 1,
+      }),
     ).toBeVisible();
 
     await this.page.getByPlaceholder("e.g., Insurance Prod").fill(displayName);
     // The form's submit button shares the "Create namespace" label.
     await this.page
-      .getByRole("button", { name: "Create namespace" })
+      .getByRole("button", { name: "Create context graph" })
       .last()
       .click();
 
     await expect(
-      this.page.getByRole("heading", { name: "Namespaces", level: 1 }),
+      this.page.getByRole("heading", { name: "Context graphs", level: 1 }),
     ).toBeVisible({ timeout: 60_000 });
     // Filter to the new name so it's on the first page (default size 20).
     await this.filterTo(displayName);

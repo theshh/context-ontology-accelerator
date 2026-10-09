@@ -40,7 +40,7 @@ describe("CreateNamespace", () => {
   it("renders the form header", () => {
     render(<CreateNamespace />, { wrapper });
     expect(
-      screen.getByRole("heading", { name: /create namespace/i }),
+      screen.getByRole("heading", { name: /create context graph/i }),
     ).toBeInTheDocument();
   });
 
@@ -53,7 +53,9 @@ describe("CreateNamespace", () => {
   it("shows validation error for empty name on submit", async () => {
     const user = userEvent.setup();
     render(<CreateNamespace />, { wrapper });
-    await user.click(screen.getByRole("button", { name: /create namespace/i }));
+    await user.click(
+      screen.getByRole("button", { name: /create context graph/i }),
+    );
     expect(screen.getByText("Namespace name is required.")).toBeInTheDocument();
   });
 
@@ -86,7 +88,9 @@ describe("CreateNamespace", () => {
     render(<CreateNamespace />, { wrapper });
     const input = screen.getByPlaceholderText("e.g., Insurance Prod");
     await user.type(input, "123 Test");
-    await user.click(screen.getByRole("button", { name: /create namespace/i }));
+    await user.click(
+      screen.getByRole("button", { name: /create context graph/i }),
+    );
     expect(
       screen.getByText(/must start with a lowercase letter/),
     ).toBeInTheDocument();

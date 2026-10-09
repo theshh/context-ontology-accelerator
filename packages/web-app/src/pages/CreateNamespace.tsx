@@ -73,16 +73,16 @@ export const CreateNamespace: React.FC = () => {
             Cancel
           </Button>
           <Button variant="primary" loading={isPending} onClick={handleSubmit}>
-            Create namespace
+            Create context graph
           </Button>
         </SpaceBetween>
       }
       header={
         <Header
           variant="h1"
-          description="Create a new namespace to partition your semantic graph into an isolated scope."
+          description="Create a new context graph to partition your semantic graph into an isolated scope."
         >
-          Create namespace
+          Create context graph
         </Header>
       }
       errorText={error ? extractErrorMessage(error) : undefined}

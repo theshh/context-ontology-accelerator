@@ -1,11 +1,13 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useContext, useEffect, useMemo, useState } from "react";
 import { Routes, Route, useNavigate, useLocation } from "react-router-dom";
 import AppLayout from "@cloudscape-design/components/app-layout-toolbar";
 import Flashbar from "@cloudscape-design/components/flashbar";
-import SideNavigation from "@cloudscape-design/components/side-navigation";
+import SideNavigation, {
+  type SideNavigationProps,
+} from "@cloudscape-design/components/side-navigation";
 import TopNavigation, {
   type TopNavigationProps,
 } from "@cloudscape-design/components/top-navigation";
@@ -20,7 +22,13 @@ import { NamespaceList } from "./pages/NamespaceList";
 import { CreateNamespace } from "./pages/CreateNamespace";
 import { HomePage } from "./pages/HomePage";
 import { GetNamespace } from "./pages/GetNamespace";
-import { NamespacePermissions } from "./pages/NamespacePermissions";
+import { ContextGraphSettings } from "./pages/ContextGraphSettings";
+import { OntologyList } from "./pages/OntologyList";
+import {
+  ContextGraphShell,
+  resolveContextGraphTab,
+} from "@components/ContextGraphShell";
+import { RuntimeConfigContext } from "@components/RuntimeContext";
 import { TableDetail } from "./pages/TableDetail";
 import { ProfilePage } from "./pages/ProfilePage";
 import { Playground } from "./pages/Playground";
@@ -109,6 +117,7 @@ function AppShell() {
   const navigate = useNavigate();
   const location = useLocation();
   const { user, logout } = useUser();
+  const runtimeConfig = useContext(RuntimeConfigContext);
   const [navOpen, setNavOpen] = useState(true);
   const [darkMode, setDarkMode] = useState(initialDark);
   const [densityCompact, setDensityCompact] = useState(initialCompact);
@@ -150,10 +159,10 @@ function AppShell() {
   }>({ position: "side" });
   const [namespaceWarning, setNamespaceWarning] = useState(false);
 
-  // The namespace list and create routes have no "current namespace" and
-  // are deliberately rendered without the namespace-scoped side-nav. Mirror
-  // that in the top nav by hiding the namespace switcher utility there.
-  const isNamespaceListRoute = location.pathname === "/namespaces/create";
+  // Context graphs are opened from the list, so the top-bar switcher is only
+  // shown on the Playground, which has no graph in its URL and still needs a
+  // way to choose which graph to query.
+  const showGraphSwitcher = location.pathname.startsWith("/playground");
 
   useEffect(() => {
     window.localStorage.setItem(DARK_MODE_KEY, darkMode ? "1" : "0");
@@ -166,83 +175,120 @@ function AppShell() {
   }, [densityCompact]);
 
   const nsPath = namespaceId ? `/namespaces/${namespaceId}` : "#";
-  const namespaceScopedNavItems = [
+
+  // Console deep links for the AWS services COA runs on. Region comes from
+  // runtime-config.json; without it the console opens the user's last region.
+  const region = runtimeConfig?.region;
+  const consoleUrl = (svc: string, hash = "") =>
+    `https://console.aws.amazon.com/${svc}/home${region ? `?region=${region}` : ""}${hash}`;
+
+  const sideNavItems: SideNavigationProps.Item[] = [
+    { type: "link", text: "Dashboard", href: "/" },
+    { type: "link", text: "Context graphs", href: "/namespaces" },
+    { type: "link", text: "Connections", href: `${nsPath}/sources` },
+    { type: "link", text: "Ontology", href: `${nsPath}/ontology` },
+    { type: "link", text: "Playground", href: "/playground" },
+    { type: "divider" },
     {
-      type: "section" as const,
-      text: "Scan",
+      type: "section",
+      text: "Administration",
       items: [
-        {
-          type: "link" as const,
-          text: "Sources",
-          href: `${nsPath}/sources`,
-        },
+        { type: "link", text: "Identity", href: "/identity" },
+        { type: "link", text: "System health", href: "/system-health" },
       ],
     },
+    { type: "divider" },
     {
-      type: "section" as const,
-      text: "Ontology",
-      items: [
-        {
-          type: "link" as const,
-          text: "Induction",
-          href: `${nsPath}/ontology`,
-        },
-        {
-          type: "link" as const,
-          text: "Explorer",
-          href: `${nsPath}/ontology/graph`,
-        },
-        {
-          type: "link" as const,
-          text: "Metrics",
-          href: `${nsPath}/metrics`,
-        },
-      ],
+      type: "link",
+      text: "AWS Glue Data Catalog",
+      href: consoleUrl("glue", "#/v2/data-catalog/databases"),
+      external: true,
+    },
+    {
+      type: "link",
+      text: "Amazon Bedrock",
+      href: consoleUrl("bedrock"),
+      external: true,
+    },
+    {
+      type: "link",
+      text: "Amazon Neptune",
+      href: consoleUrl("neptune"),
+      external: true,
     },
   ];
 
-  // Flat [section, label, href] index of every left-nav link, used to derive a
-  // default breadcrumb (COA › Section › Page) for pages that don't publish
-  // their own richer trail via useBreadcrumbs.
+  // Flat [section, label, href] index of the in-app left-nav links, used to
+  // derive a default breadcrumb (COA › Section › Page) for pages that don't
+  // publish their own richer trail via useBreadcrumbs.
   const navIndex: Array<{
     section: string | null;
     label: string;
     href: string;
   }> = [
-    { section: null, label: "Home", href: "/" },
-    ...namespaceScopedNavItems.flatMap((s) =>
-      s.items.map((i) => ({ section: s.text, label: i.text, href: i.href })),
-    ),
-    {
-      section: "Serve",
-      label: "Playground",
-      href: "/playground",
-    },
-    { section: "Administration", label: "Namespaces", href: "/namespaces" },
+    { section: null, label: "Dashboard", href: "/" },
+    { section: null, label: "Context graphs", href: "/namespaces" },
+    { section: null, label: "Playground", href: "/playground" },
     { section: "Administration", label: "Identity", href: "/identity" },
     {
       section: "Administration",
-      label: "System Health",
+      label: "System health",
       href: "/system-health",
     },
   ];
 
+  // Pages inside one context graph get COA › Context graphs › <graph> › <tab>.
+  const graphMatch = location.pathname.match(/^\/namespaces\/([^/]+)/);
+  const graphId =
+    graphMatch && graphMatch[1] !== "create" ? graphMatch[1] : undefined;
+  const graph = graphId
+    ? namespaces.find((n) => n.namespaceId === graphId)
+    : undefined;
+  const graphTab = graphId
+    ? resolveContextGraphTab(
+        location.pathname.slice(`/namespaces/${graphId}`.length),
+      )
+    : undefined;
+  const GRAPH_TAB_LABELS = {
+    overview: undefined,
+    curation: "Curation",
+    explorer: "Graph explorer",
+    settings: "Settings",
+  } as const;
+
   // Longest-prefix match of the current path against known nav hrefs, so detail
-  // routes (e.g. /namespaces/:id/metrics/:id) still resolve to their nav page.
+  // routes still resolve to their nav page.
   const matchedNav = navIndex
-    .filter((n) => n.href !== "#" && location.pathname.startsWith(n.href))
+    .filter((n) =>
+      n.href === "/"
+        ? location.pathname === "/"
+        : location.pathname.startsWith(n.href),
+    )
     .sort((a, b) => b.href.length - a.href.length)[0];
 
-  const routeDefaultCrumbs: BreadcrumbItem[] = matchedNav
-    ? [
-        { text: "COA", onClick: () => navigate("/") },
-        ...(matchedNav.section ? [{ text: matchedNav.section }] : []),
-        {
-          text: matchedNav.label,
-          onClick: () => navigate(matchedNav.href),
-        },
-      ]
-    : [{ text: "COA", onClick: () => navigate("/") }];
+  const routeDefaultCrumbs: BreadcrumbItem[] =
+    graphId && graphTab
+      ? [
+          { text: "COA", onClick: () => navigate("/") },
+          { text: "Context graphs", onClick: () => navigate("/namespaces") },
+          {
+            text: graph?.displayName ?? graph?.name ?? graphId,
+            onClick: () => navigate(`/namespaces/${graphId}`),
+          },
+          ...(GRAPH_TAB_LABELS[graphTab.tab]
+            ? [{ text: GRAPH_TAB_LABELS[graphTab.tab] as string }]
+            : []),
+        ]
+      : matchedNav
+        ? [
+            { text: "COA", onClick: () => navigate("/") },
+            ...(matchedNav.section ? [{ text: matchedNav.section }] : []),
+            {
+              text: matchedNav.label,
+              onClick: () => navigate(matchedNav.href),
+            },
+          ]
+        : [{ text: "COA", onClick: () => navigate("/") }];
 
   // A page's own published trail wins; otherwise fall back to the route default.
   const effectiveCrumbs =
@@ -260,14 +306,14 @@ function AppShell() {
       // they are viewing a namespace nested inside another. Hide it
       // there to match the side-nav, which is also empty on those
       // routes.
-      ...(isNamespaceListRoute
+      ...(!showGraphSwitcher
         ? []
         : [
             {
               type: "menu-dropdown" as const,
-              text: `Namespace: ${isLoading ? "Loading…" : (current?.displayName ?? current?.name ?? "—")}`,
+              text: `Context graph: ${isLoading ? "Loading…" : (current?.displayName ?? current?.name ?? "—")}`,
               ariaLabel: "Namespace switcher",
-              title: "Namespace",
+              title: "Context graph",
               onItemClick: ({ detail }: { detail: { id: string } }) =>
                 setNamespace(detail.id),
               items:
@@ -287,7 +333,7 @@ function AppShell() {
                   : [
                       {
                         id: "none",
-                        text: "No namespaces — create one first",
+                        text: "No context graphs — create one first",
                         disabled: true,
                       },
                     ],
@@ -363,7 +409,7 @@ function AppShell() {
       },
     ],
     [
-      isNamespaceListRoute,
+      showGraphSwitcher,
       isLoading,
       current?.displayName,
       current?.name,
@@ -417,7 +463,7 @@ function AppShell() {
               items={[
                 {
                   type: "warning",
-                  content: "Please select or create a namespace first.",
+                  content: "Please open or create a context graph first.",
                   dismissible: true,
                   onDismiss: () => setNamespaceWarning(false),
                   id: "ns-warning",
@@ -458,36 +504,10 @@ function AppShell() {
           <SideNavigation
             activeHref={location.pathname}
             header={{ href: "/", text: "Context Ontology Accelerator" }}
-            items={[
-              { type: "link", text: "Home", href: "/" },
-              ...namespaceScopedNavItems,
-              {
-                type: "section",
-                text: "Serve",
-                items: [
-                  {
-                    type: "link",
-                    text: "Playground",
-                    href: "/playground",
-                  },
-                ],
-              },
-              { type: "divider" },
-              {
-                type: "section",
-                text: "Administration",
-                items: [
-                  { type: "link", text: "Namespaces", href: "/namespaces" },
-                  { type: "link", text: "Identity", href: "/identity" },
-                  {
-                    type: "link",
-                    text: "System Health",
-                    href: "/system-health",
-                  },
-                ],
-              },
-            ]}
+            items={sideNavItems}
             onFollow={(e) => {
+              // Console links open in a new tab via the browser default.
+              if (e.detail.external) return;
               e.preventDefault();
               if (e.detail.href.startsWith("#")) {
                 setNamespaceWarning(true);
@@ -521,64 +541,41 @@ function AppShell() {
               <Route path="/namespaces/create" element={<CreateNamespace />} />
               <Route
                 path="/namespaces/:namespaceId"
-                element={<GetNamespace />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/permissions"
-                element={<NamespacePermissions />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/sources"
-                element={<SourceList />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/sources/connect"
-                element={<ConnectSource />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/sources/:sourceId"
-                element={<SourceDetail />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/sources/:dataSourceId/tables/:tableId"
-                element={<TableDetail />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/ontology"
-                element={<OntologyPage />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/ontology/proposals/:proposalId"
-                element={<ProposalDetailPage />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/ontology/graph"
-                element={<GraphSearchPage />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/ontology/induced"
-                element={<InducedOntologyDetailPage />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/ontology/induced/class"
-                element={<OntologyClassDetailPage />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/metrics"
-                element={<MetricList />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/metrics/create"
-                element={<MetricForm />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/metrics/:metricName"
-                element={<MetricDetail />}
-              />
-              <Route
-                path="/namespaces/:namespaceId/metrics/:metricName/edit"
-                element={<MetricForm />}
-              />
+                element={<ContextGraphShell />}
+              >
+                <Route index element={<GetNamespace />} />
+                <Route path="settings" element={<ContextGraphSettings />} />
+                <Route path="permissions" element={<ContextGraphSettings />} />
+                <Route path="sources" element={<SourceList />} />
+                <Route path="sources/connect" element={<ConnectSource />} />
+                <Route path="sources/:sourceId" element={<SourceDetail />} />
+                <Route
+                  path="sources/:dataSourceId/tables/:tableId"
+                  element={<TableDetail />}
+                />
+                <Route path="ontology" element={<OntologyPage />} />
+                <Route
+                  path="ontology/proposals/:proposalId"
+                  element={<ProposalDetailPage />}
+                />
+                <Route path="ontology/graph" element={<GraphSearchPage />} />
+                <Route
+                  path="ontology/induced"
+                  element={<InducedOntologyDetailPage />}
+                />
+                <Route
+                  path="ontology/induced/class"
+                  element={<OntologyClassDetailPage />}
+                />
+                <Route path="ontologies" element={<OntologyList />} />
+                <Route path="metrics" element={<MetricList />} />
+                <Route path="metrics/create" element={<MetricForm />} />
+                <Route path="metrics/:metricName" element={<MetricDetail />} />
+                <Route
+                  path="metrics/:metricName/edit"
+                  element={<MetricForm />}
+                />
+              </Route>
               <Route path="/identity" element={<IdentityPage />} />
               <Route path="/system-health" element={<SystemHealthPage />} />
               <Route path="/profile" element={<ProfilePage />} />

@@ -208,15 +208,16 @@ export const NamespaceList: React.FC = () => {
       empty: (
         <Box textAlign="center" padding="xxl">
           <SpaceBetween size="m">
-            <b>No namespaces</b>
+            <b>No context graphs</b>
             <Box variant="p" color="text-body-secondary">
-              Create your first namespace to start building a semantic context.
+              Create your first context graph to start building a semantic
+              context.
             </Box>
             <Button
               variant="primary"
               onClick={() => navigate("/namespaces/create")}
             >
-              Create namespace
+              Create context graph
             </Button>
           </SpaceBetween>
         </Box>
@@ -326,7 +327,7 @@ export const NamespaceList: React.FC = () => {
           <Header
             variant="h1"
             counter={getHeaderCounterText(visibleItems.length, selected.length)}
-            description="Namespaces partition the semantic graph into isolated scopes. Each namespace has its own data sources, ontology, and access policies."
+            description="Context graphs partition the semantic graph into isolated scopes. Each context graph has its own connections, ontology, and access policies."
             actions={
               <SpaceBetween direction="horizontal" size="xs">
                 <Button
@@ -371,12 +372,12 @@ export const NamespaceList: React.FC = () => {
                   variant="primary"
                   onClick={() => navigate("/namespaces/create")}
                 >
-                  Create namespace
+                  Create context graph
                 </Button>
               </SpaceBetween>
             }
           >
-            Namespaces
+            Context graphs
           </Header>
         }
         filter={

@@ -147,7 +147,7 @@ export const NamespacePermissions: React.FC = () => {
 
 // ── Tabs ─────────────────────────────────────────────────────────────
 
-const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
+export const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
   namespaceId,
 }) => {
   const {

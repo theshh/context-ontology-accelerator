@@ -54,18 +54,18 @@ describe("NamespaceList", () => {
 
   it("renders the header", () => {
     render(<NamespaceList />, { wrapper });
-    expect(screen.getByText("Namespaces")).toBeInTheDocument();
+    expect(screen.getByText("Context graphs")).toBeInTheDocument();
   });
 
   it("shows empty state when no namespaces exist", () => {
     render(<NamespaceList />, { wrapper });
-    expect(screen.getByText("No namespaces")).toBeInTheDocument();
+    expect(screen.getByText("No context graphs")).toBeInTheDocument();
   });
 
   it("renders create namespace button", () => {
     render(<NamespaceList />, { wrapper });
     expect(
-      screen.getAllByRole("button", { name: /create namespace/i }).length,
+      screen.getAllByRole("button", { name: /create context graph/i }).length,
     ).toBeGreaterThan(0);
   });
 });

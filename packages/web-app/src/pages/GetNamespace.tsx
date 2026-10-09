@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Namespace detail page — displays summary info plus Data Sources, Ontologies,
- * and Metrics for a single namespace. Permissions (roles + members) live on a
- * dedicated page at /namespaces/:namespaceId/permissions.
+ * Context graph (namespace) Overview tab — graph details plus the sources
+ * connected to it ("Connections"). The graph name, status and section tabs
+ * come from ContextGraphShell; ontologies and metrics live under Curation,
+ * and edit/permissions under Settings.
  *
  * Route: /namespaces/:namespaceId
  */
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
@@ -24,14 +25,11 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import Spinner from "@cloudscape-design/components/spinner";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Table from "@cloudscape-design/components/table";
-import Tabs from "@cloudscape-design/components/tabs";
 import Textarea from "@cloudscape-design/components/textarea";
 import type { TableProps } from "@cloudscape-design/components/table";
 import { useGetNamespace } from "@api-hooks/use-get-namespace";
 import { useUpdateNamespace } from "@api-hooks/use-update-namespace";
 import { useListSources } from "@api-hooks/use-list-sources";
-import { useListMetrics } from "@api-hooks/use-metrics";
-import type { MetricDefinition } from "@api-hooks/use-metrics";
 import type { SourceSummary } from "@coa/control-plane-client";
 import {
   NamespaceStatus,
@@ -39,9 +37,6 @@ import {
   SourceType,
   VkgHealthStatus,
 } from "@coa/control-plane-client";
-import { useApiClient } from "@components/ApiClientProvider";
-import { listOntologies } from "../services/ontology-engine";
-import type { OntologyRecord } from "../services/ontology-engine";
 
 /** Formats an ISO timestamp into a localized short date+time string, or "—" if absent. */
 function formatDate(iso: string | undefined): string {
@@ -78,7 +73,6 @@ const VKG_HEALTH_DESCRIPTIONS: Record<VkgHealthStatus, string> = {
 };
 
 export const GetNamespace: React.FC = () => {
-  const navigate = useNavigate();
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const { data, isLoading, error } = useGetNamespace(namespaceId ?? "");
   const [editVisible, setEditVisible] = useState(false);
@@ -111,24 +105,16 @@ export const GetNamespace: React.FC = () => {
 
   return (
     <SpaceBetween size="l">
-      <Header
-        variant="h1"
-        actions={
-          <SpaceBetween direction="horizontal" size="xs">
-            <Button onClick={() => setEditVisible(true)}>Edit</Button>
-            <Button
-              iconName="lock-private"
-              onClick={() => navigate(`/namespaces/${namespaceId}/permissions`)}
-            >
-              Permissions
-            </Button>
-          </SpaceBetween>
+      <Container
+        header={
+          <Header
+            variant="h2"
+            actions={<Button onClick={() => setEditVisible(true)}>Edit</Button>}
+          >
+            Graph details
+          </Header>
         }
       >
-        {ns.displayName ?? ns.name}
-      </Header>
-
-      <Container header={<Header variant="h2">Summary</Header>}>
         <KeyValuePairs
           columns={3}
           items={[
@@ -205,7 +191,7 @@ export const GetNamespace: React.FC = () => {
         />
       </Container>
 
-      <NamespaceTabs namespaceId={namespaceId ?? ""} />
+      <ConnectionsTable namespaceId={namespaceId ?? ""} />
 
       <EditNamespaceModal
         namespaceId={namespaceId ?? ""}
@@ -218,35 +204,11 @@ export const GetNamespace: React.FC = () => {
   );
 };
 
-// ── Tabs ─────────────────────────────────────────────────────────────
+// ── Connections ───────────────────────────────────────────────────────
 
-const NamespaceTabs: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
-  return (
-    <Tabs
-      tabs={[
-        {
-          id: "sources",
-          label: "Sources",
-          content: <SourcesTab namespaceId={namespaceId} />,
-        },
-        {
-          id: "ontologies",
-          label: "Ontologies",
-          content: <OntologiesTab namespaceId={namespaceId} />,
-        },
-        {
-          id: "metrics",
-          label: "Metrics",
-          content: <MetricsTab namespaceId={namespaceId} />,
-        },
-      ]}
-    />
-  );
-};
-
-// ── Sources tab ──────────────────────────────────────────────────────
-
-const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
+const ConnectionsTable: React.FC<{ namespaceId: string }> = ({
+  namespaceId,
+}) => {
   const navigate = useNavigate();
   const { data, isLoading, error, refetch, isFetching } =
     useListSources(namespaceId);
@@ -259,7 +221,7 @@ const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   const columns: TableProps.ColumnDefinition<SourceSummary>[] = [
     {
       id: "name",
-      header: "Source name",
+      header: "Connection name",
       isRowHeader: true,
       cell: (item) => (
         <Link
@@ -275,7 +237,7 @@ const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
     },
     {
       id: "type",
-      header: "Type",
+      header: "Source type",
       cell: (item) =>
         item.sourceType === SourceType.DATABASE ? "Database" : "Documents",
     },
@@ -312,17 +274,27 @@ const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
         <Header
           variant="h2"
           counter={`(${sources.length})`}
+          description="Data sources connected to this context graph."
           actions={
-            <Button
-              iconName="refresh"
-              loading={isFetching}
-              onClick={() => refetch()}
-            >
-              Refresh
-            </Button>
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button
+                iconName="refresh"
+                loading={isFetching}
+                onClick={() => refetch()}
+              >
+                Refresh
+              </Button>
+              <Button
+                onClick={() =>
+                  navigate(`/namespaces/${namespaceId}/sources/connect`)
+                }
+              >
+                Add connection
+              </Button>
+            </SpaceBetween>
           }
         >
-          Sources
+          Connections
         </Header>
       }
       empty={
@@ -332,183 +304,7 @@ const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
           </StatusIndicator>
         ) : (
           <Box textAlign="center" color="text-body-secondary">
-            No sources in this namespace.
-          </Box>
-        )
-      }
-    />
-  );
-};
-
-// ── Ontologies tab ───────────────────────────────────────────────────
-
-const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
-  const navigate = useNavigate();
-  const apiClient = useApiClient();
-  const [items, setItems] = useState<OntologyRecord[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const fetchOntologies = React.useCallback(() => {
-    if (!namespaceId) return;
-    setLoading(true);
-    setError(null);
-    listOntologies(apiClient, namespaceId)
-      .then((res) => {
-        setItems(res);
-      })
-      .catch((e: unknown) => {
-        setError(e instanceof Error ? e.message : "Failed to load ontologies");
-      })
-      .finally(() => {
-        setLoading(false);
-      });
-  }, [apiClient, namespaceId]);
-
-  useEffect(() => {
-    fetchOntologies();
-  }, [fetchOntologies]);
-
-  const columns: TableProps.ColumnDefinition<OntologyRecord>[] = [
-    {
-      id: "title",
-      header: "Ontology",
-      isRowHeader: true,
-      cell: (o) => (
-        <Link
-          href={`/namespaces/${namespaceId}/ontology`}
-          onFollow={(e) => {
-            e.preventDefault();
-            navigate(`/namespaces/${namespaceId}/ontology`);
-          }}
-        >
-          {o.title || o.ontologyId}
-        </Link>
-      ),
-    },
-    { id: "type", header: "Type", cell: (o) => o.ontologyType },
-    { id: "classes", header: "Classes", cell: (o) => o.classCount },
-    { id: "properties", header: "Properties", cell: (o) => o.propertyCount },
-    {
-      id: "created",
-      header: "Created",
-      cell: (o) => formatDate(o.createdAt),
-    },
-  ];
-
-  return (
-    <Table<OntologyRecord>
-      variant="container"
-      items={items}
-      trackBy="ontologyId"
-      loading={loading}
-      loadingText="Loading ontologies…"
-      columnDefinitions={columns}
-      header={
-        <Header
-          variant="h2"
-          counter={`(${items.length})`}
-          actions={
-            <Button
-              iconName="refresh"
-              loading={loading}
-              onClick={() => fetchOntologies()}
-            >
-              Refresh
-            </Button>
-          }
-        >
-          Ontologies
-        </Header>
-      }
-      empty={
-        error ? (
-          <StatusIndicator type="error">
-            Failed to load ontologies: {error}
-          </StatusIndicator>
-        ) : (
-          <Box textAlign="center" color="text-body-secondary">
-            No ontologies in this namespace yet.
-          </Box>
-        )
-      }
-    />
-  );
-};
-
-// ── Metrics tab ──────────────────────────────────────────────────────
-
-const MetricsTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
-  const navigate = useNavigate();
-  const { data, isLoading, error, refetch, isFetching } =
-    useListMetrics(namespaceId);
-
-  const metrics: MetricDefinition[] = useMemo(
-    () => data?.pages.flatMap((p) => p.metrics ?? []) ?? [],
-    [data],
-  );
-
-  const columns: TableProps.ColumnDefinition<MetricDefinition>[] = [
-    {
-      id: "name",
-      header: "Metric",
-      isRowHeader: true,
-      cell: (m) => (
-        <Link
-          href={`/namespaces/${namespaceId}/metrics/${encodeURIComponent(m.name ?? "")}`}
-          onFollow={(e) => {
-            e.preventDefault();
-            navigate(
-              `/namespaces/${namespaceId}/metrics/${encodeURIComponent(m.name ?? "")}`,
-            );
-          }}
-        >
-          {m.name}
-        </Link>
-      ),
-    },
-    {
-      id: "description",
-      header: "Description",
-      cell: (m) => m.description || "—",
-    },
-    { id: "dataSourceId", header: "Data source", cell: (m) => m.dataSourceId },
-    { id: "sourceTable", header: "Table", cell: (m) => m.sourceTable },
-  ];
-
-  return (
-    <Table<MetricDefinition>
-      variant="container"
-      items={metrics}
-      trackBy="name"
-      loading={isLoading}
-      loadingText="Loading metrics…"
-      columnDefinitions={columns}
-      header={
-        <Header
-          variant="h2"
-          counter={`(${metrics.length})`}
-          actions={
-            <Button
-              iconName="refresh"
-              loading={isFetching}
-              onClick={() => refetch()}
-            >
-              Refresh
-            </Button>
-          }
-        >
-          Metrics
-        </Header>
-      }
-      empty={
-        error ? (
-          <StatusIndicator type="error">
-            Failed to load metrics: {error.message}
-          </StatusIndicator>
-        ) : (
-          <Box textAlign="center" color="text-body-secondary">
-            No metrics in this namespace yet.
+            No connections in this context graph.
           </Box>
         )
       }
@@ -526,7 +322,7 @@ interface EditNamespaceModalProps {
   onDismiss: () => void;
 }
 
-const EditNamespaceModal: React.FC<EditNamespaceModalProps> = ({
+export const EditNamespaceModal: React.FC<EditNamespaceModalProps> = ({
   namespaceId,
   displayName: initialDisplayName,
   description: initialDescription,

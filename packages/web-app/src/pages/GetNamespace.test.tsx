@@ -108,16 +108,16 @@ describe("GetNamespace", () => {
     mockNamespace = { ...baseNamespace };
   });
 
-  it("renders the namespace display name as header", () => {
+  it("renders the Graph details section heading", () => {
     render(<GetNamespace />, { wrapper });
     expect(
-      screen.getByRole("heading", { name: "Test Namespace" }),
+      screen.getByRole("heading", { name: "Graph details" }),
     ).toBeInTheDocument();
   });
 
   it("renders the summary section", () => {
     render(<GetNamespace />, { wrapper });
-    expect(screen.getByText("Summary")).toBeInTheDocument();
+    expect(screen.getByText("test-ns")).toBeInTheDocument();
     expect(screen.getByText("ns-1")).toBeInTheDocument();
     expect(screen.getByText("admin@example.com")).toBeInTheDocument();
   });
@@ -160,12 +160,15 @@ describe("GetNamespace", () => {
     ).toBeInTheDocument();
   });
 
-  it("renders Edit and Permissions action buttons", () => {
+  it("renders Edit and Add connection buttons; Permissions moved to Settings", () => {
     render(<GetNamespace />, { wrapper });
-    expect(screen.getByRole("button", { name: /edit/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^edit$/i })).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /permissions/i }),
+      screen.getByRole("button", { name: /add connection/i }),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /permissions/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("does not render a Data Sources action button (removed)", () => {
@@ -175,16 +178,12 @@ describe("GetNamespace", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("renders Sources, Ontologies, and Metrics tabs but not Members", () => {
+  it("renders the Connections table and no in-page tabs (they moved to Curation)", () => {
     render(<GetNamespace />, { wrapper });
-    expect(screen.getByRole("tab", { name: /sources/i })).toBeInTheDocument();
     expect(
-      screen.getByRole("tab", { name: /ontologies/i }),
+      screen.getByRole("heading", { name: /connections/i }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /metrics/i })).toBeInTheDocument();
-    expect(
-      screen.queryByRole("tab", { name: /members/i }),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab")).not.toBeInTheDocument();
   });
 
   it("links each data source name to its detail page", () => {

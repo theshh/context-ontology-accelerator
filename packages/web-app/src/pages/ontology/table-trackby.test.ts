@@ -39,6 +39,7 @@ const PAGES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 /** Tables whose rows are `OntologyRecord`s. */
 const ONTOLOGY_TABLES = [
   "GetNamespace.tsx",
+  "OntologyList.tsx",
   join("ontology", "explorer", "OntologyInventoryView.tsx"),
   "OntologyPage.tsx",
 ];
@@ -57,11 +58,10 @@ const VALID_KEYS = new Set([
   "classCount",
   "propertyCount",
   "createdAt",
-  // other row types in the same files: the sources table (sourceId), the
-  // metrics table (name, a required MetricDefinition field), and the proposals
-  // table, which is still snake_case on the wire.
+  // other row types in the same files: the connections table on the
+  // context-graph Overview (sourceId), and the proposals table, which is still
+  // snake_case on the wire.
   "sourceId",
-  "name",
   "status",
   "proposal_id",
   "created_at",
