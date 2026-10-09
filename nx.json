@@ -35,5 +35,6 @@
     {
       "plugin": "nx/plugins/package-json"
     }
-  ]
+  ],
+  "analytics": false
 }

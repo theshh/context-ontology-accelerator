@@ -33,6 +33,9 @@
          move with athena.federation.sdk.version: a lower value downgrades the Jackson the
          SDK was compiled against, which compiles and then fails at run time. -->
     <jackson.version>2.22.2</jackson.version>
+    <!-- Extra test JVM flags that only some JDKs accept; empty unless a profile below sets
+         them. Appended to surefire's argLine. -->
+    <surefire.jdk.argLine></surefire.jdk.argLine>
   </properties>
 
   <!-- Versions live here so a connector's pom names dependencies without pinning them,
@@ -82,7 +85,7 @@
                  POJOs, so they pass without it; the first test to allocate a vector fails
                  with "Failed to initialize MemoryUtil" and gives no hint that a JVM flag
                  is missing. Set now, while it costs nothing. -->
-            <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+            <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED ${surefire.jdk.argLine}</argLine>
             <systemPropertyVariables>
               <!-- Any test that constructs a handler builds AWS SDK clients, and the SDK
                    resolves a region at build time from AWS_REGION, the profile, or EC2
@@ -136,4 +139,23 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <!-- The Netty shaded into the federation SDK (4.2.x) turns sun.misc.Unsafe off by default
+         on Java 25+ unless the JVM was started with sun-misc-unsafe-memory-access=allow.
+         Without Unsafe it hands Arrow a PooledDirectByteBuf, Arrow casts it to
+         PooledUnsafeDirectByteBuf, and the first test to allocate a vector fails with a
+         ClassCastException. The Lambda runs java21 and never hits this; a developer building
+         on a newer local JDK does. The flag only exists from JDK 23 and an older JVM refuses
+         to start with it, hence a profile rather than the argLine above. -->
+    <profile>
+      <id>jdk24-unsafe-memory-access</id>
+      <activation>
+        <jdk>[24,)</jdk>
+      </activation>
+      <properties>
+        <surefire.jdk.argLine>--sun-misc-unsafe-memory-access=allow</surefire.jdk.argLine>
+      </properties>
+    </profile>
+  </profiles>
 </project>
