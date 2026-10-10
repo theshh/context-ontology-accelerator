@@ -229,6 +229,25 @@ describe("ontology-engine API wrappers", () => {
     expect(result).toEqual(envelope);
   });
 
+  it("searchEntitiesPaged normalises a response missing hits/total_count", async () => {
+    const { searchEntitiesPaged } = await import("./ontology-engine");
+    get.mockResolvedValueOnce({ items: [] });
+    expect(await searchEntitiesPaged(api, "ns", "*")).toEqual({
+      hits: [],
+      total_count: 0,
+    });
+    const hits = [
+      { uri: "http://ex/C", label: "C", kind: "class", graph_uris: ["g"] },
+    ];
+    get.mockResolvedValueOnce({ hits });
+    expect(await searchEntitiesPaged(api, "ns", "*")).toEqual({
+      hits,
+      total_count: 1,
+    });
+    get.mockResolvedValueOnce(null);
+    expect((await searchEntitiesPaged(api, "ns", "*")).hits).toEqual([]);
+  });
+
   it("getClass / getObjectProperty / getDatatypeProperty pass the uri param", async () => {
     await getClass(api, "ns", "http://ex/C");
     await getObjectProperty(api, "ns", "http://ex/p");

@@ -610,9 +610,15 @@ export async function searchEntitiesPaged(
     offset?: number;
   },
 ): Promise<GraphSearchResult> {
-  return apiClient.get<GraphSearchResult>(
+  const raw = await apiClient.get<Partial<GraphSearchResult> | null>(
     `/namespaces/${encodeURIComponent(namespace)}/graph/search${qs({ q: query, ...opts })}`,
   );
+  // Normalise the envelope: a response missing `hits` (or `total_count`) would
+  // otherwise crash the Explorer's paging (`lastPage.hits.length`) during render.
+  const hits = Array.isArray(raw?.hits) ? raw.hits : [];
+  const total_count =
+    typeof raw?.total_count === "number" ? raw.total_count : hits.length;
+  return { hits, total_count };
 }
 
 /**
