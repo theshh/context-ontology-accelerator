@@ -2,17 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * The simplified Explorer (flags in @constants/ux off): Graph view only, no
- * Inducted sources tab. Mirrors GraphSearch.tabs.test.tsx's harness. The two inventory views are stubbed
+ * The simplified Explorer (flags in @constants/ux off): just the graph -- no
+ * List view, no Ontologies / Inducted sources tabs. Mirrors GraphSearch.tabs.test.tsx's harness. The two inventory views are stubbed
  * to a marker element — their contents have dedicated tests in
  * `explorer/*.test.tsx`; here we only prove which tab body the page mounts.
  */
-import {
-  render,
-  waitFor,
-  cleanup,
-  within,
-} from "@testing-library/react";
+import { render, waitFor, cleanup, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -29,6 +24,7 @@ import type {
 vi.mock("@constants/ux", () => ({
   SHOW_TECHNICAL_VIEWS: false,
   SHOW_EXPLORER_LIST_VIEW: false,
+  SHOW_EXPLORER_ONTOLOGIES_TAB: false,
   SHOW_INDUCTED_SOURCES_TAB: false,
 }));
 
@@ -128,14 +124,6 @@ function renderPage(search = "") {
   return within(result.container);
 }
 
-/** The Cloudscape tab whose panel is currently active (aria-selected). */
-function activeTabLabel(view: ReturnType<typeof renderPage>): string | null {
-  const selected = view
-    .getAllByRole("tab")
-    .find((t) => t.getAttribute("aria-selected") === "true");
-  return selected?.textContent?.trim() ?? null;
-}
-
 describe("GraphSearchPage — simplified Explorer", () => {
   beforeEach(() => {
     cleanup();
@@ -155,16 +143,25 @@ describe("GraphSearchPage — simplified Explorer", () => {
     expect(searchEntitiesPaged).not.toHaveBeenCalled();
   });
 
-  it("shows only the Classes and Ontologies tabs", async () => {
+  it("renders just the graph: no Explorer header and no tab strip", async () => {
     const view = renderPage();
-    await waitFor(() => expect(activeTabLabel(view)).toBe("Classes"));
-    const labels = view.getAllByRole("tab").map((t) => t.textContent?.trim());
-    expect(labels).toEqual(["Classes", "Ontologies"]);
+    await waitFor(() =>
+      expect(view.getByTestId("graph-flow")).toBeInTheDocument(),
+    );
+    expect(view.queryAllByRole("tab")).toHaveLength(0);
+    expect(view.queryByRole("heading", { name: "Explorer" })).toBeNull();
+    expect(view.queryByTestId("ontology-inventory")).toBeNull();
   });
 
-  it("falls back to Classes for a ?tab=sources deep link", async () => {
-    const view = renderPage("?tab=sources");
-    await waitFor(() => expect(activeTabLabel(view)).toBe("Classes"));
-    expect(view.queryByTestId("inducted-sources")).toBeNull();
-  });
+  it.each(["?tab=ontologies", "?tab=sources"])(
+    "ignores a %s deep link and still shows the graph",
+    async (search) => {
+      const view = renderPage(search);
+      await waitFor(() =>
+        expect(view.getByTestId("graph-flow")).toBeInTheDocument(),
+      );
+      expect(view.queryByTestId("ontology-inventory")).toBeNull();
+      expect(view.queryByTestId("inducted-sources")).toBeNull();
+    },
+  );
 });

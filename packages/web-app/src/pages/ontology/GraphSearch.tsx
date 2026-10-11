@@ -38,6 +38,7 @@ import {
 import { useApiClient } from "@components/ApiClientProvider";
 import {
   SHOW_EXPLORER_LIST_VIEW,
+  SHOW_EXPLORER_ONTOLOGIES_TAB,
   SHOW_INDUCTED_SOURCES_TAB,
 } from "@constants/ux";
 import {
@@ -726,11 +727,11 @@ async function fetchVertexByKind(
   return null;
 }
 
-const EXPLORER_TABS = new Set(
-  SHOW_INDUCTED_SOURCES_TAB
-    ? ["classes", "ontologies", "sources"]
-    : ["classes", "ontologies"],
-);
+const EXPLORER_TABS = new Set([
+  "classes",
+  ...(SHOW_EXPLORER_ONTOLOGIES_TAB ? ["ontologies"] : []),
+  ...(SHOW_INDUCTED_SOURCES_TAB ? ["sources"] : []),
+]);
 /** Default pane: the List view when it is shown, else the Graph view. */
 const DEFAULT_VIEW: "graph" | "list" = SHOW_EXPLORER_LIST_VIEW
   ? "list"
@@ -2130,6 +2131,17 @@ export function GraphSearchPage() {
     </>
   );
 
+  // Simplified Explorer: with neither inventory tab shown, the page is just
+  // the class graph -- no page header and no single-tab strip.
+  if (!SHOW_EXPLORER_ONTOLOGIES_TAB && !SHOW_INDUCTED_SOURCES_TAB) {
+    return (
+      <SpaceBetween size="l">
+        <PendingReviewBanner />
+        {classesTab}
+      </SpaceBetween>
+    );
+  }
+
   return (
     <SpaceBetween size="l">
       <PendingReviewBanner />
@@ -2148,16 +2160,20 @@ export function GraphSearchPage() {
         onChange={({ detail }) => setTab(detail.activeTabId)}
         tabs={[
           { id: "classes", label: "Classes", content: classesTab },
-          {
-            id: "ontologies",
-            label: "Ontologies",
-            content: (
-              <OntologyInventoryView
-                apiClient={apiClient}
-                namespace={namespaceId}
-              />
-            ),
-          },
+          ...(SHOW_EXPLORER_ONTOLOGIES_TAB
+            ? [
+                {
+                  id: "ontologies",
+                  label: "Ontologies",
+                  content: (
+                    <OntologyInventoryView
+                      apiClient={apiClient}
+                      namespace={namespaceId}
+                    />
+                  ),
+                },
+              ]
+            : []),
           ...(SHOW_INDUCTED_SOURCES_TAB
             ? [
                 {

@@ -13,6 +13,7 @@ import { parseR2rmlByClass, type ConceptMatch } from "./grounding";
 vi.mock("@constants/ux", () => ({
   SHOW_TECHNICAL_VIEWS: true,
   SHOW_EXPLORER_LIST_VIEW: true,
+  SHOW_EXPLORER_ONTOLOGIES_TAB: true,
   SHOW_INDUCTED_SOURCES_TAB: true,
 }));
 

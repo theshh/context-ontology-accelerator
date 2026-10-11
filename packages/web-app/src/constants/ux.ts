@@ -17,5 +17,12 @@ export const SHOW_TECHNICAL_VIEWS = false;
 /** Graph explorer: the flat List view (the Graph view is the only view). */
 export const SHOW_EXPLORER_LIST_VIEW = false;
 
+/**
+ * Graph explorer: the "Ontologies" tab. With this and the Inducted sources tab
+ * both hidden, the Explorer renders just the graph (no header, no tab strip).
+ * The ontology list itself is still reachable under Curation -> Ontologies.
+ */
+export const SHOW_EXPLORER_ONTOLOGIES_TAB = false;
+
 /** Graph explorer: the "Inducted sources" tab. */
 export const SHOW_INDUCTED_SOURCES_TAB = false;
