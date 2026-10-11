@@ -37,6 +37,7 @@ import { useApiClient } from "@components/ApiClientProvider";
 import { useBreadcrumbs } from "@components/BreadcrumbProvider";
 import { TurtleHighlight } from "@components/TurtleHighlight";
 import { PendingReviewBanner } from "@components/ontology/PendingReviewBanner";
+import { SHOW_TECHNICAL_VIEWS } from "@constants/ux";
 
 /** Strip an IRI down to its local name (after the last ``#`` or ``/``). */
 export function localName(uri: string | undefined | null): string {
@@ -538,32 +539,36 @@ export function InducedOntologyDetailPage() {
               />
             ),
           },
-          {
-            id: "source",
-            label: "Source (Turtle)",
-            content: (
-              <SpaceBetween size="s">
-                {turtleError && (
-                  <Alert type="warning" header="Could not load source">
-                    {turtleError}
-                  </Alert>
-                )}
-                {turtleLoading ? (
-                  <Box textAlign="center" padding="l">
-                    <Spinner /> Loading source…
-                  </Box>
-                ) : turtle ? (
-                  <TurtleHighlight>{turtle}</TurtleHighlight>
-                ) : (
-                  !turtleError && (
-                    <Box color="text-body-secondary">
-                      No source available for this ontology.
-                    </Box>
-                  )
-                )}
-              </SpaceBetween>
-            ),
-          },
+          ...(SHOW_TECHNICAL_VIEWS
+            ? [
+                {
+                  id: "source",
+                  label: "Source (Turtle)",
+                  content: (
+                    <SpaceBetween size="s">
+                      {turtleError && (
+                        <Alert type="warning" header="Could not load source">
+                          {turtleError}
+                        </Alert>
+                      )}
+                      {turtleLoading ? (
+                        <Box textAlign="center" padding="l">
+                          <Spinner /> Loading source…
+                        </Box>
+                      ) : turtle ? (
+                        <TurtleHighlight>{turtle}</TurtleHighlight>
+                      ) : (
+                        !turtleError && (
+                          <Box color="text-body-secondary">
+                            No source available for this ontology.
+                          </Box>
+                        )
+                      )}
+                    </SpaceBetween>
+                  ),
+                },
+              ]
+            : []),
         ]}
       />
     </SpaceBetween>

@@ -21,6 +21,14 @@ import type {
   OntologyRecord,
 } from "../../services/ontology-engine";
 
+// These tests cover the full (un-simplified) UI, which still ships behind the
+// flags in @constants/ux; pin every flag on so that code stays covered.
+vi.mock("@constants/ux", () => ({
+  SHOW_TECHNICAL_VIEWS: true,
+  SHOW_EXPLORER_LIST_VIEW: true,
+  SHOW_INDUCTED_SOURCES_TAB: true,
+}));
+
 // Two classes in one ontology: Policy is a sub-class of Claim. The taxonomy
 // comes from the ontology-overview (subClassOf), NOT a per-class getClass
 // fan-out.

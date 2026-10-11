@@ -34,6 +34,7 @@ import {
   type ConceptMatch,
   type R2rmlMapping,
 } from "./grounding";
+import { SHOW_TECHNICAL_VIEWS } from "@constants/ux";
 
 /** Replace a quoted literal value in a Turtle body. */
 function replaceQuoted(body: string, pred: string, newValue: string): string {
@@ -84,7 +85,7 @@ function PropertyEditor({
         Back to class
       </Button>
 
-      {!isReadOnly && (
+      {SHOW_TECHNICAL_VIEWS && !isReadOnly && (
         <Box float="right">
           <Toggle
             checked={editRaw}
@@ -286,7 +287,7 @@ export function ClassDetailPanel({
 
   return (
     <SpaceBetween size="m">
-      {!isReadOnly && (
+      {SHOW_TECHNICAL_VIEWS && !isReadOnly && (
         <Box float="right">
           <Toggle
             checked={editRaw}
@@ -680,7 +681,7 @@ export function ClassDetailPanel({
                 </Box>
               }
             />
-            {r2rml && (
+            {SHOW_TECHNICAL_VIEWS && r2rml && (
               <ExpandableSection headerText="View raw R2RML">
                 <TurtleHighlight>{r2rml}</TurtleHighlight>
               </ExpandableSection>
@@ -690,7 +691,7 @@ export function ClassDetailPanel({
       )}
 
       {/* Collapsed raw class source */}
-      {!editRaw && (
+      {SHOW_TECHNICAL_VIEWS && !editRaw && (
         <ExpandableSection headerText="Source (Turtle)">
           <TurtleHighlight>{g.classEntity.body}</TurtleHighlight>
         </ExpandableSection>

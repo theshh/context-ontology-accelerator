@@ -28,6 +28,7 @@ import {
   parseR2rmlByClass,
   type ConceptMatch,
 } from "./grounding";
+import { SHOW_TECHNICAL_VIEWS } from "@constants/ux";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -569,7 +570,7 @@ export function ProposalEntitiesPanel({
           }
         />
       </ExpandableSection>
-      {prelude && (
+      {SHOW_TECHNICAL_VIEWS && prelude && (
         <ExpandableSection
           variant="container"
           defaultExpanded={false}

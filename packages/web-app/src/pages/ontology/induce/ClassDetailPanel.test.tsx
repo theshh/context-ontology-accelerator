@@ -8,6 +8,14 @@ import { ClassDetailPanel, type ClassGroup } from "./ClassDetailPanel";
 import type { TurtleEntity } from "./turtle";
 import { parseR2rmlByClass, type ConceptMatch } from "./grounding";
 
+// These tests cover the full (un-simplified) UI, which still ships behind the
+// flags in @constants/ux; pin every flag on so that code stays covered.
+vi.mock("@constants/ux", () => ({
+  SHOW_TECHNICAL_VIEWS: true,
+  SHOW_EXPLORER_LIST_VIEW: true,
+  SHOW_INDUCTED_SOURCES_TAB: true,
+}));
+
 const classEntity: TurtleEntity = {
   subject: "Claim",
   fullSubject: "ex:Claim",

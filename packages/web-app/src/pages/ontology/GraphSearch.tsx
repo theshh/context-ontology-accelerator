@@ -37,6 +37,10 @@ import {
 } from "@api-hooks/use-graph-classes";
 import { useApiClient } from "@components/ApiClientProvider";
 import {
+  SHOW_EXPLORER_LIST_VIEW,
+  SHOW_INDUCTED_SOURCES_TAB,
+} from "@constants/ux";
+import {
   useBreadcrumbs,
   type BreadcrumbItem,
 } from "@components/BreadcrumbProvider";
@@ -722,7 +726,15 @@ async function fetchVertexByKind(
   return null;
 }
 
-const EXPLORER_TABS = new Set(["classes", "ontologies", "sources"]);
+const EXPLORER_TABS = new Set(
+  SHOW_INDUCTED_SOURCES_TAB
+    ? ["classes", "ontologies", "sources"]
+    : ["classes", "ontologies"],
+);
+/** Default pane: the List view when it is shown, else the Graph view. */
+const DEFAULT_VIEW: "graph" | "list" = SHOW_EXPLORER_LIST_VIEW
+  ? "list"
+  : "graph";
 
 export function GraphSearchPage() {
   const { namespaceId } = useParams<{ namespaceId: string }>();
@@ -760,9 +772,10 @@ export function GraphSearchPage() {
   const [visibleUris, setVisibleUris] = useState<Set<string>>(new Set());
   // Total number of root classes available (visible roots may be capped).
   const [totalRoots, setTotalRoots] = useState(0);
-  // Which pane is shown: a flat paginated class list (default), or the
-  // interactive graph.
-  const [view, setView] = useState<"graph" | "list">("list");
+  // Which pane is shown: a flat paginated class list, or the interactive
+  // graph. With the List view hidden (SHOW_EXPLORER_LIST_VIEW) the graph is
+  // the only pane.
+  const [view, setView] = useState<"graph" | "list">(DEFAULT_VIEW);
   // class URI → description, from the per-ontology overview calls. Feeds the
   // List view's Description column without loading each class's full vertex.
   const [descriptionByUri, setDescriptionByUri] = useState<Map<string, string>>(
@@ -1391,7 +1404,7 @@ export function GraphSearchPage() {
   // "Ontology Explorer" crumb: return to the list root, clearing any selection.
   const handleGoToRoot = () => {
     setSelectedVertex(null);
-    setView("list");
+    setView(DEFAULT_VIEW);
   };
 
   // Publish a live breadcrumb trail to the AppLayout breadcrumbs slot (the bar
@@ -1414,7 +1427,7 @@ export function GraphSearchPage() {
         onClick: () => setSelectedVertex(selectedVertex),
       });
     }
-    if (view === "graph") {
+    if (view === "graph" && SHOW_EXPLORER_LIST_VIEW) {
       crumbs.push({ text: "Graph", onClick: () => setView("graph") });
     }
     setBreadcrumbs(crumbs);
@@ -1648,17 +1661,19 @@ export function GraphSearchPage() {
         >
           <SpaceBetween size="s">
             <SpaceBetween direction="horizontal" size="xs">
-              <SegmentedControl
-                selectedId={view}
-                onChange={({ detail }) =>
-                  setView(detail.selectedId as "graph" | "list")
-                }
-                label="View"
-                options={[
-                  { id: "list", text: "List", iconName: "list-view" },
-                  { id: "graph", text: "Graph", iconName: "share" },
-                ]}
-              />
+              {SHOW_EXPLORER_LIST_VIEW && (
+                <SegmentedControl
+                  selectedId={view}
+                  onChange={({ detail }) =>
+                    setView(detail.selectedId as "graph" | "list")
+                  }
+                  label="View"
+                  options={[
+                    { id: "list", text: "List", iconName: "list-view" },
+                    { id: "graph", text: "Graph", iconName: "share" },
+                  ]}
+                />
+              )}
               <div style={{ flexGrow: 1, minWidth: 300 }}>
                 <Input
                   value={query}
@@ -2120,7 +2135,11 @@ export function GraphSearchPage() {
       <PendingReviewBanner />
       <Header
         variant="h1"
-        description="Browse the ontologies in this namespace, the classes inside them, and the sources they were induced from."
+        description={
+          SHOW_INDUCTED_SOURCES_TAB
+            ? "Browse the ontologies in this namespace, the classes inside them, and the sources they were induced from."
+            : "Browse the ontologies in this namespace and the classes inside them."
+        }
       >
         Explorer
       </Header>
@@ -2139,16 +2158,20 @@ export function GraphSearchPage() {
               />
             ),
           },
-          {
-            id: "sources",
-            label: "Inducted sources",
-            content: (
-              <InductedSourcesView
-                apiClient={apiClient}
-                namespace={namespaceId}
-              />
-            ),
-          },
+          ...(SHOW_INDUCTED_SOURCES_TAB
+            ? [
+                {
+                  id: "sources",
+                  label: "Inducted sources",
+                  content: (
+                    <InductedSourcesView
+                      apiClient={apiClient}
+                      namespace={namespaceId}
+                    />
+                  ),
+                },
+              ]
+            : []),
         ]}
       />
     </SpaceBetween>

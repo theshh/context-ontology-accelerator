@@ -65,6 +65,7 @@ import { parseTurtleEntities, type TurtleEntity } from "./turtle";
 import { ProposalEntitiesPanel } from "./ProposalEntitiesPanel";
 import { InfoPopover } from "@components/InfoPopover";
 import { ButtonWithHint } from "@components/ButtonWithHint";
+import { SHOW_TECHNICAL_VIEWS } from "@constants/ux";
 
 /**
  * Whether the proposal has a COMPUTED ontology to show constraints for.
@@ -1508,7 +1509,7 @@ export function ProposalDetailPage() {
             />
           )}
 
-          {editedR2rml && (
+          {SHOW_TECHNICAL_VIEWS && editedR2rml && (
             <ExpandableSection
               variant="container"
               headerText="R2RML Mapping"
@@ -1553,7 +1554,7 @@ export function ProposalDetailPage() {
             </ExpandableSection>
           )}
 
-          {editedTurtle && (
+          {SHOW_TECHNICAL_VIEWS && editedTurtle && (
             <ExpandableSection
               variant="container"
               headerText="Ontology Source (Turtle)"

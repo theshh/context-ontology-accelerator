@@ -8,6 +8,14 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { InducedOntologyDetailPage } from "./InducedOntologyDetail";
 
+// These tests cover the full (un-simplified) UI, which still ships behind the
+// flags in @constants/ux; pin every flag on so that code stays covered.
+vi.mock("@constants/ux", () => ({
+  SHOW_TECHNICAL_VIEWS: true,
+  SHOW_EXPLORER_LIST_VIEW: true,
+  SHOW_INDUCTED_SOURCES_TAB: true,
+}));
+
 const OVERVIEW = {
   ontologyId: "http://ex.org/o#",
   namespace: "ns",
