@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import React, { useContext, useEffect, useMemo, useState } from "react";
-import { Routes, Route, useNavigate, useLocation } from "react-router-dom";
+import {
+  Routes,
+  Route,
+  Navigate,
+  useNavigate,
+  useLocation,
+} from "react-router-dom";
+import { SHOW_ARCHIVED_CONTEXT_GRAPHS, SHOW_DASHBOARD } from "@constants/ux";
 import AppLayout from "@cloudscape-design/components/app-layout-toolbar";
 import Flashbar from "@cloudscape-design/components/flashbar";
 import SideNavigation, {
@@ -183,7 +190,9 @@ function AppShell() {
     `https://console.aws.amazon.com/${svc}/home${region ? `?region=${region}` : ""}${hash}`;
 
   const sideNavItems: SideNavigationProps.Item[] = [
-    { type: "link", text: "Dashboard", href: "/" },
+    ...(SHOW_DASHBOARD
+      ? [{ type: "link" as const, text: "Dashboard", href: "/" }]
+      : []),
     { type: "link", text: "Context graphs", href: "/namespaces" },
     { type: "link", text: "Connections", href: `${nsPath}/sources` },
     { type: "link", text: "Ontology", href: `${nsPath}/ontology` },
@@ -226,7 +235,9 @@ function AppShell() {
     label: string;
     href: string;
   }> = [
-    { section: null, label: "Dashboard", href: "/" },
+    ...(SHOW_DASHBOARD
+      ? [{ section: null, label: "Dashboard", href: "/" }]
+      : []),
     { section: null, label: "Context graphs", href: "/namespaces" },
     { section: null, label: "Playground", href: "/playground" },
     { section: "Administration", label: "Identity", href: "/identity" },
@@ -319,6 +330,11 @@ function AppShell() {
               items:
                 namespaces.length > 0
                   ? [...namespaces]
+                      .filter(
+                        (n) =>
+                          SHOW_ARCHIVED_CONTEXT_GRAPHS ||
+                          n.status !== "ARCHIVED",
+                      )
                       .sort((a, b) =>
                         (a.displayName ?? a.name ?? "").localeCompare(
                           b.displayName ?? b.name ?? "",
@@ -536,7 +552,16 @@ function AppShell() {
         content={
           <PageErrorBoundary>
             <Routes>
-              <Route path="/" element={<HomePage />} />
+              <Route
+                path="/"
+                element={
+                  SHOW_DASHBOARD ? (
+                    <HomePage />
+                  ) : (
+                    <Navigate to="/namespaces" replace />
+                  )
+                }
+              />
               <Route path="/namespaces" element={<NamespaceList />} />
               <Route path="/namespaces/create" element={<CreateNamespace />} />
               <Route

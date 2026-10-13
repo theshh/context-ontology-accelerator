@@ -11,6 +11,7 @@ import React, {
 } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useListNamespaces } from "@api-hooks";
+import { SHOW_ARCHIVED_CONTEXT_GRAPHS } from "@constants/ux";
 import type { NamespaceSummary } from "@api-hooks";
 
 interface NamespaceContextValue {
@@ -56,7 +57,12 @@ export const NamespaceProvider: React.FC<React.PropsWithChildren> = ({
   }, [location.pathname, namespaces, selectedId]);
 
   const current = useMemo(
-    () => namespaces.find((n) => n.namespaceId === selectedId) ?? namespaces[0],
+    () =>
+      namespaces.find((n) => n.namespaceId === selectedId) ??
+      (SHOW_ARCHIVED_CONTEXT_GRAPHS
+        ? undefined
+        : namespaces.find((n) => n.status !== "ARCHIVED")) ??
+      namespaces[0],
     [namespaces, selectedId],
   );
 

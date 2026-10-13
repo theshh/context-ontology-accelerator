@@ -6,7 +6,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   NamespaceList,
   getStatusActionItems,
@@ -15,6 +15,12 @@ import {
 import { NamespaceStatus } from "@coa/control-plane-client";
 
 const mockDeleteMutate = vi.fn();
+const mockUx = vi.hoisted(() => ({ showArchived: true }));
+vi.mock("@constants/ux", () => ({
+  get SHOW_ARCHIVED_CONTEXT_GRAPHS() {
+    return mockUx.showArchived;
+  },
+}));
 let mockNamespaces: Array<{
   namespaceId: string;
   name: string;
@@ -67,6 +73,42 @@ describe("NamespaceList", () => {
     expect(
       screen.getAllByRole("button", { name: /create context graph/i }).length,
     ).toBeGreaterThan(0);
+  });
+});
+
+describe("NamespaceList archived context graphs (simplified default)", () => {
+  beforeEach(() => {
+    mockUx.showArchived = false;
+    mockNamespaces = [
+      {
+        namespaceId: "ns-a",
+        name: "live-graph",
+        status: NamespaceStatus.ACTIVE,
+      },
+      {
+        namespaceId: "ns-b",
+        name: "old-graph",
+        status: NamespaceStatus.ARCHIVED,
+      },
+    ];
+  });
+  afterEach(() => {
+    mockUx.showArchived = true;
+  });
+
+  it("hides archived graphs from the default list", () => {
+    render(<NamespaceList />, { wrapper });
+    expect(screen.getByText("live-graph")).toBeInTheDocument();
+    expect(screen.queryByText("old-graph")).not.toBeInTheDocument();
+  });
+
+  it("still shows archived graphs when the Archived filter is chosen", async () => {
+    const user = userEvent.setup();
+    render(<NamespaceList />, { wrapper });
+    await user.click(screen.getByText(/^All (statuses|except archived)$/));
+    await user.click(await screen.findByText("Archived"));
+    expect(await screen.findByText("old-graph")).toBeInTheDocument();
+    expect(screen.queryByText("live-graph")).not.toBeInTheDocument();
   });
 });
 

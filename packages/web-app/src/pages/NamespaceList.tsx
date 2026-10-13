@@ -31,6 +31,7 @@ import {
   NamespaceSummary,
 } from "@api-hooks";
 import { NamespaceStatus } from "@coa/control-plane-client";
+import { SHOW_ARCHIVED_CONTEXT_GRAPHS } from "@constants/ux";
 
 const PAGE_SIZE_OPTIONS = [
   { value: 10, label: "10 namespaces" },
@@ -58,7 +59,12 @@ const STATUS_MAP: Record<
 };
 
 const STATUS_FILTER_OPTIONS: SelectProps.Option[] = [
-  { value: "all", label: "All statuses" },
+  {
+    value: "all",
+    label: SHOW_ARCHIVED_CONTEXT_GRAPHS
+      ? "All statuses"
+      : "All except archived",
+  },
   { value: NamespaceStatus.ACTIVE, label: "Active" },
   { value: NamespaceStatus.ARCHIVED, label: "Archived" },
   { value: NamespaceStatus.DELETING, label: "Deleting" },
@@ -193,7 +199,11 @@ export const NamespaceList: React.FC = () => {
 
   const visibleItems = useMemo(() => {
     const s = selectedStatus.value;
-    if (!s || s === "all") return allItems;
+    if (!s || s === "all") {
+      return SHOW_ARCHIVED_CONTEXT_GRAPHS
+        ? allItems
+        : allItems.filter((n) => n.status !== NamespaceStatus.ARCHIVED);
+    }
     return allItems.filter((n) => n.status === s);
   }, [allItems, selectedStatus]);
 

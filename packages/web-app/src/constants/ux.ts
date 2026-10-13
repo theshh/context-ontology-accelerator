@@ -26,3 +26,13 @@ export const SHOW_EXPLORER_ONTOLOGIES_TAB = false;
 
 /** Graph explorer: the "Inducted sources" tab. */
 export const SHOW_INDUCTED_SOURCES_TAB = false;
+
+/**
+ * Archived context graphs in the list and the Playground switcher. When hidden,
+ * they are still reachable by choosing "Archived" in the list's status filter
+ * (so they can be reactivated or deleted) and by direct URL.
+ */
+export const SHOW_ARCHIVED_CONTEXT_GRAPHS = false;
+
+/** The Dashboard home page and its side-nav link. "/" opens Context graphs. */
+export const SHOW_DASHBOARD = false;
