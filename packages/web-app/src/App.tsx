@@ -29,6 +29,7 @@ import { NamespaceList } from "./pages/NamespaceList";
 import { CreateNamespace } from "./pages/CreateNamespace";
 import { HomePage } from "./pages/HomePage";
 import { GetNamespace } from "./pages/GetNamespace";
+import { BusinessMapPage } from "./pages/BusinessMap";
 import { ContextGraphSettings } from "./pages/ContextGraphSettings";
 import { OntologyList } from "./pages/OntologyList";
 import {
@@ -278,6 +279,7 @@ function AppShell() {
     : undefined;
   const GRAPH_TAB_LABELS = {
     overview: undefined,
+    map: "Business map",
     curation: "Curation",
     explorer: "Graph explorer",
     settings: "Settings",
@@ -597,6 +599,7 @@ function AppShell() {
                 element={<ContextGraphShell />}
               >
                 <Route index element={<GetNamespace />} />
+                <Route path="map" element={<BusinessMapPage />} />
                 <Route path="settings" element={<ContextGraphSettings />} />
                 <Route path="permissions" element={<ContextGraphSettings />} />
                 <Route path="sources" element={<SourceList />} />

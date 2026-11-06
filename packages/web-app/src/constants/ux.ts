@@ -36,3 +36,7 @@ export const SHOW_ARCHIVED_CONTEXT_GRAPHS = false;
 
 /** The Dashboard home page and its side-nav link. "/" opens Context graphs. */
 export const SHOW_DASHBOARD = false;
+
+/** Show the Business map tab (a plain-language picture of the graph's things,
+ * relationships and rules) on each context graph. */
+export const SHOW_BUSINESS_MAP = true;

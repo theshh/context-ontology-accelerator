@@ -17,12 +17,18 @@ import Header from "@cloudscape-design/components/header";
 import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
+import { SHOW_BUSINESS_MAP } from "@constants/ux";
 import Tabs from "@cloudscape-design/components/tabs";
 import { NamespaceStatus } from "@coa/control-plane-client";
 import { useGetNamespace } from "@api-hooks/use-get-namespace";
 import { PageErrorBoundary } from "@components/PageErrorBoundary";
 
-export type ContextGraphTab = "overview" | "curation" | "explorer" | "settings";
+export type ContextGraphTab =
+  | "overview"
+  | "map"
+  | "curation"
+  | "explorer"
+  | "settings";
 export type CurationSubTab = "induction" | "ontologies" | "metrics";
 
 /**
@@ -33,6 +39,7 @@ export function resolveContextGraphTab(rest: string): {
   tab: ContextGraphTab;
   sub?: CurationSubTab;
 } {
+  if (rest.startsWith("/map")) return { tab: "map" };
   if (rest.startsWith("/ontology/graph")) return { tab: "explorer" };
   if (rest.startsWith("/metrics")) return { tab: "curation", sub: "metrics" };
   if (rest.startsWith("/ontologies") || rest.startsWith("/ontology/induced"))
@@ -46,6 +53,7 @@ export function resolveContextGraphTab(rest: string): {
 
 const TAB_PATHS: Record<ContextGraphTab, string> = {
   overview: "",
+  map: "/map",
   curation: "/ontology",
   explorer: "/ontology/graph",
   settings: "/settings",
@@ -110,6 +118,7 @@ export const ContextGraphShell: React.FC = () => {
         }
         tabs={[
           { id: "overview", label: "Overview" },
+          ...(SHOW_BUSINESS_MAP ? [{ id: "map", label: "Business map" }] : []),
           { id: "curation", label: "Curation" },
           { id: "explorer", label: "Graph explorer" },
           { id: "settings", label: "Settings" },

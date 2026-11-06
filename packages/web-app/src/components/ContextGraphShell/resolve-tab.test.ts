@@ -16,6 +16,7 @@ describe("resolveContextGraphTab", () => {
     ["/ontology/induced/class", { tab: "curation", sub: "ontologies" }],
     ["/metrics", { tab: "curation", sub: "metrics" }],
     ["/metrics/m1/edit", { tab: "curation", sub: "metrics" }],
+    ["/map", { tab: "map" }],
     ["/ontology/graph", { tab: "explorer" }],
     ["/settings", { tab: "settings" }],
     ["/permissions", { tab: "settings" }],
