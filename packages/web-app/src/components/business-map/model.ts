@@ -51,6 +51,8 @@ export interface MapEntity {
   connection: string;
   rules: string[];
   attributeCount: number;
+  /** Tables folded into this circle when several look-alike tables were grouped. */
+  members?: string[];
 }
 export interface MapLink {
   source: string;
@@ -188,10 +190,74 @@ export function buildBusinessMap(
     links.push({ source: s, target: t, label: relationshipLabel(p) });
   }
 
-  const connections = [...new Set(entities.map((e) => e.connection))].sort(
+  const grouped = groupLookAlikes(entities, links);
+  const connections = [...new Set(grouped.entities.map((e) => e.connection))].sort(
     (a, b) => (a === "Other" ? 1 : b === "Other" ? -1 : a.localeCompare(b)),
   );
-  return { entities, links, rules: ruleModels, connections };
+  return { entities: grouped.entities, links: grouped.links, rules: ruleModels, connections };
+}
+
+/** Fewest look-alike tables worth folding into one circle. */
+const GROUP_MIN = 3;
+
+/**
+ * Fold tables that only differ by breakdown into one circle: same data
+ * connection, same relationships, and no rule of their own beyond what the
+ * group shares. Typical case: a published dataset split by age, gender, tenure.
+ * Keeps the picture about business things rather than how a source slices them.
+ */
+export function groupLookAlikes(
+  entities: MapEntity[],
+  links: MapLink[],
+): { entities: MapEntity[]; links: MapLink[] } {
+  const neighbours = new Map<string, string[]>();
+  for (const e of entities) neighbours.set(e.id, []);
+  for (const l of links) {
+    neighbours.get(l.source)?.push(`${l.label}>${l.target}`);
+    neighbours.get(l.target)?.push(`${l.label}<${l.source}`);
+  }
+  const buckets = new Map<string, MapEntity[]>();
+  for (const e of entities) {
+    const sig = neighbours.get(e.id)!;
+    // Only things that connect elsewhere and nothing connects to (leaves).
+    if (sig.length === 0 || sig.some((n) => n.includes("<"))) continue;
+    const key = `${e.connection}|${[...sig].sort().join(",")}`;
+    const list = buckets.get(key) ?? [];
+    list.push(e);
+    buckets.set(key, list);
+  }
+  const folded = new Map<string, string>();
+  const groups: MapEntity[] = [];
+  for (const [, list] of buckets) {
+    if (list.length < GROUP_MIN) continue;
+    const id = `group:${list[0].connection}`;
+    list.forEach((e) => folded.set(e.id, id));
+    groups.push({
+      id,
+      label: `${list[0].connection} (${list.length} datasets)`,
+      table: list.map((e) => e.table).join(", "),
+      description: list.find((e) => e.description)?.description ?? "",
+      connection: list[0].connection,
+      rules: [...new Set(list.flatMap((e) => e.rules))],
+      attributeCount: list.reduce((n, e) => n + e.attributeCount, 0),
+      members: list.map((e) => e.label),
+    });
+  }
+  if (groups.length === 0) return { entities, links };
+  const seen = new Set<string>();
+  const outLinks: MapLink[] = [];
+  for (const l of links) {
+    const source = folded.get(l.source) ?? l.source;
+    const target = folded.get(l.target) ?? l.target;
+    const key = `${source}|${target}|${l.label}`;
+    if (source === target || seen.has(key)) continue;
+    seen.add(key);
+    outLinks.push({ ...l, source, target });
+  }
+  return {
+    entities: [...entities.filter((e) => !folded.has(e.id)), ...groups],
+    links: outLinks,
+  };
 }
 
 interface LayoutNode extends SimulationNodeDatum {
@@ -208,33 +274,101 @@ export function layoutBusinessMap(
   model: BusinessMapModel,
 ): Record<string, { x: number; y: number }> {
   const groups = model.connections;
-  const g = groups.length || 1;
-  // Each data connection gets a home on an ellipse; its things start (and are
-  // gently held) there, so a connection's tables read as one cluster even when
-  // the ontology has no relationship between them.
-  const home = groups.map((_, i) => {
-    const a = (2 * Math.PI * i) / g - Math.PI / 2;
-    return g === 1 ? { x: 0, y: 0 } : { x: Math.cos(a) * 340, y: Math.sin(a) * 230 };
+  const conn = new Map(model.entities.map((e) => [e.id, e.connection]));
+  const sizeOf = (c: string) => model.entities.filter((e) => e.connection === c).length;
+
+  // 1. Place each data connection as one zone. Zones that share more
+  //    relationships pull together, so cross-zone lines stay short; zone size
+  //    follows how many things it holds, and zones never overlap.
+  interface Zone extends SimulationNodeDatum { id: string; r: number }
+  const zones: Zone[] = groups.map((c, i) => {
+    const a = (2 * Math.PI * i) / Math.max(groups.length, 1);
+    return { id: c, r: 80 + Math.sqrt(sizeOf(c)) * 110, x: Math.cos(a) * 200, y: Math.sin(a) * 140 };
   });
+  const weight = new Map<string, number>();
+  for (const l of model.links) {
+    const a = conn.get(l.source);
+    const b = conn.get(l.target);
+    if (!a || !b || a === b) continue;
+    const k = [a, b].sort().join("|");
+    weight.set(k, (weight.get(k) ?? 0) + 1);
+  }
+  const zoneLinks = [...weight].map(([k, w]) => {
+    const [source, target] = k.split("|");
+    return { source, target, w };
+  });
+  const zsim = forceSimulation(zones)
+    .force(
+      "link",
+      forceLink<Zone, { source: string; target: string; w: number }>(zoneLinks)
+        .id((d) => d.id)
+        .distance((l) => ((l.source as unknown as Zone).r + (l.target as unknown as Zone).r) * 1.05)
+        .strength((l) => Math.min(0.2 + l.w * 0.1, 0.8)),
+    )
+    .force("charge", forceManyBody().strength(-300))
+    .force("collide", forceCollide<Zone>((d) => d.r + 24).iterations(4))
+    .force("x", forceX(0).strength(0.05))
+    .force("y", forceY(0).strength(0.08))
+    .stop();
+  for (let i = 0; i < 400; i++) zsim.tick();
+  const home = new Map(zones.map((z) => [z.id, z]));
+
+  // 2. Place things inside their zone: linked things pull together, circles
+  //    repel, and each is held firmly inside its own zone.
   const nodes: LayoutNode[] = model.entities.map((e, i) => {
-    const gi = Math.max(0, groups.indexOf(e.connection));
-    const jitter = (i % 5) * 18 - 36;
-    return { id: e.id, group: gi, x: home[gi].x + jitter, y: home[gi].y - jitter };
+    const z = home.get(e.connection)!;
+    const a = (2 * Math.PI * i) / Math.max(sizeOf(e.connection), 1);
+    return {
+      id: e.id,
+      group: groups.indexOf(e.connection),
+      x: (z.x ?? 0) + Math.cos(a) * z.r * 0.4,
+      y: (z.y ?? 0) + Math.sin(a) * z.r * 0.4,
+    };
   });
-  const links = model.links.map((l) => ({ source: l.source, target: l.target }));
+  const inner = model.links.filter((l) => conn.get(l.source) === conn.get(l.target));
   const sim = forceSimulation(nodes)
     .force(
       "link",
-      forceLink<LayoutNode, { source: string; target: string }>(links)
+      forceLink<LayoutNode, { source: string; target: string }>(
+        inner.map((l) => ({ source: l.source, target: l.target })),
+      )
         .id((d) => d.id)
-        .distance(140)
-        .strength(0.5),
+        .distance(170)
+        .strength(0.4),
     )
-    .force("charge", forceManyBody().strength(-420))
-    .force("collide", forceCollide(72))
-    .force("x", forceX<LayoutNode>((d) => home[d.group].x).strength(0.12))
-    .force("y", forceY<LayoutNode>((d) => home[d.group].y).strength(0.14))
+    .force("charge", forceManyBody().strength(-500).distanceMax(400))
+    .force("collide", forceCollide(95))
+    .force("x", forceX<LayoutNode>((d) => home.get(groups[d.group])!.x ?? 0).strength(0.25))
+    .force("y", forceY<LayoutNode>((d) => home.get(groups[d.group])!.y ?? 0).strength(0.25))
     .stop();
-  for (let i = 0; i < 400; i++) sim.tick();
+  for (let i = 0; i < 400; i++) {
+    sim.tick();
+    // Keep every circle inside its zone.
+    for (const n of nodes) {
+      const z = home.get(groups[n.group])!;
+      const dx = (n.x ?? 0) - (z.x ?? 0);
+      const dy = (n.y ?? 0) - (z.y ?? 0);
+      const d = Math.hypot(dx, dy);
+      const max = z.r - 70;
+      if (d > max && d > 0) {
+        n.x = (z.x ?? 0) + (dx / d) * max;
+        n.y = (z.y ?? 0) + (dy / d) * max;
+      }
+    }
+  }
   return Object.fromEntries(nodes.map((d) => [d.id, { x: d.x ?? 0, y: d.y ?? 0 }]));
+}
+
+/** Zone centre and radius per data connection, for drawing. */
+export function zonesFor(
+  model: BusinessMapModel,
+  pos: Record<string, { x: number; y: number }>,
+): Array<{ connection: string; x: number; y: number; r: number }> {
+  return model.connections.map((c) => {
+    const pts = model.entities.filter((e) => e.connection === c).map((e) => pos[e.id]);
+    const cx = pts.reduce((a, p) => a + p.x, 0) / (pts.length || 1);
+    const cy = pts.reduce((a, p) => a + p.y, 0) / (pts.length || 1);
+    const r = Math.max(0, ...pts.map((p) => Math.hypot(p.x - cx, p.y - cy))) + 62;
+    return { connection: c, x: cx, y: cy, r };
+  });
 }

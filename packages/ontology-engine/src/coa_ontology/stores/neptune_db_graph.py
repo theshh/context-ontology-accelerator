@@ -1889,8 +1889,17 @@ class NeptuneDBGraphStore(GraphStore):
             # Only keep named-IRI domains/ranges (skip blank-node class expressions).
             if entry["domain"] is None and "domain" in b and b["domain"]["type"] == "uri":
                 entry["domain"] = b["domain"]["value"]
-            if entry["range"] is None and "range" in b and b["range"]["type"] == "uri":
-                entry["range"] = b["range"]["value"]
+            if "range" in b and b["range"]["type"] == "uri":
+                rng_value = b["range"]["value"]
+                # Accept appends triples, so a column induced first as an
+                # attribute (xsd range) and later as a relationship (class range,
+                # once its foreign key is approved) carries BOTH ranges. Prefer
+                # the class range: it is the newer, more specific statement.
+                current = entry["range"]
+                current_is_literal = current is not None and (current.startswith(_XSD) or current == RDFS + "Literal")
+                new_is_literal = rng_value.startswith(_XSD) or rng_value == RDFS + "Literal"
+                if current is None or (current_is_literal and not new_is_literal):
+                    entry["range"] = rng_value
 
         object_properties: list[dict] = []
         datatype_properties: list[dict] = []
@@ -1911,7 +1920,12 @@ class NeptuneDBGraphStore(GraphStore):
                 continue
             rng = entry.get("range") or ""
             is_literal_range = rng.startswith(_XSD) or rng == RDFS + "Literal"
-            if is_datatype or (not is_object and is_literal_range):
+            # A property typed BOTH owl:ObjectProperty and owl:DatatypeProperty
+            # (see the range note above) is a relationship when it has a class
+            # range; only a literal range keeps it an attribute.
+            if is_object and is_datatype and rng and not is_literal_range:
+                object_properties.append(entry)
+            elif is_datatype or (not is_object and is_literal_range):
                 datatype_properties.append(entry)
             else:
                 object_properties.append(entry)

@@ -205,6 +205,38 @@ class TestGetOntologyOverview:
         assert "https://ex.org/o#matchConfidence" not in obj
         assert "https://ex.org/o#matchConfidence" not in dat
 
+    def test_column_promoted_to_relationship_by_a_later_accept(self):
+        # Accept appends triples. A column induced first as an attribute (xsd
+        # range, owl:DatatypeProperty) and later as a relationship (once its
+        # foreign key was approved: class range, owl:ObjectProperty) carries both.
+        # It is a relationship, whichever row Neptune returns first.
+        p = "https://ex.org/o#employment_agencyCode"
+        rows = [
+            {
+                "p": _uri(p),
+                "type": _uri(OWL + "DatatypeProperty"),
+                "domain": _uri("https://ex.org/o#Employment"),
+                "range": _uri(_XSD + "string"),
+            },
+            {
+                "p": _uri(p),
+                "type": _uri(OWL + "ObjectProperty"),
+                "domain": _uri("https://ex.org/o#Employment"),
+                "range": _uri("https://ex.org/o#DimAgency"),
+            },
+            {"p": _uri(p), "type": _uri(RDF + "Property"), "label": _lit("agency_code")},
+        ]
+        store = NeptuneDBGraphStore(namespace="ns")
+        for ordered in (rows, list(reversed(rows))):
+            with patch(
+                "coa_ontology.stores.neptune_db_graph._sparql_query",
+                side_effect=[_rows(), _rows(*ordered)],
+            ):
+                overview = store.get_ontology_overview("https://ex.org/o#", namespace="ns")
+            assert [o["uri"] for o in overview["object_properties"]] == [p]
+            assert overview["object_properties"][0]["range"] == "https://ex.org/o#DimAgency"
+            assert overview["datatype_properties"] == []
+
     def test_annotation_property_also_object_property_is_kept(self):
         # Guard the exclusion's boundary: a property explicitly declared an
         # owl:ObjectProperty is still a relationship even if it also carries an

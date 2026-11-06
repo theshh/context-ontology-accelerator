@@ -20,7 +20,7 @@ import {
 } from "chart.js";
 import { EdgeLine, GraphController } from "chartjs-chart-graph";
 import type { BusinessMapModel } from "./model";
-import { layoutBusinessMap } from "./model";
+import { layoutBusinessMap, zonesFor } from "./model";
 
 Chart.register(GraphController, EdgeLine, LinearScale, PointElement);
 
@@ -88,10 +88,9 @@ export function BusinessMapChart({
     const E = model.entities;
     const L = model.links;
     const ruleUses = (i: number, rule: string) => E[i].rules.includes(rule);
-    const focus = () =>
-      state.current.hover >= 0
-        ? state.current.hover
-        : (idx[state.current.selected ?? ""] ?? -1);
+    // Dimming follows the pointer (or a chosen rule) only; a selected circle is
+    // outlined but does not grey out the rest of the map.
+    const focus = () => state.current.hover;
     const active = (i: number) => {
       const r = state.current.highlightRule;
       if (r) return ruleUses(i, r);
@@ -126,6 +125,34 @@ export function BusinessMapChart({
       id: "businessMapLabels",
       beforeDatasetsDraw(chart) {
         const { ctx } = chart;
+        const pts = chart.getDatasetMeta(0).data;
+        // One soft zone per data connection, behind its circles, labelled with
+        // the connection's name, so "where does this come from" reads at a glance.
+        ctx.save();
+        const sx = chart.scales.x;
+        const sy = chart.scales.y;
+        const scale = Math.abs(sx.getPixelForValue(1) - sx.getPixelForValue(0));
+        for (const z of zonesFor(model, pos)) {
+          const cx = sx.getPixelForValue(z.x);
+          const cy = sy.getPixelForValue(z.y);
+          const r = z.r * scale;
+          const col = connectionColour(model, z.connection);
+          ctx.fillStyle = pale(col, 0.07);
+          ctx.strokeStyle = pale(col, 0.25);
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+          ctx.font = "700 11px 'Open Sans', 'Helvetica Neue', Arial, sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillStyle = col;
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = "#ffffff";
+          ctx.strokeText(z.connection.toUpperCase(), cx, cy - r - 7);
+          ctx.fillText(z.connection.toUpperCase(), cx, cy - r - 7);
+        }
+        ctx.restore();
         ctx.save();
         ctx.shadowColor = "rgba(0,7,22,.18)";
         ctx.shadowBlur = 8;
@@ -165,30 +192,52 @@ export function BusinessMapChart({
           ctx.fillStyle = on ? "#033160" : "#5f6b7a";
           ctx.fillText(l.label, x, y + 0.5);
         }
-        E.forEach((e, i) => {
+        // Names: most-used things first; a name that would overlap one already
+        // drawn is skipped. The hovered circle's name always
+        // shows, so every name is one hover away.
+        const placed: Array<[number, number, number, number]> = [];
+        const hit = (b: [number, number, number, number]) =>
+          placed.some((q) => b[0] < q[2] && b[2] > q[0] && b[1] < q[3] && b[3] > q[1]);
+        const order = E.map((_, i) => i).sort((a, b) => {
+          const h = state.current.hover;
+          if (a === h) return -1;
+          if (b === h) return 1;
+          return E[b].rules.length - E[a].rules.length;
+        });
+        ctx.font = "700 13.5px 'Open Sans', 'Helvetica Neue', Arial, sans-serif";
+        for (const i of order) {
+          const e = E[i];
           const p = pts[i];
-          if (!p) return;
+          if (!p) continue;
           const r = radius(e.rules.length);
-          ctx.globalAlpha = active(i) ? 1 : 0.45;
-          ctx.font = "700 13.5px 'Open Sans', 'Helvetica Neue', Arial, sans-serif";
+          const w = ctx.measureText(e.label).width;
+          const box: [number, number, number, number] = [p.x - w / 2 - 3, p.y + r + 5, p.x + w / 2 + 3, p.y + r + 23];
+          if (i !== state.current.hover && hit(box)) continue;
+          placed.push(box);
+          ctx.globalAlpha = active(i) ? 1 : 0.4;
           ctx.lineWidth = 4;
           ctx.strokeStyle = "#ffffff";
           ctx.fillStyle = "#000716";
           ctx.strokeText(e.label, p.x, p.y + r + 14);
           ctx.fillText(e.label, p.x, p.y + r + 14);
-          if (e.rules.length) {
-            ctx.font = "700 12px 'Open Sans', 'Helvetica Neue', Arial, sans-serif";
-            ctx.fillStyle = "#ffffff";
-            ctx.fillText(String(e.rules.length), p.x, p.y + 0.5);
-          }
+        }
+        ctx.font = "700 12px 'Open Sans', 'Helvetica Neue', Arial, sans-serif";
+        E.forEach((e, i) => {
+          const p = pts[i];
+          if (!p || !e.rules.length) return;
+          ctx.globalAlpha = active(i) ? 1 : 0.4;
+          ctx.fillStyle = "#ffffff";
+          ctx.fillText(String(e.rules.length), p.x, p.y + 0.5);
         });
         ctx.restore();
       },
     };
 
-    const xs = E.map((e) => pos[e.id].x);
-    const ys = E.map((e) => pos[e.id].y);
-    const pad = 90;
+    const zs = zonesFor(model, pos);
+    const minX = Math.min(...zs.map((z) => z.x - z.r)) - 10;
+    const maxX = Math.max(...zs.map((z) => z.x + z.r)) + 10;
+    const minY = Math.min(...zs.map((z) => z.y - z.r)) - 10;
+    const maxY = Math.max(...zs.map((z) => z.y + z.r)) + 10;
     const chart = new Chart(canvas, {
       type: "graph",
       data: {
@@ -227,12 +276,14 @@ export function BusinessMapChart({
         ],
       },
       options: {
-        maintainAspectRatio: false,
+        // The data box keeps its own aspect ratio so zones stay circles.
+        maintainAspectRatio: true,
+        aspectRatio: (maxX - minX) / (maxY - minY),
         animation: { duration: 200 },
         layout: { padding: { top: 30, bottom: 40, left: 30, right: 30 } },
         scales: {
-          x: { display: false, min: Math.min(...xs) - pad, max: Math.max(...xs) + pad },
-          y: { display: false, min: Math.min(...ys) - pad, max: Math.max(...ys) + pad },
+          x: { display: false, min: minX, max: maxX },
+          y: { display: false, min: minY, max: maxY },
         },
         plugins: { legend: { display: false }, tooltip: { enabled: false } },
         onHover: (ev, els) => {
@@ -263,7 +314,7 @@ export function BusinessMapChart({
   }, [selected, highlightRule]);
 
   return (
-    <div style={{ position: "relative", height }}>
+    <div style={{ position: "relative", maxHeight: height, display: "flex", justifyContent: "center" }}>
       <canvas
         ref={canvasRef}
         role="img"

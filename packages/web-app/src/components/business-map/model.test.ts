@@ -94,3 +94,25 @@ describe("buildBusinessMap", () => {
     expect(new Set(pts.map((p) => `${Math.round(p.x)},${Math.round(p.y)}`)).size).toBe(3);
   });
 });
+
+describe("groupLookAlikes", () => {
+  it("folds leaf tables with the same connection and links into one circle", () => {
+    const cls = ["dim_grade", "psd_by_age", "psd_by_gender", "psd_by_tenure", "officer"].map((t) => ({ uri: `${NS}${t}`, label: t }));
+    const rel = (d: string, r: string, l: string) => ({ uri: `${NS}${d}_${l}`, label: l, domain: `${NS}${d}`, range: `${NS}${r}` });
+    const model = buildBusinessMap(
+      cls,
+      [rel("psd_by_age", "dim_grade", "executive_level"), rel("psd_by_gender", "dim_grade", "executive_level"), rel("psd_by_tenure", "dim_grade", "executive_level"), rel("officer", "dim_grade", "grade_code")],
+      [],
+      [],
+      { psd_by_age: "PSD open", psd_by_gender: "PSD open", psd_by_tenure: "PSD open", dim_grade: "Reference", officer: "HR" },
+    );
+    const group = model.entities.find((e) => e.id === "group:PSD open")!;
+    expect(group.label).toBe("PSD open (3 datasets)");
+    expect(group.members).toEqual(["PSD by age", "PSD by gender", "PSD by tenure"]);
+    expect(model.entities.map((e) => e.id)).not.toContain("psd_by_age");
+    expect(model.links).toContainEqual({ source: "group:PSD open", target: "dim_grade", label: "executive level" });
+    expect(model.links.filter((l) => l.source === "group:PSD open")).toHaveLength(1);
+    // A lone table with its own link is left alone.
+    expect(model.entities.map((e) => e.id)).toContain("officer");
+  });
+});
