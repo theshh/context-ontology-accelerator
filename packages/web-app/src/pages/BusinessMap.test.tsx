@@ -4,28 +4,28 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
-import type { BusinessMapModel } from "@components/business-map/model";
 
 const NS = "http://coa.amazon.com/namespace/ns-1/ontology/induced#";
 
-// The canvas needs a real 2D context; the page test checks the data wiring and
-// the side panel, so the chart is replaced by buttons that select a circle.
-vi.mock("@components/business-map/BusinessMapChart", () => ({
-  connectionColour: () => "#0972d3",
-  BusinessMapChart: ({
-    model,
-    onSelect,
+// React Flow needs real layout; the page test checks the data wiring and the
+// side panel, so the graph is replaced by buttons that select a node.
+vi.mock("@components/graph/OntologyGraphFlow", () => ({
+  OntologyGraphFlow: ({
+    nodes,
+    edges,
+    onNodeSelect,
   }: {
-    model: BusinessMapModel;
-    onSelect: (id: string) => void;
+    nodes: Array<{ id: string; label: string; kind: string }>;
+    edges: Array<{ source: string; target: string; label?: string }>;
+    onNodeSelect: (n: { id: string; label: string; kind: string }) => void;
   }) => (
     <div data-testid="map">
-      {model.entities.map((e) => (
-        <button key={e.id} onClick={() => onSelect(e.id)}>
-          circle {e.label}
+      {nodes.map((n) => (
+        <button key={n.id} onClick={() => onNodeSelect(n)}>
+          circle {n.label}
         </button>
       ))}
-      <span>{model.links.map((l) => `${l.source}-${l.label}-${l.target}`).join(",")}</span>
+      <span>{edges.map((l) => `${l.source}-${l.label}-${l.target}`).join(",")}</span>
     </div>
   ),
 }));
@@ -136,5 +136,16 @@ describe("BusinessMapPage", () => {
     await screen.findByText("circle Officer");
     expect(screen.getByText("business things")).toBeInTheDocument();
     expect(screen.getByText("document collections")).toBeInTheDocument();
+  });
+});
+
+describe("BusinessMapPage rule filter", () => {
+  it("narrows the map to the things a rule uses", async () => {
+    renderPage();
+    await screen.findByText("circle Officer");
+    await userEvent.click(screen.getByRole("button", { name: /All business things/ }));
+    await userEvent.click(await screen.findByText("Headcount", { selector: "[data-testid] *, span" }).catch(() => screen.getAllByText("Headcount").slice(-1)[0]));
+    await waitFor(() => expect(screen.queryByText("circle Officer")).not.toBeInTheDocument());
+    expect(screen.getByText("circle Employment")).toBeInTheDocument();
   });
 });

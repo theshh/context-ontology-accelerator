@@ -18,7 +18,8 @@ import Container from "@cloudscape-design/components/container";
 import Grid from "@cloudscape-design/components/grid";
 import Header from "@cloudscape-design/components/header";
 import Link from "@cloudscape-design/components/link";
-import SegmentedControl from "@cloudscape-design/components/segmented-control";
+import FormField from "@cloudscape-design/components/form-field";
+import Select from "@cloudscape-design/components/select";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Spinner from "@cloudscape-design/components/spinner";
 import {
@@ -31,18 +32,16 @@ import { useListSources } from "@api-hooks/use-list-sources";
 import { useListMetrics } from "@api-hooks/use-metrics";
 import { OVERVIEW_PAGE_LIMIT } from "@api-hooks/use-ontology-overview";
 import {
-  BusinessMapChart,
-  connectionColour,
-} from "@components/business-map/BusinessMapChart";
+  OntologyGraphFlow,
+  type GraphEdgeData,
+  type GraphNodeData,
+} from "@components/graph/OntologyGraphFlow";
 import {
   buildBusinessMap,
   humanize,
   type MapClassInput,
   type MapPropertyInput,
 } from "@components/business-map/model";
-
-/** At most this many rule chips above the map; the rest stay in the panel. */
-const MAX_RULE_CHIPS = 5;
 
 export const BusinessMapPage: React.FC = () => {
   const { namespaceId = "" } = useParams<{ namespaceId: string }>();
@@ -152,15 +151,44 @@ export const BusinessMapPage: React.FC = () => {
     // Default to the most-used thing so the panel is never empty.
     [...model.entities].sort((a, b) => b.rules.length - a.rules.length)[0];
 
-  const ruleChips = useMemo(
-    () =>
-      [...model.rules]
+  const ruleByName = Object.fromEntries(model.rules.map((r) => [r.name, r]));
+  const ruleOptions = useMemo(
+    () => [
+      { value: "all", label: "All business things" },
+      ...[...model.rules]
         .filter((r) => r.entities.length > 0)
-        .sort((a, b) => b.entities.length - a.entities.length)
-        .slice(0, MAX_RULE_CHIPS),
+        .sort((a, b) => a.label.localeCompare(b.label))
+        .map((r) => ({
+          value: r.name,
+          label: r.label,
+          description: `Uses ${r.entities.length} ${r.entities.length === 1 ? "thing" : "things"}`,
+        })),
+    ],
     [model.rules],
   );
-  const ruleByName = Object.fromEntries(model.rules.map((r) => [r.name, r]));
+
+  // The same graph the Graph explorer draws: one class node per business
+  // thing, one labelled relationship edge per link. Choosing a rule narrows
+  // the picture to the things that rule reads.
+  const graph = useMemo(() => {
+    const keep =
+      rule === "all"
+        ? null
+        : new Set(model.entities.filter((e) => e.rules.includes(rule)).map((e) => e.id));
+    const nodes: GraphNodeData[] = model.entities
+      .filter((e) => !keep || keep.has(e.id))
+      .map((e) => ({ id: e.id, label: e.label, kind: "class" }));
+    const edges: GraphEdgeData[] = model.links
+      .filter((l) => !keep || (keep.has(l.source) && keep.has(l.target)))
+      .map((l) => ({
+        id: `${l.source}|${l.label}|${l.target}`,
+        source: l.source,
+        target: l.target,
+        label: l.label,
+        kind: "objectProperty",
+      }));
+    return { nodes, edges };
+  }, [model, rule]);
 
   if (loading) {
     return (
@@ -196,63 +224,42 @@ export const BusinessMapPage: React.FC = () => {
   return (
     <SpaceBetween size="m">
       <Box color="text-body-secondary">
-        The things this context graph keeps records about and how they connect.
-        Bigger circles are used by more rules. Hover a circle to trace its
-        connections; click it for details.
+        The things this context graph keeps records about, and how they connect.
       </Box>
       <Grid gridDefinition={[{ colspan: { default: 12, l: 8 } }, { colspan: { default: 12, l: 4 } }]}>
-        <Container disableContentPaddings>
-          <div style={{ padding: "12px 16px 0" }}>
-            <SegmentedControl
-              label="Show the things a rule uses"
-              selectedId={rule}
-              onChange={({ detail }) => setRule(detail.selectedId)}
-              options={[
-                { id: "all", text: "Everything" },
-                ...ruleChips.map((r) => ({ id: r.name, text: r.label })),
-              ]}
-            />
-          </div>
-          <BusinessMapChart
-            model={model}
-            selected={current?.id ?? null}
-            highlightRule={rule === "all" ? null : rule}
-            onSelect={(id) => {
-              setSelected(id);
-              setRule("all");
-            }}
-          />
-          <div
-            style={{
-              display: "flex",
-              flexWrap: "wrap",
-              gap: 16,
-              padding: "10px 16px",
-              borderTop: "1px solid var(--color-border-divider-default, #e9ebed)",
-              fontSize: 12,
-            }}
-          >
-            {model.connections.map((c) => (
-              <span key={c} style={{ color: "var(--color-text-body-secondary, #5f6b7a)" }}>
-                <i
-                  aria-hidden
-                  style={{
-                    display: "inline-block",
-                    width: 11,
-                    height: 11,
-                    borderRadius: "50%",
-                    marginRight: 6,
-                    verticalAlign: -1,
-                    background: connectionColour(model, c),
-                  }}
-                />
-                {c}
-              </span>
-            ))}
-            <span style={{ color: "var(--color-text-body-secondary, #5f6b7a)" }}>
-              Number in a circle = rules that use it
-            </span>
-          </div>
+        <Container
+          header={
+            <Header
+              variant="h2"
+              description="Click a circle to see what it is, where its data lives and which rules use it. Scroll to zoom; drag to move."
+            >
+              Business map
+            </Header>
+          }
+        >
+          <SpaceBetween size="s">
+            <FormField
+              label="Show only what a rule uses"
+              description="Pick a rule (governed metric) to see just the business things it reads."
+            >
+              <Select
+                selectedOption={ruleOptions.find((o) => o.value === rule) ?? ruleOptions[0]}
+                onChange={({ detail }) => setRule(detail.selectedOption.value ?? "all")}
+                options={ruleOptions}
+                filteringType={ruleOptions.length > 8 ? "auto" : "none"}
+              />
+            </FormField>
+            <div style={{ height: 600 }}>
+              <OntologyGraphFlow
+                key={rule}
+                nodes={graph.nodes}
+                edges={graph.edges}
+                layout="force"
+                collapseStandalone={false}
+                onNodeSelect={(n) => n && setSelected(n.id)}
+              />
+            </div>
+          </SpaceBetween>
         </Container>
 
         <SpaceBetween size="m">
@@ -266,6 +273,11 @@ export const BusinessMapPage: React.FC = () => {
             >
               <SpaceBetween size="s">
                 {current.description && <Box>{current.description}</Box>}
+                {current.members && (
+                  <Box variant="small" color="text-body-secondary">
+                    Groups {current.members.length} similar datasets: {current.members.join(", ")}.
+                  </Box>
+                )}
                 <Box variant="awsui-key-label">Rules that use it</Box>
                 {current.rules.length === 0 ? (
                   <Box color="text-body-secondary">No rule uses this yet.</Box>

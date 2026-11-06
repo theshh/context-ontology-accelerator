@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import {
   buildBusinessMap,
   humanize,
-  layoutBusinessMap,
   relationshipLabel,
   tablesUsedBy,
 } from "./model";
@@ -86,13 +85,6 @@ describe("buildBusinessMap", () => {
     expect(model.entities.find((e) => e.id === "employment")?.rules).toEqual(["headcount"]);
   });
 
-  it("lays every entity out at a finite, distinct position", () => {
-    const pos = layoutBusinessMap(model);
-    const pts = Object.values(pos);
-    expect(pts).toHaveLength(3);
-    pts.forEach((p) => expect(Number.isFinite(p.x) && Number.isFinite(p.y)).toBe(true));
-    expect(new Set(pts.map((p) => `${Math.round(p.x)},${Math.round(p.y)}`)).size).toBe(3);
-  });
 });
 
 describe("groupLookAlikes", () => {
