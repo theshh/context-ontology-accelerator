@@ -17,14 +17,18 @@ import re
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import boto3
 import structlog
 from coa_common import resolve_namespace_id, resolve_region, sync_boto_config
+from coa_common.constants import GRAPH_BACKED_SUB_TYPES, StructuredBackend
+from coa_common.language_tags import LanguageTagError, canonicalize_language_tag, effective_namespace_language
+from coa_common.neptune_endpoints import GRAPH_CLUSTER_CLAIM_SK, is_graph_cluster_claim_pk
 
 from ..query_utils import validate_namespace
+from ..tier2.table_qualifier import AMBIGUOUS_SOURCE
 
 logger = structlog.get_logger(__name__)
 
@@ -32,6 +36,10 @@ _IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 _WORKGROUP_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+$")
 _RESOLVE_TIMEOUT_S = 5.0
 _CACHE_TTL_S = 120.0
+# A failed Glue listing is retried sooner than a good one is refreshed: until it
+# is, every table it would have placed stays unplaced (and a cross-database query
+# is refused), so one throttle should not cost two minutes.
+_FAILED_LISTING_TTL_S = 15.0
 # Max SRC# records fetched per namespace query. If DynamoDB reports more results
 # beyond this page (LastEvaluatedKey present), callers that derive a zero-count
 # signal (get_source_composition) MUST treat the read as unknown, since a source
@@ -42,12 +50,28 @@ _QUERY_LIMIT = 50
 # (TTL alone only invalidates on read, it never evicts).
 _ITEMS_CACHE_MAX = 1024
 
+
+class NamespaceLanguageUnavailableError(RuntimeError):
+    """The namespace's language could not be determined.
+
+    Raised for a missing namespace item, a failed read, or a stored value that is
+    not a supported tag. Never resolved to ``en``: only an existing item without a
+    ``language`` attribute (a namespace created before the field) reads as ``en``.
+    """
+
+
 # Source-type literals as stored in the sources DDB table (mirror of the
 # generated control-plane SourceType enum: DATABASE / DOCUMENTS). Kept as string
 # literals here to avoid a cross-package import into the serve path — the same
 # literals are already used for routing at find_database_source / find_sole_database_source.
 _SOURCE_TYPE_DATABASE = "DATABASE"
 _SOURCE_TYPE_DOCUMENTS = "DOCUMENTS"
+_GLUE_SUB_TYPE = "GLUE_DATABASE"
+# Athena's root catalog, lower-cased as the scope comparison is.
+_ROOT_CATALOG_LC = "awsdatacatalog"
+
+# (namespace, sorted (glue catalog id, database) pairs) — see `_glue_table_owners`.
+_GlueListingKey = tuple[str, tuple[tuple[str, str], ...]]
 
 
 @dataclass(frozen=True)
@@ -76,16 +100,73 @@ class SourceComposition:
     ``unknown`` is True when the composition could not be determined (registry
     unavailable, timeout, or error). Callers MUST fail open on unknown — i.e. run
     every tier — so a lookup miss never silently drops a tier that would answer.
+
+    ``structured_backends`` says WHICH structured backends the DATABASE sources need:
+    ``SQL`` for relational sources, ``RDF_SPARQL`` for graph sources. Tier-2 runs only
+    the strategies whose backends intersect it. When not given it is derived from
+    ``has_structured_source`` as ``{SQL}`` — the meaning every composition had before
+    graph sources existed.
     """
 
     has_structured_source: bool
     has_unstructured_source: bool
     unknown: bool = False
+    structured_backends: frozenset[StructuredBackend] | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        """Derive ``structured_backends`` from ``has_structured_source`` when not given."""
+        if self.structured_backends is None:
+            derived = frozenset({StructuredBackend.SQL}) if self.has_structured_source else frozenset()
+            object.__setattr__(self, "structured_backends", derived)
 
     @classmethod
     def unknown_composition(cls) -> SourceComposition:
-        """Fail-open sentinel: treat the namespace as if it has every source type."""
-        return cls(has_structured_source=True, has_unstructured_source=True, unknown=True)
+        """Fail-open sentinel: treat the namespace as if it has every source type.
+
+        Tier gating fails open (every tier runs), but strategy selection fails SAFE to
+        the SQL default: an uncertain read must not start routing questions to a graph
+        strategy the namespace may not have.
+        """
+        return cls(
+            has_structured_source=True,
+            has_unstructured_source=True,
+            unknown=True,
+            structured_backends=frozenset({StructuredBackend.SQL}),
+        )
+
+
+def _is_graph_source(item: dict[str, Any]) -> bool:
+    """A DATABASE row whose data is an RDF graph served over SPARQL, not SQL."""
+    return item.get("sourceType") == _SOURCE_TYPE_DATABASE and item.get("sourceSubType") in GRAPH_BACKED_SUB_TYPES
+
+
+def _is_sql_source(item: dict[str, Any]) -> bool:
+    """A DATABASE row answered by SQL.
+
+    Graph rows share sourceType DATABASE but have no catalog, database or schema, so
+    every SQL lookup must skip them.
+    """
+    return item.get("sourceType") == _SOURCE_TYPE_DATABASE and not _is_graph_source(item)
+
+
+def _glue_database_mismatch(item: dict[str, Any], database: str, namespace: str) -> bool:
+    """True when a Glue record's ``discoveredSchemas[0]`` is not its ``database``.
+
+    The executor runs a Glue record against ``discoveredSchemas[0]`` when there is
+    one (AthenaQueryExecutor), not ``athenaDatabase``. When the two disagree the
+    record is not used to place tables, and a legacy root-catalog record is not
+    granted either: both would act on a database the source is not queried as.
+    """
+    discovered = [str(d).lower() for d in item.get("discoveredSchemas") or []]
+    if not discovered or discovered[0] == database:
+        return False
+    logger.warning(
+        "glue_database_mismatch",
+        namespace=namespace,
+        athena_database=database,
+        discovered_schema=discovered[0],
+    )
+    return True
 
 
 class SourcesRegistry:
@@ -125,6 +206,20 @@ class SourcesRegistry:
         # _query_sources), so the cache only ever holds complete result sets.
         self._items_cache: OrderedDict[str, tuple[list[dict[str, Any]], float]] = OrderedDict()
         self._cache_lock = asyncio.Lock()
+        # Namespace language is immutable once the namespace exists, so a value
+        # read from its METADATA item never goes stale. Bounded LRU, no TTL.
+        self._language_cache: OrderedDict[str, str] = OrderedDict()
+        # Only a namespace pooling several Glue databases ever lists the catalog
+        # (see ``table_placements``). Keyed by (namespace, listed databases), so a
+        # source added or removed since the listing is a cache miss, not a stale
+        # answer about which databases hold a name.
+        self._glue: Any = (
+            boto3.client("glue", region_name=self._region, config=sync_boto_config()) if self._table_name else None
+        )
+        self._glue_tables_cache: OrderedDict[_GlueListingKey, tuple[dict[str, set[str]] | None, float]] = OrderedDict()
+        # One listing in flight per key: a burst of cache misses shares it rather
+        # than each holding a pool thread (a timed-out listing keeps its thread).
+        self._glue_inflight: dict[_GlueListingKey, asyncio.Future[dict[str, set[str]] | None]] = {}
 
     @property
     def available(self) -> bool:
@@ -190,7 +285,66 @@ class SourcesRegistry:
         except Exception:
             logger.warning("namespace_exists_metadata_failed", namespace=namespace, exc_info=True)
             return None
-        return bool(resp.get("Item"))
+        item = resp.get("Item")
+        if item:
+            # The existence gate already holds the item: remember its language so
+            # the request's label preference costs no second read.
+            self._remember_language(namespace, item)
+        return bool(item)
+
+    def _remember_language(self, namespace: str, item: dict[str, Any]) -> None:
+        """Cache the canonical language of a loaded METADATA item, if valid."""
+        try:
+            language = canonicalize_language_tag(effective_namespace_language(item))
+        except (LanguageTagError, TypeError, AttributeError):
+            # Leave it uncached; namespace_language() re-reads and reports it.
+            return
+        self._language_cache[namespace] = language
+        self._language_cache.move_to_end(namespace)
+        while len(self._language_cache) > _ITEMS_CACHE_MAX:
+            self._language_cache.popitem(last=False)
+
+    async def namespace_language(self, namespace: str) -> str | None:
+        """Return the namespace's canonical effective language.
+
+        Returns:
+            The stored language, ``"en"`` for an existing item written before the
+            field existed, or ``None`` when no namespaces table is configured (the
+            feature is absent, as for :meth:`namespace_exists`).
+
+        Raises:
+            NamespaceLanguageUnavailableError: The table is configured but the
+                item is missing, the read failed, or the stored value is invalid.
+        """
+        if not self._namespaces_table or not self._dynamodb:
+            return None
+        cached = self._language_cache.get(namespace)
+        if cached is not None:
+            self._language_cache.move_to_end(namespace)
+            return cached
+        loop = asyncio.get_running_loop()
+        table = self._dynamodb.Table(self._namespaces_table)
+        try:
+            ns_id = await loop.run_in_executor(self._executor, lambda: resolve_namespace_id(namespace, table))
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._executor,
+                    lambda: table.get_item(Key={"PK": f"NS#{ns_id}", "SK": "METADATA"}),
+                ),
+                timeout=_RESOLVE_TIMEOUT_S,
+            )
+        except Exception as exc:
+            logger.warning("namespace_language_read_failed", namespace=namespace, error=type(exc).__name__)
+            raise NamespaceLanguageUnavailableError(f"cannot read namespace {namespace!r}") from exc
+        item = resp.get("Item")
+        if not item:
+            raise NamespaceLanguageUnavailableError(f"namespace {namespace!r} not found")
+        try:
+            language = canonicalize_language_tag(effective_namespace_language(item))
+        except (LanguageTagError, TypeError, AttributeError) as exc:
+            raise NamespaceLanguageUnavailableError(f"namespace {namespace!r} has an invalid language") from exc
+        self._remember_language(namespace, item)
+        return language
 
     async def get_source(self, namespace: str, data_source_id: str) -> dict[str, Any]:
         """Fetch a single source record by namespace + source ID."""
@@ -214,6 +368,26 @@ class SourcesRegistry:
             logger.warning("sources_registry_timeout", op="get_source", namespace=namespace)
             return {}
         return response.get("Item", {})
+
+    async def get_graph_cluster_claim(self, claim_pk: str) -> dict[str, Any]:
+        """Fetch a Neptune cluster's claim row, ``{}`` when there is none; reads no other row."""
+        if not is_graph_cluster_claim_pk(claim_pk):
+            raise ValueError(f"Invalid graph cluster claim key: {claim_pk!r}")
+        if not self.available:
+            return {}
+        loop = asyncio.get_running_loop()
+        table = self._dynamodb.Table(self._table_name)
+        try:
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._executor, lambda: table.get_item(Key={"PK": claim_pk, "SK": GRAPH_CLUSTER_CLAIM_SK})
+                ),
+                timeout=_RESOLVE_TIMEOUT_S,
+            )
+        except TimeoutError:
+            logger.warning("sources_registry_timeout", op="get_graph_cluster_claim")
+            return {}
+        return response.get("Item") or {}
 
     async def _query_sources(self, namespace: str) -> list[dict[str, Any]] | None:
         """Shared, cached DDB query for the SRC# records under a namespace.
@@ -292,9 +466,24 @@ class SourcesRegistry:
         if items is None:
             return {}
         for item in items:
-            if item.get("sourceType") == _SOURCE_TYPE_DATABASE:
+            if _is_sql_source(item):
                 return item
         return {}
+
+    async def document_sources(self, namespace: str) -> list[dict[str, Any]] | None:
+        """Return every DOCUMENTS source record registered to ``namespace``.
+
+        Used to scope reads of original document objects to the buckets and
+        prefixes a namespace actually ingested from. Returns ``None`` when the
+        inventory is uncertain (registry unavailable, timeout, or a truncated
+        page) so a caller that authorizes on this list can fail CLOSED rather
+        than treat a partial read as the complete set. Reuses the cached
+        ``_query_sources`` round-trip.
+        """
+        items = await self._query_sources(namespace)
+        if items is None:
+            return None
+        return [item for item in items if item.get("sourceType") == _SOURCE_TYPE_DOCUMENTS]
 
     async def find_sole_database_source(self, namespace: str) -> dict[str, Any] | None:
         """Find the sole DATABASE source in a namespace, or None if ambiguous.
@@ -309,8 +498,21 @@ class SourcesRegistry:
         items = await self._query_sources(namespace)
         if items is None:
             return None
-        db_sources = [item for item in items if item.get("sourceType") == _SOURCE_TYPE_DATABASE]
+        db_sources = [item for item in items if _is_sql_source(item)]
         return db_sources[0] if len(db_sources) == 1 else None
+
+    async def find_sole_graph_source(self, namespace: str) -> dict[str, Any] | None:
+        """The namespace's only RDF_SPARQL source, or None when there are zero or several.
+
+        The SPARQL strategy's last-resort routing when no retrieved class names its
+        source: sound only when exactly one graph source exists, since a guess in a
+        multi-graph namespace would query the wrong endpoint.
+        """
+        items = await self._query_sources(namespace)
+        if items is None:
+            return None
+        graph_sources = [item for item in items if _is_graph_source(item)]
+        return graph_sources[0] if len(graph_sources) == 1 else None
 
     async def database_source_count(self, namespace: str) -> int:
         """Number of DATABASE sources registered to ``namespace``.
@@ -324,7 +526,7 @@ class SourcesRegistry:
         items = await self._query_sources(namespace)
         if items is None:
             return 0
-        return sum(1 for item in items if item.get("sourceType") == _SOURCE_TYPE_DATABASE)
+        return sum(1 for item in items if _is_sql_source(item))
 
     async def sql_namespace_scope(self, namespace: str) -> SQLNamespaceScope | None:
         """Return the physical SQL objects registered to ``namespace``.
@@ -342,11 +544,28 @@ class SourcesRegistry:
         native_databases: set[str] = set()
         federated_catalog_schemas: set[tuple[str, str]] = set()
         for item in items:
-            if item.get("sourceType") != _SOURCE_TYPE_DATABASE or item.get("queryable") is False:
+            if not _is_sql_source(item) or item.get("queryable") is False:
                 continue
 
             catalog = str(item.get("athenaDataCatalogName") or "").lower()
-            if catalog:
+            # `POST /sources` copied the caller's
+            # `glueConfiguration.athenaDataCatalogName` into this attribute until
+            # 217d7c5fa (2026-09-03), and onboarding clients passed
+            # `AwsDataCatalog`, so a deployment that onboarded Glue before then
+            # still has such records. Filed as a federated
+            # (awsdatacatalog, schema) pair they authorized nothing:
+            # validate_namespace_sql_scope checks an `awsdatacatalog` reference
+            # ONLY against `native_databases`, so the qualifier's own rewrite
+            # ("awsdatacatalog"."bank_risk"."risk_ecl") was denied as outside the
+            # namespace. Such a Glue record falls through to the native path
+            # below, which authorizes its own `athenaDatabase` — the database a
+            # bare query already runs against (the executor and the qualifier
+            # still read the record as catalog `AwsDataCatalog` + its discovered
+            # schema, which names the same database). Limited to Glue records: a
+            # connector that carried this value would otherwise be granted a root
+            # database it never owned.
+            legacy_root_glue = catalog == _ROOT_CATALOG_LC and item.get("sourceSubType") == _GLUE_SUB_TYPE
+            if catalog and not legacy_root_glue:
                 for schema in item.get("discoveredSchemas") or []:
                     schema_name = str(schema).lower()
                     if _IDENTIFIER_PATTERN.fullmatch(catalog) and _IDENTIFIER_PATTERN.fullmatch(schema_name):
@@ -357,6 +576,8 @@ class SourcesRegistry:
             database = str(
                 item.get("athenaDatabase") or item.get("glueDatabaseName") or config.get("databaseName") or ""
             ).lower()
+            if legacy_root_glue and _glue_database_mismatch(item, database, namespace):
+                continue
 
             # A native Glue source can sit in a DISTINCT (non-root) Athena catalog,
             # declared at create and recorded in ``athenaCatalog`` (NOT the
@@ -400,6 +621,188 @@ class SourcesRegistry:
             native_databases=frozenset(native_databases),
             federated_catalog_schemas=frozenset(federated_catalog_schemas),
         )
+
+    async def native_glue_databases(self, namespace: str) -> dict[str, tuple[str, str]]:
+        """``source_id -> (glue catalog id, database)`` for the root-catalog Glue sources.
+
+        Only queryable Glue sources in the account's root catalog are listed: a
+        nested/federated catalog is addressed as ``catalog.schema``, not as a bare
+        database, so it cannot be named the same way.
+        """
+        items = await self._query_sources(namespace)
+        out: dict[str, tuple[str, str]] = {}
+        for item in items or []:
+            if item.get("sourceType") != _SOURCE_TYPE_DATABASE or item.get("queryable") is False:
+                continue
+            if item.get("sourceSubType") != _GLUE_SUB_TYPE:
+                continue
+            nested = [str(item.get(k) or "").lower() for k in ("athenaDataCatalogName", "athenaCatalog")]
+            if any(c and c != _ROOT_CATALOG_LC for c in nested):
+                continue
+            config = self.parse_configuration(item)
+            database = str(
+                item.get("athenaDatabase") or item.get("glueDatabaseName") or config.get("databaseName") or ""
+            ).lower()
+            if _glue_database_mismatch(item, database, namespace):
+                # Not placeable under `database`: the executor queries a different one.
+                continue
+            source_id = str(item.get("sourceId") or str(item.get("SK", "")).removeprefix("SRC#"))
+            if source_id and _IDENTIFIER_PATTERN.fullmatch(database):
+                out[source_id] = (str(config.get("catalogId") or ""), database)
+        return out
+
+    async def table_placements(self, namespace: str, table_sources: dict[str, str]) -> dict[str, tuple[str, str]]:
+        """Map each bare table name to ``(source_id, database)`` of the Glue source holding it.
+
+        Only meaningful when a namespace pools SEVERAL root-catalog Glue databases:
+        the SQL writer is shown bare table names, and a query joining tables from
+        two of them cannot run against any one default database. Returns ``{}``
+        for every other namespace, so the writer's prompt and the routing are
+        unchanged there.
+
+        A table's own ``data_source_id`` decides first. A table WITHOUT one (an
+        uploaded ontology carries no R2RML, so its classes are unplaced) is looked
+        up in the Glue catalog of the namespace's own databases, and placed only
+        when exactly one of them holds that name. A name held by two or more of them
+        (or by a database two sources share) maps to ``(AMBIGUOUS_SOURCE, "")``, so
+        a query touching it is refused rather than run against a guessed database.
+        That lookup runs only when EVERY
+        database source of the namespace is one of these Glue databases: a JDBC
+        (or nested-catalog) source cannot be listed the same way, so a same-named
+        table there would be invisible and the guess could pick the wrong source.
+        Such a table stays unplaced and is refused downstream, as before. A
+        non-queryable database source, or a Glue record whose two database fields
+        disagree, turns the lookup off for the same reason. A table whose id names
+        some other source is never looked up: it is not a Glue table.
+
+        Args:
+            namespace: Namespace whose sources bound the lookup.
+            table_sources: Bare table name -> the retrieved class's
+                ``data_source_id`` ("" when the class is unplaced).
+        """
+        sources = await self.native_glue_databases(namespace)
+        if len({db for _, db in sources.values()}) < 2:
+            return {}
+        out = {t.lower(): (s, sources[s][1]) for t, s in table_sources.items() if s in sources}
+        unplaced = [t.lower() for t, s in table_sources.items() if not s]
+        if unplaced and await self.database_source_count(namespace) == len(sources):
+            # A database two sources both register cannot name one source.
+            by_database: dict[str, list[str]] = {}
+            for source_id, (_, database) in sources.items():
+                by_database.setdefault(database, []).append(source_id)
+            catalog = await self._glue_table_owners(namespace, sorted(set(sources.values())))
+            if catalog is not None:
+                for table in unplaced:
+                    owners = catalog.get(table, set())
+                    if not owners:
+                        continue
+                    database = next(iter(owners))
+                    if len(owners) == 1 and len(by_database.get(database, [])) == 1:
+                        out[table] = (by_database[database][0], database)
+                    else:
+                        out[table] = (AMBIGUOUS_SOURCE, "")
+        return out
+
+    async def same_name_databases(self, namespace: str, tables: list[str]) -> dict[str, dict[str, str]]:
+        """For each of ``tables`` held by two or more of the namespace's Glue databases: ``{database: source_id}``.
+
+        Answers "which tables of this name exist?" independently of what retrieval
+        returned. Retrieval keeps a handful of classes, so it can return one of
+        several same-named tables (one per study, say). Nothing then collides, and
+        a query read that one table and returned its rows as the whole answer. The
+        caller treats a name listed here as shared even when one copy was
+        retrieved, and names every database in the refusal.
+
+        Only the namespace's own root-catalog Glue databases are listed (as for
+        :meth:`table_placements`), so a database outside its sources never makes a
+        name look shared, and a name only one of them holds is not returned. A
+        database two sources both register maps to ``AMBIGUOUS_SOURCE``. ``{}``
+        when the namespace holds fewer than two such databases, or when any of
+        them cannot be listed (the caller then behaves as before).
+
+        Args:
+            namespace: Namespace whose sources bound the lookup.
+            tables: Bare table names to check.
+        """
+        if not tables:
+            return {}
+        sources = await self.native_glue_databases(namespace)
+        if len({db for _, db in sources.values()}) < 2:
+            return {}
+        catalog = await self._glue_table_owners(namespace, sorted(set(sources.values())))
+        if catalog is None:
+            return {}
+        by_database: dict[str, list[str]] = {}
+        for source_id, (_, database) in sources.items():
+            by_database.setdefault(database, []).append(source_id)
+        out: dict[str, dict[str, str]] = {}
+        for table in {t.lower() for t in tables}:
+            owners = catalog.get(table, set())
+            if len(owners) < 2:
+                continue
+            out[table] = {
+                database: ids[0] if len(ids) == 1 else AMBIGUOUS_SOURCE
+                for database in sorted(owners)
+                for ids in [by_database.get(database, [])]
+            }
+        return out
+
+    async def _glue_table_owners(self, namespace: str, databases: list[tuple[str, str]]) -> dict[str, set[str]] | None:
+        """Bare table name -> the databases (of ``databases``) holding it; cached per listed set.
+
+        ``None`` when ANY database could not be listed (e.g. a cross-account
+        catalog the serve role cannot read, or a listing past the timeout): a
+        partial listing could make a name look unique when it is not. The failure
+        is cached too (for ``_FAILED_LISTING_TTL_S``), so a namespace that cannot be
+        listed pays the timeout once per window rather than on every request.
+
+        The key covers which databases were listed, not what they hold: a table
+        created in one of them is seen only after the entry expires.
+        """
+        key: _GlueListingKey = (namespace, tuple(databases))
+        cached = self._glue_tables_cache.get(key)
+        if cached is not None:
+            ttl = _CACHE_TTL_S if cached[0] is not None else _FAILED_LISTING_TTL_S
+            if time.monotonic() - cached[1] < ttl:
+                return cached[0]
+        inflight = self._glue_inflight.get(key)
+        if inflight is None:
+            inflight = asyncio.ensure_future(self._list_glue_table_owners(key))
+            self._glue_inflight[key] = inflight
+            inflight.add_done_callback(lambda _f: self._glue_inflight.pop(key, None))
+        return await asyncio.shield(inflight)
+
+    async def _list_glue_table_owners(self, key: _GlueListingKey) -> dict[str, set[str]] | None:
+        """List ``key``'s databases once and cache the result (``None`` on any failure)."""
+        namespace, databases = key
+        glue = self._glue
+
+        def _list() -> dict[str, set[str]]:
+            if glue is None:
+                raise RuntimeError("no sources table configured")
+            owners: dict[str, set[str]] = {}
+            for catalog_id, database in databases:
+                kwargs: dict[str, Any] = {"DatabaseName": database, "AttributesToGet": ["NAME"]}
+                if catalog_id:
+                    kwargs["CatalogId"] = catalog_id
+                for page in glue.get_paginator("get_tables").paginate(**kwargs):
+                    for table in page.get("TableList", []):
+                        owners.setdefault(str(table["Name"]).lower(), set()).add(database)
+            return owners
+
+        loop = asyncio.get_running_loop()
+        owners: dict[str, set[str]] | None
+        try:
+            owners = await asyncio.wait_for(loop.run_in_executor(self._executor, _list), timeout=_RESOLVE_TIMEOUT_S)
+        except Exception as e:
+            # Degrade to "unplaced": the table stays bare and is handled as before.
+            logger.warning("glue_table_owners_failed", namespace=namespace, error=f"{type(e).__name__}: {str(e)[:120]}")
+            owners = None
+        self._glue_tables_cache[key] = (owners, time.monotonic())
+        self._glue_tables_cache.move_to_end(key)
+        while len(self._glue_tables_cache) > _ITEMS_CACHE_MAX:
+            self._glue_tables_cache.popitem(last=False)
+        return owners
 
     async def get_source_composition(self, namespace: str) -> SourceComposition:
         """Return which source types a namespace has (for serve-tier gating).
@@ -450,8 +853,18 @@ class SourcesRegistry:
 
         has_structured_source = any(item.get("sourceType") == _SOURCE_TYPE_DATABASE for item in items)
         has_unstructured_source = any(item.get("sourceType") == _SOURCE_TYPE_DOCUMENTS for item in items)
+        # Derived from the sub-type alone (absent or any non-graph sub-type → SQL), so
+        # every pre-existing source keeps meaning {SQL}.
+        structured_backends: set[StructuredBackend] = set()
+        for item in items:
+            if _is_graph_source(item):
+                structured_backends.add(StructuredBackend.RDF_SPARQL)
+            elif _is_sql_source(item):
+                structured_backends.add(StructuredBackend.SQL)
         return SourceComposition(
-            has_structured_source=has_structured_source, has_unstructured_source=has_unstructured_source
+            has_structured_source=has_structured_source,
+            has_unstructured_source=has_unstructured_source,
+            structured_backends=frozenset(structured_backends),
         )
 
     async def resolve_database_name(self, namespace: str, data_source_id: str = "") -> str:

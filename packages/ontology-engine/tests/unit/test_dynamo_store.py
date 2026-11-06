@@ -65,6 +65,9 @@ class _FakeDynamoTable:
         # (≤1 MB per page) even with no ``Limit`` — set this to force multi-page
         # drains (e.g. an orphan on page 2). ``None`` = everything in one page.
         self.page_size = page_size
+        # Every ``scan`` call's kwargs, so tests can count reads and check what
+        # was sent (e.g. no per-call ``Limit``).
+        self.scan_calls: list[dict] = []
 
     def put_item(self, Item):
         self.items[(Item["PK"], Item["SK"])] = dict(Item)
@@ -115,9 +118,6 @@ class _FakeDynamoTable:
         return {}
 
     def scan(self, **kwargs):
-        filter_expr: str = kwargs.get("FilterExpression", "")
-        values: dict[str, Any] = kwargs.get("ExpressionAttributeValues", {}) or {}
-        names: dict[str, str] = kwargs.get("ExpressionAttributeNames", {}) or {}
         # DynamoDB ``Limit`` caps items SCANNED per page (not returned), so a page
         # can return fewer matches than requested and set LastEvaluatedKey. We
         # model that faithfully: walk the raw store from ExclusiveStartKey, read
@@ -125,7 +125,26 @@ class _FakeDynamoTable:
         # slice, and emit LastEvaluatedKey when more raw items remain. This is
         # what makes a paginated drain testable with a row on page 2. Without a
         # Limit, everything is one page.
-        ordered = list(self.items.items())  # [((PK, SK), item), ...] insertion order
+        self.scan_calls.append(dict(kwargs))
+        return self._read(list(self.items.items()), **kwargs)
+
+    def query(self, **kwargs):
+        """``Query`` for the one key condition the registry listing uses.
+
+        ``PK = :pk AND begins_with(SK, :skp)``: the partition's rows, then the
+        same paging and post-read filtering as :meth:`scan`.
+        """
+        assert kwargs["KeyConditionExpression"] == "PK = :pk AND begins_with(SK, :skp)"
+        values = kwargs["ExpressionAttributeValues"]
+        ordered = [
+            (k, item) for k, item in self.items.items() if k[0] == values[":pk"] and k[1].startswith(values[":skp"])
+        ]
+        return self._read(ordered, **kwargs)
+
+    def _read(self, ordered: list, **kwargs):
+        filter_expr: str = kwargs.get("FilterExpression", "")
+        values: dict[str, Any] = kwargs.get("ExpressionAttributeValues", {}) or {}
+        names: dict[str, str] = kwargs.get("ExpressionAttributeNames", {}) or {}
         start = 0
         start_key = kwargs.get("ExclusiveStartKey")
         if start_key is not None:
@@ -731,6 +750,91 @@ class TestListProposalsScanPaginationDrain:
 
         # All three, incl. the page-2 row. A single-page scan would drop p3.
         assert {r["proposal_id"] for r in rows} == {"p1", "p2", "p3"}
+
+
+class TestListProposalsNewestFirst:
+    """``list_proposals`` returns the NEWEST matches, newest first, across scan pages.
+
+    A Scan has no order, so a capped list must drain every page and sort before it
+    cuts, or a namespace holding more than ``limit`` matches gets an arbitrary
+    subset (a page asking for the latest induction could see only older ones).
+    ``page_size=2`` forces a multi-page scan with the matches spread across pages.
+    """
+
+    @staticmethod
+    def _seed(table: _FakeDynamoTable, ns: str, pid: str, created_at: str | None, source_type: str) -> None:
+        item = {
+            "PK": f"{ns}#PROPOSAL#{pid}",
+            "SK": "META",
+            "proposal_id": pid,
+            "namespace": ns,
+            "proposal_type": "induction",
+            "source_type": source_type,
+            "status": "accepted",
+        }
+        if created_at is not None:
+            item["created_at"] = created_at
+        table.put_item(Item=item)
+
+    @pytest.fixture()
+    def paged(self, monkeypatch):
+        from coa_ontology import dynamo_store as ds
+
+        table = _FakeDynamoTable(page_size=2)
+        ns = "ns-newest"
+        # Storage (scan) order deliberately differs from age order; the newest
+        # structured match sits on the last page behind document inductions.
+        self._seed(table, ns, "p-old", "2026-01-01T00:00:00+00:00", "STRUCTURED")
+        for i in range(4):
+            self._seed(table, ns, f"u-{i}", f"2026-07-0{i + 1}T00:00:00+00:00", "UNSTRUCTURED")
+        self._seed(table, ns, "p-mid", "2026-03-01T00:00:00+00:00", "STRUCTURED")
+        self._seed(table, ns, "p-new", "2026-06-02T00:00:00+00:00", "STRUCTURED")
+        # Newer than everything, but in another namespace: must not match.
+        self._seed(table, "ns-other", "x-1", "2026-09-01T00:00:00+00:00", "STRUCTURED")
+        monkeypatch.setattr(ds, "_get_table", lambda: table)
+        return ns
+
+    def test_list_proposals_more_matches_than_limit_returns_newest(self, paged):
+        from coa_ontology import dynamo_store as ds
+
+        rows = ds.list_proposals(namespace=paged, proposal_type="induction", source_type="STRUCTURED", limit=2)
+
+        # The two newest structured inductions, not the first two the scan meets.
+        assert [r["proposal_id"] for r in rows] == ["p-new", "p-mid"]
+
+    def test_list_proposals_filtered_drain_is_newest_first(self, paged):
+        from coa_ontology import dynamo_store as ds
+
+        rows = ds.list_proposals(namespace=paged, proposal_type="induction", source_type="STRUCTURED", limit=None)
+
+        assert [r["proposal_id"] for r in rows] == ["p-new", "p-mid", "p-old"]
+
+    def test_list_proposals_default_limit_is_newest_first(self, paged):
+        from coa_ontology import dynamo_store as ds
+
+        rows = ds.list_proposals(namespace=paged)
+
+        assert [r["proposal_id"] for r in rows] == ["u-3", "u-2", "u-1", "u-0", "p-new", "p-mid", "p-old"]
+
+    def test_list_proposals_missing_created_at_sorts_last(self, monkeypatch):
+        from coa_ontology import dynamo_store as ds
+
+        table = _FakeDynamoTable(page_size=2)
+        self._seed(table, "ns-undated", "p-undated", None, "STRUCTURED")
+        self._seed(table, "ns-undated", "p-dated", "2026-01-01T00:00:00+00:00", "STRUCTURED")
+        monkeypatch.setattr(ds, "_get_table", lambda: table)
+
+        rows = ds.list_proposals(namespace="ns-undated")
+
+        assert [r["proposal_id"] for r in rows] == ["p-dated", "p-undated"]
+
+    def test_list_proposals_non_positive_limit_returns_empty(self, paged):
+        """A zero or negative ``limit`` returns nothing, as it did before the drain
+        (a negative slice would otherwise drop only the oldest row)."""
+        from coa_ontology import dynamo_store as ds
+
+        assert ds.list_proposals(namespace=paged, limit=0) == []
+        assert ds.list_proposals(namespace=paged, limit=-1) == []
 
 
 class TestListProposalsCrossNamespaceContainsFilter:

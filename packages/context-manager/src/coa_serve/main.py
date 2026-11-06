@@ -11,6 +11,8 @@ MCP) and coordinates downstream services through tiered resolution.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import math
 import os
 import re
 import time
@@ -20,7 +22,10 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from coa_common.constants import validate_query_text
+from coa_common.label_language import LabelPreference
+from coa_common.language_tags import LanguageTagError
 from coa_common.logging import setup_logging
+from coa_common.sparql_config import graph_sources_enabled
 from pydantic import ValidationError
 
 from .clients.athena import AthenaQueryExecutor
@@ -28,6 +33,7 @@ from .clients.bedrock import BedrockLLMClient
 from .clients.composite_executor import CompositeQueryExecutor
 from .clients.neptune import NeptuneGraphClient
 from .clients.opensearch import OpenSearchVectorClient
+from .clients.sparql_clients import SparqlClientCache
 from .config import ServiceConfig, load_config
 from .exceptions import (
     AccessDeniedError,
@@ -40,8 +46,9 @@ from .exceptions import (
 from .guardrail_config import GuardrailConfigProvider, build_guardrail_config_provider
 from .identity import extract_jwt_identity, resolve_principal, resolve_user_id
 from .models import InvokeRequest, TraceStep
+from .namespace_language import bind_label_preference
 from .orchestrator import Orchestrator
-from .role_resolver import ResolvedProfile, resolve_profile
+from .role_resolver import ResolvedProfile, may_view_debug_info, resolve_profile
 from .session import SessionManager
 from .session_actions import (
     handle_create_session,
@@ -62,10 +69,16 @@ from .tier2.ontop.sparql_example_loader import FewShotExampleLoader
 from .tier2.ontop.strategy import OntopStrategy
 from .tier2.ontop.vkg_translator import VKGTranslator
 from .tier2.skip.aoss_provenance import AossProvenanceEvaluator
+from .tier2.sparql.nl_to_sparql import NativeNLtoSPARQL
+from .tier2.sparql.strategy import SparqlStrategy
 from .tier2.sql_firewall import SQLFirewall
-from .tier2.strategy import StructuredQueryTier
-from .tier3.graph_traverser import GraphTraverser
-from .tier3.knowledge_retriever import KnowledgeRetriever
+from .tier2.strategy import StrategyOption, StructuredQueryTier
+from .tier3.graph_traverser import GraphTraverser, is_traversable_uri
+from .tier3.knowledge_retriever import (
+    KnowledgeRetriever,
+    _supporting_content_from_chunk,
+    _validated_document_chunks,
+)
 from .tier3.synthesizer import Synthesizer
 
 if TYPE_CHECKING:
@@ -77,7 +90,16 @@ from .trace import TraceCollector
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
 
-app = BedrockAgentCoreApp()
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    """Release long-lived per-source SPARQL clients when the runtime shuts down."""
+    yield
+    if _sparql_client_cache is not None:
+        await _sparql_client_cache.aclose()
+
+
+app = BedrockAgentCoreApp(lifespan=_lifespan)
 
 _config: ServiceConfig | None = None
 _guardrail_provider: GuardrailConfigProvider | None = None
@@ -86,6 +108,7 @@ _session_manager: SessionManager | None = None
 _session_metadata: SessionMetadataStore | None = None
 _sources_registry: SourcesRegistry | None = None
 _nl_to_sparql: NLtoSPARQL | None = None
+_sparql_client_cache: SparqlClientCache | None = None
 _init_lock = asyncio.Lock()
 
 # Hard upper bound on the per-request transport budget: max(10, min(env, 300)).
@@ -123,10 +146,55 @@ def _build_deadline(request) -> Deadline:
 _NAMESPACE_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
 
+def _register_sparql_strategy(
+    strategies: list,
+    *,
+    graph_client,
+    llm_client,
+    guardrail_id: str,
+    guardrail_id_provider,
+    sources_registry,
+    vector_client,
+    oss_ontology_index: str,
+    firewall: SQLFirewall,
+) -> SparqlStrategy | None:
+    """Register the native SPARQL strategy when the graph-sources switch is on.
+
+    Ships dark: with the switch off the list is untouched. Inserted just before Ontop,
+    so in a mixed namespace the default chain runs NL→SQL, then NL→SPARQL, then
+    Ontop (LLD §3.3): Ontop answers from the SQL mappings with a low measured
+    accuracy, and running it first left graph questions to a weak SQL answer. The
+    runner only selects it for a namespace that has a graph source, or a request
+    that pins it. ``firewall`` is the SQL strategies' own, so Cedar admits the same
+    principals to the graph path as to the SQL path.
+    """
+    if not graph_sources_enabled():
+        return None
+    strategy = SparqlStrategy(
+        translator=NativeNLtoSPARQL(
+            graph_client=graph_client,
+            llm_client=llm_client,
+            guardrail_id=guardrail_id,
+            guardrail_id_provider=guardrail_id_provider,
+        ),
+        sources_registry=sources_registry,
+        vector_client=vector_client,
+        oss_ontology_index=oss_ontology_index,
+        namespace_authorizer=firewall,
+    )
+    ontop_at = next((i for i, s in enumerate(strategies) if getattr(s, "name", None) == StrategyOption.ONTOP), None)
+    if ontop_at is None:
+        strategies.append(strategy)
+    else:
+        strategies.insert(ontop_at, strategy)
+    logger.info("sparql_strategy_registered")
+    return strategy
+
+
 async def _ensure_initialized():
     """Initialize config and orchestrator on first request."""
     global _config, _guardrail_provider, _orchestrator, _session_manager
-    global _session_metadata, _sources_registry, _nl_to_sparql
+    global _session_metadata, _sources_registry, _nl_to_sparql, _sparql_client_cache
     if _orchestrator is not None:
         return
     async with _init_lock:
@@ -353,9 +421,20 @@ async def _ensure_initialized():
             # with the flag off the client is simply never used.
             graph_client=neptune_client,
         )
-        structured_query_tier = StructuredQueryTier(
-            strategies=[ontop_strategy, nl_to_sql_strategy, agentic_strategy],
+        strategies = [ontop_strategy, nl_to_sql_strategy, agentic_strategy]
+        sparql_strategy = _register_sparql_strategy(
+            strategies,
+            graph_client=neptune_client,
+            llm_client=bedrock_client,
+            guardrail_id=config.guardrail_id,
+            guardrail_id_provider=guardrail_provider.guardrail_id,
+            sources_registry=sources_registry,
+            vector_client=opensearch_client,
+            oss_ontology_index=oss_ontology_index,
+            firewall=firewall,
         )
+        _sparql_client_cache = sparql_strategy.client_cache if sparql_strategy is not None else None
+        structured_query_tier = StructuredQueryTier(strategies=strategies)
 
         # Deep-reasoning Tier 3 path. Built so a deployment default
         # (TIER3_STRATEGY=deep-reasoning) OR a per-request
@@ -372,7 +451,7 @@ async def _ensure_initialized():
         agentic_retriever = None
         try:
             from .clients.base import ClientSet
-            from .tier3.agentic.factory import build_agentic_retriever
+            from .tier3.agentic.factory import build_agentic_retriever, build_stop_signal_config
             from .tier3.agentic.planner import BedrockStepPlanner
 
             agentic_clients = ClientSet(
@@ -385,6 +464,7 @@ async def _ensure_initialized():
                 bedrock_client,
                 guardrail_id=config.guardrail_id or None,
                 guardrail_id_provider=guardrail_provider.guardrail_id,
+                stop_signals=build_stop_signal_config(config),
             )
             agentic_retriever = build_agentic_retriever(
                 config,
@@ -392,6 +472,8 @@ async def _ensure_initialized():
                 step_planner,
                 structured_query_tier=structured_query_tier,
                 guardrail_id_provider=guardrail_provider.guardrail_id,
+                # Scopes the read_document tool to each namespace's DOCUMENTS sources.
+                sources_registry=sources_registry,
             )
         except Exception as exc:
             logger.warning("agentic_retriever_unavailable", error=type(exc).__name__, error_msg=str(exc)[:200])
@@ -505,6 +587,67 @@ async def _handle_translate(payload: dict, request_id: str) -> dict:
     }
 
 
+# KBSearch ``topK`` bounds and default, per ``serve.smithy`` (@range(min: 1, max: 100)).
+# The data-layer handler enforces the same values at the REST edge; both packages
+# have a parity test against the model, so neither can drift from it.
+KB_SEARCH_MIN_TOP_K = 1
+KB_SEARCH_MAX_TOP_K = 100
+KB_SEARCH_DEFAULT_TOP_K = 10
+
+# KBSearch members the retriever cannot honour. ``sourceFilter`` would need a
+# server-side k-NN filter on the chunk's document identity, whose field mapping
+# in the chunk index is not one this service controls; filtering the top_k hits
+# afterwards would return fewer (often zero) chunks while matching chunks exist
+# further down the ranking. ``entityFilter`` has nothing to filter on: chunk hits
+# carry no entity annotations. Both are rejected rather than ignored, so a caller
+# never receives unfiltered results believing a filter was applied.
+_KB_SEARCH_UNSUPPORTED_FILTERS = ("sourceFilter", "entityFilter")
+
+
+def _require_int(value: Any, name: str, lo: int, hi: int) -> int:
+    """Return ``value`` if it is a genuine integer in ``[lo, hi]``, else raise ``ValueError``.
+
+    ``bool`` is rejected although it subclasses ``int``, and floats are not coerced
+    (``int(1.5) == 1`` would change what the caller asked for). The message names
+    the field and the range, never the rejected value.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
+        raise ValueError(f"Invalid {name}. Must be an integer from {lo} to {hi}.")
+    return value
+
+
+def _parse_kb_search_options(options: Any) -> tuple[int, float | None]:
+    """Return ``(top_k, min_score)`` from kbSearch ``options``, or raise ``ValueError``.
+
+    Validated here as well as at the REST edge because the MCP server invokes this
+    action directly. Out-of-range values are rejected, not clamped. The messages
+    name the field, never the rejected value.
+    """
+    if options is None:
+        options = {}
+    if not isinstance(options, dict):
+        raise ValueError("Invalid options. Must be an object.")
+    top_k = options.get("topK")
+    if top_k is None:
+        top_k = KB_SEARCH_DEFAULT_TOP_K
+    else:
+        top_k = _require_int(top_k, "topK", KB_SEARCH_MIN_TOP_K, KB_SEARCH_MAX_TOP_K)
+    min_score = options.get("minScore")
+    if min_score is not None:
+        if (
+            isinstance(min_score, bool)
+            or not isinstance(min_score, (int, float))
+            or not math.isfinite(min_score)
+            or min_score < 0
+        ):
+            raise ValueError("Invalid minScore. Must be a finite, non-negative number.")
+        min_score = float(min_score)
+    for name in _KB_SEARCH_UNSUPPORTED_FILTERS:
+        if options.get(name):
+            raise ValueError(f"{name} is not supported by kbSearch.")
+    return top_k, min_score
+
+
 async def _handle_kb_search(payload: dict, request_id: str) -> dict:
     """Vector search in OpenSearch — returns matching document chunks."""
     namespace = payload.get("namespace", "")
@@ -516,7 +659,10 @@ async def _handle_kb_search(payload: dict, request_id: str) -> dict:
     if not namespace:
         return _error(400, "namespace required", request_id)
 
-    top_k = min(options.get("topK", 10), 100)
+    try:
+        top_k, min_score = _parse_kb_search_options(options)
+    except ValueError as exc:
+        return _error(400, str(exc), request_id)
     vector_retriever = _orchestrator._knowledge_retriever._vector
     bedrock_client = _orchestrator._bedrock_client
 
@@ -537,15 +683,26 @@ async def _handle_kb_search(payload: dict, request_id: str) -> dict:
     try:
         t0 = time.perf_counter()
         chunks = await asyncio.wait_for(
-            vector_retriever.search(embedding, namespace, top_k=top_k),
+            vector_retriever.search(embedding, namespace, top_k=top_k, max_top_k=KB_SEARCH_MAX_TOP_K),
             timeout=RESOLVE_TIMEOUT_S,
         )
+        if min_score is not None:
+            # Exact, not approximate: k-NN returns the top_k highest-scoring chunks,
+            # so every chunk at or above the threshold that could have been returned
+            # is in this set. Dropping the rest only shortens the list.
+            chunks = [c for c in chunks if c.relevance_score >= min_score]
         search_ms = int((time.perf_counter() - t0) * 1000)
+        # Report dropped evidence the same way the Tier-3 vector step does, so a
+        # search that discarded provenance-less chunks never reads as complete.
+        chunks, dropped_chunk_count = _validated_document_chunks(chunks)
+        search_detail = f"{len(chunks)} chunks"
+        if dropped_chunk_count:
+            search_detail += f"; dropped {dropped_chunk_count} anonymous or malformed document chunks"
         trace.record(
             StepId.T3_VECTOR_SEARCH,
-            "success",
+            "degraded" if dropped_chunk_count else "success",
             search_ms,
-            detail=f"{len(chunks)} chunks",
+            detail=search_detail,
             tool_used="opensearch",
         )
     except TimeoutError as e:
@@ -557,16 +714,9 @@ async def _handle_kb_search(payload: dict, request_id: str) -> dict:
         raise DataSourceUnavailableError("Vector search failed") from e
 
     return {
-        "chunks": [
-            {
-                "chunkId": c.chunk_id,
-                "text": c.text,
-                "sourceDocumentId": c.source_doc,
-                "sourceDocumentName": c.source_doc_name,
-                "relevanceScore": c.relevance_score,
-            }
-            for c in chunks
-        ],
+        # KBSearch chunks never carried the legacy `sourceDoc` / `label` keys, so the
+        # Tier-3-only deprecated aliases are not added here.
+        "chunks": [_supporting_content_from_chunk(chunk, include_deprecated_aliases=False) for chunk in chunks],
         "trace": trace.steps_serializable,
         "queryEmbeddingModel": bedrock_client._embed_model_id,
         "requestId": request_id,
@@ -574,17 +724,78 @@ async def _handle_kb_search(payload: dict, request_id: str) -> dict:
     }
 
 
+# GraphTraverse bounds and defaults, per ``serve.smithy``. Enforced here as well as
+# at the REST edge because the MCP server invokes this action directly.
+GRAPH_TRAVERSE_MIN_DEPTH = 1
+GRAPH_TRAVERSE_MAX_DEPTH = 5  # maxDepth @range(min: 1, max: 5)
+GRAPH_TRAVERSE_DEFAULT_DEPTH = 2
+GRAPH_TRAVERSE_MIN_RESULTS = 1
+GRAPH_TRAVERSE_MAX_RESULTS = 1000  # maxResults @range(min: 1, max: 1000)
+GRAPH_TRAVERSE_DEFAULT_RESULTS = 100
+GRAPH_TRAVERSE_DIRECTIONS = frozenset({"outgoing", "incoming", "both"})  # enum TraversalDirection
+# relationshipFilter: FilterValueList @length(max: 50) of FilterValue @length(min: 1, max: 2048)
+_FILTER_VALUE_LIST_MAX_ITEMS = 50
+_FILTER_VALUE_MAX_LENGTH = 2048
+
+
+def _parse_graph_traverse_options(options: Any) -> tuple[str, int, int]:
+    """Return ``(start_uri, max_depth, max_results)`` from graphTraverse ``options``.
+
+    Out-of-range values are rejected, not clamped. ``direction`` and
+    ``relationshipFilter`` are validated but not yet applied (the hop query
+    follows every relationship in both directions); the model documents that.
+    Messages name the field, never the rejected value.
+
+    Raises:
+        ValueError: A member has the wrong type or is out of range.
+    """
+    if options is None:
+        options = {}
+    if not isinstance(options, dict):
+        raise ValueError("Invalid options. Must be an object.")
+    start_uri = options.get("startUri")
+    if start_uri is None or start_uri == "":
+        raise ValueError("startUri required in options")
+    if not is_traversable_uri(start_uri):
+        raise ValueError("Invalid startUri. Must be an http(s) or urn IRI of at most 2048 characters.")
+    max_depth = options.get("maxDepth")
+    max_depth = (
+        GRAPH_TRAVERSE_DEFAULT_DEPTH
+        if max_depth is None
+        else _require_int(max_depth, "maxDepth", GRAPH_TRAVERSE_MIN_DEPTH, GRAPH_TRAVERSE_MAX_DEPTH)
+    )
+    max_results = options.get("maxResults")
+    max_results = (
+        GRAPH_TRAVERSE_DEFAULT_RESULTS
+        if max_results is None
+        else _require_int(max_results, "maxResults", GRAPH_TRAVERSE_MIN_RESULTS, GRAPH_TRAVERSE_MAX_RESULTS)
+    )
+    direction = options.get("direction")
+    if direction is not None and (not isinstance(direction, str) or direction not in GRAPH_TRAVERSE_DIRECTIONS):
+        raise ValueError(f"Invalid direction. Must be one of: {', '.join(sorted(GRAPH_TRAVERSE_DIRECTIONS))}.")
+    relationship_filter = options.get("relationshipFilter")
+    if relationship_filter is not None and (
+        not isinstance(relationship_filter, list)
+        or len(relationship_filter) > _FILTER_VALUE_LIST_MAX_ITEMS
+        or not all(isinstance(v, str) and 1 <= len(v) <= _FILTER_VALUE_MAX_LENGTH for v in relationship_filter)
+    ):
+        raise ValueError(
+            f"Invalid relationshipFilter. Must be a list of at most {_FILTER_VALUE_LIST_MAX_ITEMS} strings "
+            f"of 1 to {_FILTER_VALUE_MAX_LENGTH} characters."
+        )
+    return start_uri, max_depth, max_results
+
+
 async def _handle_graph_traverse(payload: dict, request_id: str) -> dict:
     """Graph traversal in Neptune — returns entities and relationships."""
     namespace = payload.get("namespace", "")
-    options = payload.get("options", {})
-    start_uri = options.get("startUri", "")
     if not namespace:
         return _error(400, "namespace required", request_id)
-    if not start_uri:
-        return _error(400, "startUri required in options", request_id)
+    try:
+        start_uri, max_depth, max_results = _parse_graph_traverse_options(payload.get("options"))
+    except ValueError as exc:
+        return _error(400, str(exc), request_id)
 
-    max_depth = min(options.get("maxDepth", 2), 5)
     graph_traverser = _orchestrator._knowledge_retriever._graph
 
     if not graph_traverser:
@@ -602,6 +813,9 @@ async def _handle_graph_traverse(payload: dict, request_id: str) -> dict:
             ),
             timeout=RESOLVE_TIMEOUT_S,
         )
+        # ``maxResults`` caps the ENTITIES returned; relationships are those of
+        # the kept entities, so the two lists stay consistent.
+        entities = entities[:max_results]
         traverse_ms = int((time.perf_counter() - t0) * 1000)
         trace.record(
             StepId.T3_GRAPH_TRAVERSE,
@@ -624,19 +838,20 @@ async def _handle_graph_traverse(payload: dict, request_id: str) -> dict:
                 "uri": e.uri,
                 "label": e.label,
                 "type": e.type,
-                "properties": {},
+                "properties": e.properties,
             }
             for e in entities
         ],
         "relationships": [
             {
-                "sourceUri": e.uri,
-                "predicateUri": r.get("predicate", ""),
+                "sourceUri": r.get("source_uri", ""),
+                "predicateUri": r.get("predicate_uri", ""),
                 "targetUri": r.get("target_uri", ""),
-                "predicateLabel": r.get("target_label", ""),
+                "predicateLabel": r.get("predicate_label", ""),
             }
             for e in entities
             for r in e.relationships
+            if r.get("source_uri") and r.get("predicate_uri") and r.get("target_uri")
         ],
         "trace": trace.steps_serializable,
         "requestId": request_id,
@@ -881,6 +1096,36 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
         yield emitter.format_error("InternalError", "Query resolution failed", 500)
 
 
+async def _bind_namespace_label_preference(
+    namespace: str, namespace_present: bool | None, request_id: str
+) -> dict | None:
+    """Resolve the namespace language once and bind this request's label preference.
+
+    Readers choose display labels from the namespace's immutable language
+    (namespace-language LLD §2.2.5). The existence gate has just read the
+    namespace item, so the registry answers from that read. When the item is
+    missing or unreadable the request fails closed rather than reading as
+    English; only a deployment with no namespaces table at all (existence could
+    not be checked, ``namespace_present is None``) proceeds untagged-first.
+
+    Returns:
+        ``None`` on success, else the error payload to yield.
+    """
+    from .clients.sources_registry import NamespaceLanguageUnavailableError
+
+    if _sources_registry is None or namespace_present is not True:
+        bind_label_preference(LabelPreference.untagged_first())
+        return None
+    try:
+        language = await _sources_registry.namespace_language(namespace)
+        preference = LabelPreference.untagged_first() if language is None else LabelPreference.for_namespace(language)
+    except (NamespaceLanguageUnavailableError, LanguageTagError):
+        logger.warning("namespace_language_unavailable_fail_closed", namespace=namespace, request_id=request_id)
+        return DataSourceUnavailableError("Unable to read namespace language").to_dict(request_id)
+    bind_label_preference(preference)
+    return None
+
+
 async def _authorize_namespace_access(
     namespace: str,
     jwt_user_id: str,
@@ -1060,7 +1305,7 @@ async def invoke(payload: dict, context=None):
     # of a 404 masking their input mistake. The regex matches the constraint on
     # InvokeRequest.namespace so behavior is identical between paths.
     namespace = payload.get("namespace", "")
-    if namespace and not _NAMESPACE_PATTERN.match(namespace):
+    if namespace and not _NAMESPACE_PATTERN.fullmatch(namespace):
         yield {
             "error": "ValidationError",
             "message": "Invalid namespace format",
@@ -1090,6 +1335,10 @@ async def invoke(payload: dict, context=None):
             logger.warning("namespace_exists_indeterminate_fail_closed", namespace=namespace, request_id=request_id)
             yield DataSourceUnavailableError("Unable to verify namespace").to_dict(request_id)
             return
+        language_error = await _bind_namespace_label_preference(namespace, namespace_present, request_id)
+        if language_error is not None:
+            yield language_error
+            return
 
     # ── Namespace admission gate (Cedar) ───────────────────────────────────
     # Run the coarse "may this principal query this namespace at all?" decision
@@ -1108,7 +1357,22 @@ async def invoke(payload: dict, context=None):
             namespace, _jwt_user_id, _jwt_email, _jwt_groups, payload.get("profile", {}), request_id
         )
         if authz_error is not None:
-            yield authz_error
+            # Streaming callers (the web Playground) accept only typed envelopes
+            # (`type` in {step, token, done, error, rows}); a flat error dict is
+            # dropped by the client, so the user would see no error at all when a
+            # namespace admission check denies the request. Blocking callers
+            # (MCP, data-layer actions) read the flat shape and keep it.
+            if payload.get("stream", False):
+                # ``authz_error`` is always a ServeError.to_dict() (AccessDeniedError or
+                # DataSourceUnavailableError), so the keys are present. The Tier-1/2
+                # streaming deny path reports "AccessDenied"; keep one spelling for clients.
+                error_name = authz_error["error"]
+                client_name = "AccessDenied" if error_name == "AccessDeniedError" else error_name
+                yield SSEEmitter(request_id).format_error(
+                    client_name, authz_error["message"], authz_error["statusCode"]
+                )
+            else:
+                yield authz_error
             return
 
     try:
@@ -1184,6 +1448,14 @@ async def invoke(payload: dict, context=None):
         )
         resolved.inject_into(request.profile)
 
+    # ``includeDebugInfo`` returns the generated SQL/SPARQL, i.e. the physical
+    # schema. Honour it only for a caller who already administers this
+    # namespace's schema; anyone else gets the default (fields withheld) rather
+    # than an error, so a client that always sets the flag keeps working.
+    if request.options.get("includeDebugInfo") is True and not may_view_debug_info(request.profile, request.namespace):
+        request.options["includeDebugInfo"] = False
+        logger.info("include_debug_info_withheld", namespace=request.namespace, request_id=request_id)
+
     logger.info(
         "invoke",
         namespace=request.namespace,
@@ -1196,15 +1468,21 @@ async def invoke(payload: dict, context=None):
     # Otherwise yield a single dict (backward compat for MCP/data-layer callers).
     stream_mode = payload.get("stream", False)
 
-    if not stream_mode:
-        async for event in _handle_blocking_query(request, request_id):
-            yield event
-        return
+    # Bind the request id for the query, so log lines emitted deep in the
+    # resolve path (merge_contextvars) carry it without threading it through.
+    structlog.contextvars.bind_contextvars(request_id=request_id)
+    try:
+        if not stream_mode:
+            async for event in _handle_blocking_query(request, request_id):
+                yield event
+            return
 
-    # ── Streaming SSE mode ────────────────────────────────────────────────
-    session_user_id = _jwt_user_id or upstream_user_id
-    async for event in _handle_streaming_query(payload, request, request_id, session_user_id):
-        yield event
+        # ── Streaming SSE mode ────────────────────────────────────────────
+        session_user_id = _jwt_user_id or upstream_user_id
+        async for event in _handle_streaming_query(payload, request, request_id, session_user_id):
+            yield event
+    finally:
+        structlog.contextvars.unbind_contextvars("request_id")
 
 
 if __name__ == "__main__":

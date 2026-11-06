@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from coa_common.constants import RESOURCE_PREFIX
+from structlog.testing import capture_logs
 
 pytestmark = pytest.mark.unit
 
@@ -74,7 +75,14 @@ def _stub_missing_modules() -> None:
     # Populate attributes that @patch decorators need to find on the stub modules.
     # patch() requires the attribute to already exist before it can replace it.
     lg = sys.modules["graphrag_toolkit.lexical_graph"]
-    for attr in ["LexicalGraphIndex", "GraphRAGConfig", "ExtractionConfig", "IndexingConfig", "add_versioning_info"]:
+    for attr in [
+        "LexicalGraphIndex",
+        "GraphRAGConfig",
+        "ExtractionConfig",
+        "IndexingConfig",
+        "TenantId",
+        "add_versioning_info",
+    ]:
         if not hasattr(lg, attr):
             setattr(lg, attr, MagicMock())
 
@@ -152,6 +160,7 @@ _BASE_ENV = {
     "ENABLE_PROPOSITION_EXTRACTION": "true",  # passed via container override
     "ENABLE_VERSIONING": "false",  # disable for most tests to avoid mocking add_versioning_info
     "DELETE_PREV_VERSIONS": "false",  # passed via container override
+    "NAMESPACE_LANGUAGE": "en",  # namespace-language snapshot from the job input
 }
 
 
@@ -1111,7 +1120,7 @@ class TestBuildIndexingConfig:
         """Under default flags an ExtractionConfig is still built, with
         preferred_entity_classifications=[] and infer_entity_classifications
         wired to an InferClassificationsConfig — i.e. no news vocabulary."""
-        config = mod._build_indexing_config("bucket", "ns", "ds")
+        config = mod._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
 
         assert config is not None
         mock_ec.assert_called_once()
@@ -1137,7 +1146,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         kwargs = mock_ec.call_args.kwargs
         assert kwargs["preferred_entity_classifications"] == []
         assert kwargs["infer_entity_classifications"] is False
@@ -1154,7 +1163,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         kwargs = mock_ec.call_args.kwargs
         assert kwargs["enable_proposition_extraction"] is False
 
@@ -1171,7 +1180,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         mock_bc.assert_called_once()
         assert mock_bc.call_args[1]["role_arn"] == "arn:aws:iam::123:role/batch"
 
@@ -1189,7 +1198,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        config = entrypoint._build_indexing_config("bucket", "ns", "ds")
+        config = entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         # New contract: still returns an IndexingConfig (with the vocabulary
         # fix); only BatchConfig is absent.
         assert config is not None
@@ -1208,7 +1217,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         kwargs = mock_ec.call_args.kwargs
         assert kwargs["preferred_entity_classifications"] == ["Policy", "Claim", "Loss Ratio"]
         assert kwargs["infer_entity_classifications"] is False
@@ -1228,7 +1237,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         kwargs = mock_ec.call_args.kwargs
         assert kwargs["preferred_entity_classifications"] == []
         assert kwargs["infer_entity_classifications"] is mock_icc.return_value
@@ -1279,7 +1288,7 @@ class TestBuildIndexingConfig:
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
         with caplog.at_level("WARNING"):
-            entrypoint._build_indexing_config("bucket", "ns", "ds")
+            entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         kwargs = mock_ec.call_args.kwargs
         assert kwargs["preferred_entity_classifications"] == []
         assert kwargs["infer_entity_classifications"] is False
@@ -1298,7 +1307,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         mock_ss.assert_called_once_with(chunk_size=1024, chunk_overlap=50)
         assert "chunking" in mock_ic.call_args.kwargs
 
@@ -1319,7 +1328,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         mock_ss.assert_called_once_with(chunk_size=100, chunk_overlap=99)
 
     @patch("llama_index.core.node_parser.SentenceSplitter")
@@ -1330,7 +1339,7 @@ class TestBuildIndexingConfig:
         """CHUNK_SIZE=0 (default) must not pass a chunking= kwarg — otherwise
         the toolkit's SentenceSplitter fallback (256/25) never runs. Regression
         guard: this is what preserves the SEC-10-Q baseline."""
-        mod._build_indexing_config("bucket", "ns", "ds")
+        mod._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         mock_ss.assert_not_called()
         assert "chunking" not in mock_ic.call_args.kwargs
 
@@ -1412,6 +1421,39 @@ class TestMainFlow:
                 mod.main()
             assert exc_info.value.code == 1
         mock_index.extract_and_build.assert_called_once()
+
+
+class TestWarnIfNoTopics:
+    @staticmethod
+    def _store(mock_gsf, *counts):
+        graph_store = MagicMock()
+        graph_store.execute_query.side_effect = [[{"n": n}] for n in counts]
+        mock_gsf.for_graph_store.return_value.__enter__ = MagicMock(return_value=graph_store)
+        mock_gsf.for_graph_store.return_value.__exit__ = MagicMock(return_value=False)
+        return graph_store
+
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    def test_warn_if_no_topics_zero_topics_logs_warning_with_chunk_count(self, mock_gsf, mod):
+        self._store(mock_gsf, 0, 4)
+        with capture_logs() as logs:
+            mod._warn_if_no_topics("neptune-db://x", "abc123", "ds-001", 1)
+        warnings = [e for e in logs if e["event"] == "kg_build_zero_topics_extracted"]
+        assert len(warnings) == 1
+        assert warnings[0]["log_level"] == "warning"
+        assert (warnings[0]["doc_source_id"], warnings[0]["docs"], warnings[0]["chunks"]) == ("ds-001", 1, 4)
+
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    def test_warn_if_no_topics_topics_present_logs_nothing(self, mock_gsf, mod):
+        graph_store = self._store(mock_gsf, 7)
+        with capture_logs() as logs:
+            mod._warn_if_no_topics("neptune-db://x", "abc123", "ds-001", 1)
+        assert not [e for e in logs if e["event"] == "kg_build_zero_topics_extracted"]
+        graph_store.execute_query.assert_called_once()
+
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    def test_warn_if_no_topics_query_error_does_not_raise(self, mock_gsf, mod):
+        mock_gsf.for_graph_store.side_effect = RuntimeError("neptune down")
+        mod._warn_if_no_topics("neptune-db://x", "abc123", "ds-001", 1)
 
 
 # ===================================================================
@@ -1875,7 +1917,7 @@ class TestPreferredTopics:
             patch("graphrag_toolkit.lexical_graph.ExtractionConfig") as ec,
             patch("graphrag_toolkit.lexical_graph.IndexingConfig"),
         ):
-            m._build_indexing_config("bucket", "tenant-a", "ds-001")
+            m._build_indexing_config("bucket", "tenant-a", "ds-001", namespace_language="en")
         assert ec.call_args.kwargs["preferred_topics"] == ["Black Tie Gala"]
 
     def test_empty_list_still_passed_explicitly(self, mod):
@@ -1885,7 +1927,7 @@ class TestPreferredTopics:
             patch("graphrag_toolkit.lexical_graph.ExtractionConfig") as ec,
             patch("graphrag_toolkit.lexical_graph.IndexingConfig"),
         ):
-            mod._build_indexing_config("bucket", "tenant-a", "ds-001")
+            mod._build_indexing_config("bucket", "tenant-a", "ds-001", namespace_language="en")
         assert ec.call_args.kwargs["preferred_topics"] == []
 
 
@@ -1949,3 +1991,212 @@ class TestEnvStrListCap:
         monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", _json.dumps(at_cap))
         m = mod_factory()
         assert len(m.PREFERRED_ENTITY_CLASSIFICATIONS) == MAX_VOCABULARY_ENTRIES
+
+
+# ===================================================================
+# Namespace language — extraction prompt instruction (A1)
+# ===================================================================
+
+# Shaped like graphrag-toolkit 3.18.7's templates: instructions first, then the
+# document-derived blocks the model is told to read.
+_FAKE_PROPOSITIONS_PROMPT = (
+    "\nYou decompose text into propositions.\n\n# Response Format:\ntitle\nproposition\n\n"
+    "<sourceInformation>\n{source_info}\n</sourceInformation>\n\n<text>\n{text}\n</text>\n"
+)
+_FAKE_TOPICS_PROMPT = (
+    "\nYou organize propositions into topics.\n\nAdhere strictly to the provided instructions.\n   \n"
+    "<propositions>\n{text}\n</propositions>\n\n<preferredTopics>\n{preferred_topics}\n</preferredTopics>\n\n"
+    "<preferredEntityClassifications>\n{preferred_entity_classifications}\n</preferredEntityClassifications>\n"
+)
+_FAKE_CLASSIFICATIONS_PROMPT = (
+    "\nYou identify domain-specific entity types.\n\nGuidelines:\n1. Use clear, concise classification names\n\n"
+    "Sample text chunks:\n<chunks>\n{text_chunks}\n</chunks>\n\n"
+    "Existing classifications:\n<existing_classifications>\n{existing_classifications}\n</existing_classifications>\n"
+)
+
+
+@pytest.fixture()
+def fake_toolkit_prompts(monkeypatch):
+    prompts = types.ModuleType("graphrag_toolkit.lexical_graph.indexing.prompts")
+    prompts.EXTRACT_PROPOSITIONS_PROMPT = _FAKE_PROPOSITIONS_PROMPT
+    prompts.EXTRACT_TOPICS_PROMPT = _FAKE_TOPICS_PROMPT
+    prompts.DOMAIN_ENTITY_CLASSIFICATIONS_PROMPT = _FAKE_CLASSIFICATIONS_PROMPT
+    monkeypatch.setitem(sys.modules, "graphrag_toolkit.lexical_graph.indexing.prompts", prompts)
+    monkeypatch.setattr(sys.modules["graphrag_toolkit.lexical_graph.indexing"], "prompts", prompts, raising=False)
+    return prompts
+
+
+class TestNamespaceLanguagePrompts:
+    @pytest.mark.parametrize("language", ["en", "en-US"])
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_english_namespace_passes_no_prompt_templates(self, _ic, mock_ec, _icc, language, mod):
+        # No template override means the toolkit uses its own prompts: byte for
+        # byte what an ingest on main sends.
+        mod._build_indexing_config("bucket", "ns", "ds", namespace_language=language)
+        kwargs = mock_ec.call_args.kwargs
+        assert "extract_propositions_prompt_template" not in kwargs
+        assert "extract_topics_prompt_template" not in kwargs
+
+    def test_english_namespace_does_not_import_toolkit_prompts(self, mod):
+        assert mod._namespace_language_prompts("en") == {}
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_japanese_namespace_instructs_both_extraction_prompts(self, _ic, mock_ec, _icc, mod, fake_toolkit_prompts):
+        mod._build_indexing_config("bucket", "ns", "ds", namespace_language="ja")
+        kwargs = mock_ec.call_args.kwargs
+        for parameter in ("extract_propositions_prompt_template", "extract_topics_prompt_template"):
+            template = kwargs[parameter]
+            assert "# Output Language (REQUIRED)" in template
+            assert "Write your output in Japanese (BCP 47 tag `ja`)" in template
+            # Identifiers stay verbatim.
+            assert "Copy identifiers exactly as printed, whatever script they use" in template
+
+    def test_instruction_overrides_the_toolkit_uppercase_relationship_rule(self, mod):
+        # EXTRACT_TOPICS_PROMPT asks for uppercase underscore relationship and
+        # attribute names with English examples (WORKS_FOR); a ja ingest then
+        # emitted BELONGS_TO, which became the object-property label BELONGS TO.
+        instruction = mod._extraction_language_instruction("ja")
+        assert (
+            "Relationship and attribute names keep the uppercase-with-underscores format, "
+            "written in Japanese (BCP 47 tag `ja`)."
+        ) in instruction
+        # The format-vs-language clarification must survive: for ja/zh/ko
+        # "uppercase with underscores" has no literal meaning, so the prompt
+        # spells out that it applies only to cased letters and that an underscore
+        # stands only where a space would be (restored from e64c8938a).
+        assert "Uppercase applies only to letters that have case" in instruction
+        assert "an underscore stands only where the name would otherwise contain a space" in instruction
+
+    @pytest.mark.parametrize("language", ["es-419", "ko", "zh-Hans"])
+    def test_topics_template_pins_english_response_labels(self, language, mod, fake_toolkit_prompts):
+        # The toolkit parser matches the response-format labels literally and
+        # case-sensitively. Translating them (es-419 `tema:`) or using a full-width
+        # colon (`entidades：`) drops topics only when the whole set is off: a
+        # single mismatched label is tolerated, so the real es-419 failure is the
+        # cumulative all-labels-translated case, not any one label. See
+        # test_topic_label_contract.py for the per-label behaviour.
+        topics = mod._namespace_language_prompts(language)["extract_topics_prompt_template"]
+        instruction = mod._extraction_language_instruction(language)
+        target = mod.describe_language(language)
+        assert instruction in topics
+        assert topics.index(instruction) < topics.index("<propositions>")
+        assert "The response format is a fixed template read by a program." in instruction
+        assert "`topic:`" in instruction and "`entities:`" in instruction and "`proposition:`" in instruction
+        # The value after the `|` separator (the classification) is written in the
+        # target language, restored to back 6360e9aa1.
+        assert f"The classification after the `|` separator is a value: write it in {target}." in instruction
+        assert f"Write only the values that fill its placeholders in {target}" in instruction
+        assert f"Write your output in {target}" in instruction
+        assert "{" not in instruction and "}" not in instruction
+
+    def test_english_namespace_adds_no_label_instruction(self, mod):
+        assert mod._namespace_language_prompts("en") == {}
+
+    def test_instruction_sits_before_document_content(self, mod, fake_toolkit_prompts):
+        overrides = mod._namespace_language_prompts("ja")
+
+        propositions = overrides["extract_propositions_prompt_template"]
+        assert propositions.index("# Output Language") < propositions.index("<sourceInformation>")
+        assert propositions.index("# Output Language") < propositions.index("{text}")
+        topics = overrides["extract_topics_prompt_template"]
+        assert topics.index("# Output Language") < topics.index("<propositions>")
+        assert topics.index("# Output Language") < topics.index("{text}")
+
+        # The toolkit's own text is kept intact around the insertion.
+        instruction = mod._extraction_language_instruction("ja")
+        assert propositions.replace(instruction, "") == _FAKE_PROPOSITIONS_PROMPT
+        assert topics.replace(instruction, "") == _FAKE_TOPICS_PROMPT
+
+    def test_rendered_template_keeps_only_toolkit_placeholders(self, mod, fake_toolkit_prompts):
+        # The toolkit renders with str.format: the instruction must add no braces.
+        overrides = mod._namespace_language_prompts("ja")
+        rendered = overrides["extract_propositions_prompt_template"].format(source_info="S", text="T")
+        assert "<text>\nT\n</text>" in rendered
+
+    def test_missing_anchor_fails_loudly(self, mod, fake_toolkit_prompts):
+        fake_toolkit_prompts.EXTRACT_TOPICS_PROMPT = "no document block here {text}"
+        with pytest.raises(RuntimeError, match="EXTRACT_TOPICS_PROMPT has no <propositions> block"):
+            mod._namespace_language_prompts("ja")
+
+    @pytest.mark.parametrize("language", ["en", "en-US"])
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_english_namespace_passes_no_inference_prompt(self, _ic, _ec, mock_icc, language, mod):
+        mod._build_indexing_config("bucket", "ns", "ds", namespace_language=language)
+        mock_icc.assert_called_once_with(replace_default_classifications=True)
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_japanese_namespace_instructs_classification_inference(
+        self, _ic, mock_ec, mock_icc, mod, fake_toolkit_prompts
+    ):
+        mod._build_indexing_config("bucket", "ns", "ds", namespace_language="ja")
+
+        mock_icc.assert_called_once()
+        kwargs = mock_icc.call_args.kwargs
+        assert kwargs["replace_default_classifications"] is True
+        assert mock_ec.call_args.kwargs["infer_entity_classifications"] is mock_icc.return_value
+        template = kwargs["prompt_template"]
+        assert "Write your output in Japanese (BCP 47 tag `ja`)" in template
+        # Ahead of the sample chunks, after the toolkit's guidelines.
+        assert template.index("Guidelines:") < template.index("# Output Language")
+        assert template.index("# Output Language") < template.index("Sample text chunks:")
+        assert template.index("# Output Language") < template.index("{text_chunks}")
+        # Otherwise the toolkit prompt, unchanged.
+        instruction = mod._extraction_language_instruction("ja")
+        assert template.replace(instruction, "") == _FAKE_CLASSIFICATIONS_PROMPT
+        # The instruction adds no str.format placeholders.
+        rendered = template.format(text_chunks="C", existing_classifications="E")
+        assert "<chunks>\nC\n</chunks>" in rendered
+
+    def test_classification_inference_missing_anchor_fails_loudly(self, mod, fake_toolkit_prompts):
+        fake_toolkit_prompts.DOMAIN_ENTITY_CLASSIFICATIONS_PROMPT = "no sample block here {text_chunks}"
+        with pytest.raises(RuntimeError, match="DOMAIN_ENTITY_CLASSIFICATIONS_PROMPT has no Sample text chunks: block"):
+            mod._classification_inference_prompts("ja")
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_explicit_classifications_skip_inference_prompt(
+        self, _ic, mock_ec, mock_icc, monkeypatch, mod, fake_toolkit_prompts
+    ):
+        monkeypatch.setattr(mod, "PREFERRED_ENTITY_CLASSIFICATIONS", ["Pump"])
+        mod._build_indexing_config("bucket", "ns", "ds", namespace_language="ja")
+        mock_icc.assert_not_called()
+        assert mock_ec.call_args.kwargs["infer_entity_classifications"] is False
+
+    @pytest.mark.parametrize("snapshot", [None, "", "not a tag"])
+    @patch("coa_common.s3.boto3")
+    @patch("coa_common.dao.dynamodb.boto3")
+    def test_missing_or_invalid_snapshot_fails_the_build(self, mock_ddb_boto, mock_s3, snapshot, monkeypatch, mod):
+        if snapshot is None:
+            monkeypatch.delenv("NAMESPACE_LANGUAGE")
+        else:
+            monkeypatch.setenv("NAMESPACE_LANGUAGE", snapshot)
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {"Item": {"status": "SCANNING"}}
+        mock_ddb_boto.resource.return_value.Table.return_value = mock_table
+
+        with pytest.raises(SystemExit):
+            mod.main()
+
+        # Fails before loading documents, and never reads the namespace table.
+        mock_s3.client.return_value.get_paginator.assert_not_called()
+        update_kwargs = mock_table.update_item.call_args.kwargs
+        assert SourceStatus.SCAN_FAILED in update_kwargs["ExpressionAttributeValues"].values()
+        tables_opened = [c.args[0] for c in mock_ddb_boto.resource.return_value.Table.call_args_list]
+        assert tables_opened == [_BASE_ENV["DOC_SOURCES_TABLE"]]
+
+
+@pytest.mark.unit
+def test_stage_failure_message_is_fixed_text_without_traceback(mod):
+    """errorMessage is returned to callers by GetSource; the traceback stays in the log."""
+    msg = mod._stage_failure_message("SCAN_FAILED_BUILD")
+    assert msg.startswith("SCAN_FAILED_BUILD: ")
+    assert "Traceback" not in msg and "File " not in msg

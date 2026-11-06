@@ -24,6 +24,7 @@ from typing import Any
 import boto3
 import structlog
 from coa_common.constants import EVENT_SOURCE_PREFIX
+from coa_common.idempotency import idempotent
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, get_caller_identity
 from coa_control_plane_server.models.create_metric_request_content import (
@@ -31,8 +32,10 @@ from coa_control_plane_server.models.create_metric_request_content import (
 )
 from pydantic import ValidationError
 
+from coa_metrics.api.contract import check_metric_label, normalize_label_member
 from coa_metrics.api.validation_errors import format_validation_error
 from coa_metrics.constants import VALID_SQL_DIALECTS, invalid_dialect_message
+from coa_metrics.lookups import LOOKUP_NOT_PROVIDED, LookupArgument
 from coa_metrics.neptune_client import (
     MetricAiContext,
     MetricDefinition,
@@ -42,6 +45,7 @@ from coa_metrics.neptune_client import (
 from coa_metrics.opensearch_client import MetricOpenSearchClient
 from coa_metrics.source_status import (
     SourceValidationUnavailableError,
+    build_validation_lookup,
     check_source_approved,
     check_source_table_exists,
 )
@@ -54,7 +58,6 @@ from coa_metrics.validator import (
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
-
 
 # ── Singleton clients (reused across warm invocations) ──────────────────
 
@@ -87,8 +90,14 @@ def _get_eventbridge() -> Any:
 # ── Handler ─────────────────────────────────────────────────────────────
 
 
+@idempotent(operation="CreateMetric")
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    """API Gateway proxy-integration Lambda handler for POST /namespaces/{ns}/metrics."""
+    """API Gateway proxy-integration Lambda handler for POST /namespaces/{ns}/metrics.
+
+    Retry-safe when the body carries a ``clientToken``: the token is validated,
+    removed from the body, and used to replay the original response for a
+    retried request (see ``coa_common.idempotency``).
+    """
     namespace = event.get("pathParameters", {}).get("namespaceId", "")
     caller = get_caller_identity(event)
     logger.info("create_metric", namespace=namespace, caller=caller)
@@ -102,11 +111,16 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if body is None:
         return api_response(400, {"message": "Request body is required"})
 
-    # Validate via Smithy-generated Pydantic model
+    # Validate via Smithy-generated Pydantic model. The label is NFC-normalized
+    # first so its length is counted the way it is stored.
+    normalize_label_member(body)
     try:
         request = CreateMetricRequestContent.model_validate(body)
     except ValidationError as exc:
         return api_response(400, {"message": format_validation_error(exc)})
+    label_error = check_metric_label(request.label)
+    if label_error:
+        return api_response(400, {"message": label_error})
 
     # Build metric definition (includes SqlDialect validation)
     try:
@@ -117,10 +131,17 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # Enforce APPROVED source and an existing sourceTable — hard 400s, matching
     # the UI's filter. The UI only offers APPROVED/COMPLETED sources and catalog
     # tables; the API must not be a bypass.
+    data_source_lookup = None
     try:
         source_error = check_source_approved(namespace, metric.data_source_id)
         if source_error is None:
-            source_error = check_source_table_exists(namespace, metric.data_source_id, metric.source_table)
+            data_source_lookup = build_validation_lookup(namespace)
+            source_error = check_source_table_exists(
+                namespace,
+                metric.data_source_id,
+                metric.source_table,
+                data_source_lookup=data_source_lookup,
+            )
     except SourceValidationUnavailableError as exc:
         logger.error("source_validation_unavailable", namespace=namespace, error=str(exc))
         return api_response(503, {"message": "Data source validation is unavailable — try again later"})
@@ -140,7 +161,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # provable absence) but have their own dedicated gate (check_source_table_exists
     # above) and must stay non-blocking here (Kun's review, !1133). Note
     # _validate_soft surfaces the check name under the "field" key.
-    findings = _validate_soft(request, namespace)
+    findings = _validate_soft(request, namespace, data_source_lookup=data_source_lookup)
     blocking = [f for f in findings if f.get("field") in BLOCKING_CHECKS]
     if blocking:
         return api_response(400, {"message": blocking[0]["message"], "errors": blocking})
@@ -185,7 +206,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 # ── Validation ──────────────────────────────────────────────────────────
 
 
-def _validate_soft(request: CreateMetricRequestContent, namespace: str) -> list[dict[str, str]]:
+def _validate_soft(
+    request: CreateMetricRequestContent,
+    namespace: str,
+    *,
+    data_source_lookup: LookupArgument = LOOKUP_NOT_PROVIDED,
+) -> list[dict[str, str]]:
     """Run soft validation — delegates to shared module."""
     from coa_metrics.validate_soft import validate_soft
 
@@ -197,7 +223,9 @@ def _validate_soft(request: CreateMetricRequestContent, namespace: str) -> list[
         "sourceTable": request.source_table,
         "ontologyConcepts": request.ontology_concepts or [],
     }
-    return validate_soft(metric_body, namespace)
+    if data_source_lookup is LOOKUP_NOT_PROVIDED:
+        return validate_soft(metric_body, namespace)
+    return validate_soft(metric_body, namespace, data_source_lookup=data_source_lookup)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
@@ -252,6 +280,7 @@ def _build_metric_definition(request: CreateMetricRequestContent, caller: str) -
         ontology_concepts=request.ontology_concepts or [],
         defined_by=caller,
         effective_from=datetime.now(UTC).strftime("%Y-%m-%d"),
+        label=request.label,
     )
 
 
@@ -266,6 +295,8 @@ def _metric_to_dict(metric: MetricDefinition) -> dict[str, Any]:
         "dataSourceId": metric.data_source_id,
         "sourceTable": metric.source_table,
     }
+    if metric.label:
+        result["label"] = metric.label
     if metric.default_time_grain:
         result["defaultTimeGrain"] = metric.default_time_grain
     if metric.unit:

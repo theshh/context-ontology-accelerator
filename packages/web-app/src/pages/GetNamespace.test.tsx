@@ -3,6 +3,7 @@
 
 import React from "react";
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -58,9 +59,11 @@ vi.mock("../api-hooks/use-list-sources", () => ({
   }),
 }));
 
+let mockMetrics: Array<Record<string, unknown>> = [];
+
 vi.mock("../api-hooks/use-metrics", () => ({
   useListMetrics: () => ({
-    data: { pages: [] },
+    data: { pages: [{ metrics: mockMetrics }] },
     isLoading: false,
     error: null,
   }),
@@ -106,6 +109,7 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
 describe("GetNamespace", () => {
   beforeEach(() => {
     mockNamespace = { ...baseNamespace };
+    mockMetrics = [];
   });
 
   it("renders the Graph details section heading", () => {
@@ -125,8 +129,8 @@ describe("GetNamespace", () => {
   it("renders VKG health, defaulting to UNKNOWN with an explanatory tooltip trigger", () => {
     render(<GetNamespace />, { wrapper });
     expect(screen.getByText("VKG health")).toBeInTheDocument();
-    // Namespace mock has no vkgHealth -> defaults to UNKNOWN.
-    const status = screen.getByText("UNKNOWN");
+    // Namespace mock has no vkgHealth -> defaults to UNKNOWN, shown as a word.
+    const status = screen.getByText("Unknown");
     expect(status).toBeInTheDocument();
     // Popover wraps the indicator as a text trigger (button role).
     expect(
@@ -138,7 +142,7 @@ describe("GetNamespace", () => {
     mockNamespace = { ...baseNamespace, vkgHealth: "DEGRADED" };
     render(<GetNamespace />, { wrapper });
     expect(screen.getByText("VKG health")).toBeInTheDocument();
-    const status = screen.getByText("DEGRADED");
+    const status = screen.getByText("Degraded");
     expect(status).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /DEGRADED/i }),
@@ -158,6 +162,25 @@ describe("GetNamespace", () => {
     expect(
       screen.getByText(/container health check failing/i),
     ).toBeInTheDocument();
+  });
+
+  it("renders the namespace language read-only with a human label", () => {
+    mockNamespace = { ...baseNamespace, language: "ja" };
+    render(<GetNamespace />, { wrapper });
+    expect(screen.getByText("Language")).toBeInTheDocument();
+    expect(screen.getByText("Japanese (ja)")).toBeInTheDocument();
+  });
+
+  it("renders English for an en namespace", () => {
+    mockNamespace = { ...baseNamespace, language: "en" };
+    render(<GetNamespace />, { wrapper });
+    expect(screen.getByText("English (en)")).toBeInTheDocument();
+  });
+
+  it("renders an unknown language tag as the raw tag", () => {
+    mockNamespace = { ...baseNamespace, language: "pt-BR" };
+    render(<GetNamespace />, { wrapper });
+    expect(screen.getByText("pt-BR")).toBeInTheDocument();
   });
 
   it("renders Edit and Add connection buttons; Permissions moved to Settings", () => {
@@ -191,4 +214,5 @@ describe("GetNamespace", () => {
     const link = screen.getByRole("link", { name: "My Database" });
     expect(link).toHaveAttribute("href", "/namespaces/ns-1/sources/src-1");
   });
+
 });

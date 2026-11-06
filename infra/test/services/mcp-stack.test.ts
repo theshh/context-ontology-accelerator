@@ -22,6 +22,13 @@ const TEST_CONTEXT = {
   "aws:cdk:bundling-stacks": [],
 };
 
+/** Read `key` from a synthesized template node, or undefined, without casts. */
+function field(node: unknown, key: string): unknown {
+  return typeof node === "object" && node !== null
+    ? Object.entries(node).find(([k]) => k === key)?.[1]
+    : undefined;
+}
+
 describe("McpStack", () => {
   let template: Template;
 
@@ -127,6 +134,42 @@ describe("McpStack", () => {
           JWT_CLIENT_ID: Match.anyValue(),
         }),
       }),
+    );
+  });
+
+  it("authorizer accepts exactly the audience the server's JWT check accepts", () => {
+    // Regression (GH #331): the authorizer allowed [web client, MCP client]
+    // while JWT_CLIENT_ID was the MCP client only, so a web-client ID token
+    // passed initialize and then failed every tool call with "Token audience
+    // mismatch". Both layers must accept the same ID-token audience, so a
+    // web-client token gets a 401 at the edge instead.
+    const runtimes = Object.values(
+      template.findResources("AWS::BedrockAgentCore::Runtime"),
+    );
+    expect(runtimes).toHaveLength(1);
+    const properties = field(runtimes[0], "Properties");
+    const audience = field(
+      field(
+        field(properties, "AuthorizerConfiguration"),
+        "CustomJWTAuthorizer",
+      ),
+      "AllowedAudience",
+    );
+    const jwtClientId = field(
+      field(properties, "EnvironmentVariables"),
+      "JWT_CLIENT_ID",
+    );
+    expect(audience).toEqual([jwtClientId]);
+
+    // ...and that audience is the MCP client's id, not the web client's.
+    const ref = field(jwtClientId, "Ref");
+    expect(typeof ref).toBe("string");
+    const parameter = field(
+      field(template.toJSON(), "Parameters"),
+      String(ref),
+    );
+    expect(field(parameter, "Default")).toBe(
+      `/${DEFAULT_RESOURCE_PREFIX}/mcp-client-id`,
     );
   });
 
@@ -273,7 +316,7 @@ describe("McpStack", () => {
   });
 
   // Deliberately NOT narrowed: the role reads across the whole `${ssmPrefix}` tree
-  // (`/issuer`, `/userpool-client-id`, the Context Manager runtime ARN), so scoping
+  // (`/issuer`, `/mcp-client-id`, the Context Manager runtime ARN), so scoping
   // it to a subtree presents as a runtime AccessDenied that reads as a config error.
   // Accepted residual: the Databricks connector parameters are readable here too,
   // a metadata side channel over non-secret values.
@@ -297,5 +340,63 @@ describe("McpStack", () => {
         );
       }),
     ).toBe(true);
+  });
+
+  it("targets the discovery Lambdas by fixed name, without deploy-time SSM reads", () => {
+    // Reading these ARNs from SSM at deploy time made McpStack (and, through the
+    // shared image asset, ServeStack) wait for the metric-service and ontology
+    // stacks.
+    const runtime = JSON.stringify(
+      template.findResources("AWS::BedrockAgentCore::Runtime"),
+    );
+    for (const fn of ["metric-api", "ontology-api-proxy"]) {
+      expect(runtime).toContain(
+        `:lambda:us-east-1:123456789012:function:${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-${fn}`,
+      );
+    }
+    // The partition comes from the stack, so GovCloud/China ARNs stay valid.
+    expect(runtime).toContain("AWS::Partition");
+    const params = JSON.stringify(template.toJSON().Parameters ?? {});
+    expect(params).not.toContain("/metric/api-fn-arn");
+    expect(params).not.toContain("/ontology-engine/api-fn-arn");
+  });
+});
+
+describe("McpStack - teardown", () => {
+  // AgentCore's ENIs keep McpSG in use for hours after the runtime is deleted.
+  // Retained, the stack deletes at once instead of failing on the group and
+  // keeping every stack it imports from alive; destroy.sh deletes the group.
+  it("retains the runtime security group and tags it for destroy.sh", () => {
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const depStack = new cdk.Stack(app, "DepStack", {
+      env: { account: "123456789012", region: "us-east-1" },
+    });
+    const vpc = new ec2.Vpc(depStack, "Vpc", { maxAzs: 2 });
+    const mkTable = (id: string) =>
+      new dynamodb.Table(depStack, id, {
+        partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
+      });
+    const template = Template.fromStack(
+      new McpStack(app, "TestMcpTeardown", {
+        env: { account: "123456789012", region: "us-east-1" },
+        vpc,
+        rolesTable: mkTable("Roles"),
+        resourceRoleMappingsTable: mkTable("RRM"),
+      }),
+    );
+
+    template.hasResource("AWS::EC2::SecurityGroup", {
+      DeletionPolicy: "Retain",
+      UpdateReplacePolicy: "Retain",
+      Properties: Match.objectLike({
+        GroupDescription: "AgentCore Runtime - MCP Server (thin proxy)",
+        Tags: Match.arrayWith([
+          {
+            Key: `${DEFAULT_RESOURCE_PREFIX}:teardown`,
+            Value: "delete-after-eni-release",
+          },
+        ]),
+      }),
+    });
   });
 });

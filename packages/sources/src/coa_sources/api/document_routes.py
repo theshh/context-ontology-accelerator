@@ -87,9 +87,9 @@ def _validate_bucket_namespace_authorization(source_bucket_arn: str | None, name
     # reaches this function can never skip the check by passing nothing.
     try:
         bucket = parse_bucket_from_arn(source_bucket_arn or "")
-    except ValueError as exc:
+    except ValueError:
         logger.warning("bucket_namespace_authorization_malformed_arn", namespace_id=namespace_id)
-        return api_response(400, {"error": f"sourceBucketArn is malformed: {exc}"})
+        return api_response(400, {"error": "sourceBucketArn is malformed: expected arn:aws:s3:::<bucket-name>"})
 
     tag_key = bucket_namespace_tag_key()
     try:
@@ -135,8 +135,14 @@ def _validate_bucket_namespace_authorization(source_bucket_arn: str | None, name
     return None
 
 
-def _create_document_source(doc_req: Any, namespace_id: str, event: dict[str, Any]) -> dict[str, Any]:
-    """Create a DOCUMENTS source. doc_req is a CreateDocumentSourceInput model instance."""
+def _create_document_source(
+    doc_req: Any, namespace_id: str, event: dict[str, Any], *, namespace_language: str
+) -> dict[str, Any]:
+    """Create a DOCUMENTS source. doc_req is a CreateDocumentSourceInput model instance.
+
+    ``namespace_language`` is the canonical language the caller resolved from the
+    namespace item; it rides in the ingestion job input as the KG-build snapshot.
+    """
     name: str = doc_req.name.strip()
     if not name:
         return api_response(400, {"error": "name is required"})
@@ -268,6 +274,7 @@ def _create_document_source(doc_req: Any, namespace_id: str, event: dict[str, An
             "source_type": doc_source_type,
             "s3_prefixes": s3_prefixes,
             "extraction_config": extraction_config,
+            "namespace_language": namespace_language,
         }
         if source_bucket_arn:
             sqs_body["source_bucket_arn"] = source_bucket_arn
@@ -329,7 +336,15 @@ def _handle_upload_urls(event: dict[str, Any], namespace_id: str) -> dict[str, A
         if not content_type:
             return api_response(400, {"error": f"files[{i}].contentType must not be blank"})
         if content_type not in SUPPORTED_UPLOAD_CONTENT_TYPES:
-            return api_response(400, {"error": f"files[{i}].contentType '{content_type}' is not supported"})
+            return api_response(
+                400,
+                {
+                    "error": (
+                        f"files[{i}].contentType is not supported; supported types: "
+                        f"{', '.join(sorted(SUPPORTED_UPLOAD_CONTENT_TYPES))}"
+                    )
+                },
+            )
         validated.append({"filename": filename, "contentType": content_type})
 
     upload_id = str(uuid.uuid4())

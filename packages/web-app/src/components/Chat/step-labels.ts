@@ -1,6 +1,9 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import type { AppMessage } from "../../i18n/appMessages";
+import type { AppTranslate } from "../../i18n/LocaleProvider";
+
 /**
  * Canonical trace step taxonomy → human-readable labels.
  *
@@ -15,7 +18,7 @@
  */
 
 /** Short, present-tense labels shown while a step is the current/live step. */
-export const STEP_LABELS: Record<string, string> = {
+export const STEP_LABELS: Readonly<Record<string, AppMessage>> = {
   "t1.metric_match": "Searching metric catalog",
   "t1.execute": "Running query",
   "query.embed": "Embedding query",
@@ -28,6 +31,12 @@ export const STEP_LABELS: Record<string, string> = {
   "t2.vkg.compile": "Translating SPARQL to SQL",
   "t2.vkg.retry": "Retrying translation",
   "t2.vkg.execute": "Running knowledge graph query",
+  // Native SPARQL against an RDF_SPARQL graph source (no VKG, no SQL).
+  "t2.sparql.context": "Loading graph ontology context",
+  "t2.sparql.translate": "Translating to SPARQL",
+  "t2.sparql.validate": "Validating query",
+  "t2.sparql.firewall": "Checking query safety",
+  "t2.sparql.execute": "Querying the graph",
   "t3.retrieve": "Searching knowledge sources",
   "t3.vector_search": "Searching knowledge base",
   "t3.graph_traverse": "Traversing knowledge graph",
@@ -53,11 +62,17 @@ export const STEP_LABELS: Record<string, string> = {
   agentic_working_answer: "Drafting an answer",
   agentic_final_semantic_search: "Final knowledge-base sweep",
   agentic_retrieval_stop: "Finishing retrieval",
+  // Stop-signal checks (DEEP_REASONING_* stop knobs). stop_signals is recorded
+  // per model reply when telemetry is on or a threshold is set.
+  stop_signals: "Checking stop signals",
+  subquestion_stop: "Finishing a sub-question",
+  sufficiency_confidence_hold: "Confidence too low, continuing",
+  answer_stability: "Checking answer stability",
   llm_synthesize: "Synthesizing answer",
 };
 
 /** Noun-phrase labels shown in the detailed execution plan (RationalePanel). */
-export const STEP_DISPLAY_NAMES: Record<string, string> = {
+export const STEP_DISPLAY_NAMES: Readonly<Record<string, AppMessage>> = {
   "t1.metric_match": "Match metric",
   "t1.authorize": "Cedar authorize",
   "t1.firewall": "SQL Firewall",
@@ -78,6 +93,12 @@ export const STEP_DISPLAY_NAMES: Record<string, string> = {
   "t2.vkg.execute": "Execute SQL via VKG",
   "t2.sql.failed": "NL→SQL strategy failed",
   "t2.vkg.failed": "VKG strategy failed",
+  "t2.sparql.context": "Assemble graph ontology context",
+  "t2.sparql.translate": "Generate SPARQL",
+  "t2.sparql.validate": "Validate SPARQL",
+  "t2.sparql.firewall": "SPARQL Firewall",
+  "t2.sparql.execute": "Execute SPARQL on graph",
+  "t2.sparql.failed": "NL→SPARQL strategy failed",
   "t2.strategy_selected": "Strategy selected",
   "t3.retrieve": "Parallel retrieval",
   "t3.vector_search": "Vector search",
@@ -91,6 +112,113 @@ export const STEP_DISPLAY_NAMES: Record<string, string> = {
   // to the t3.* taxonomy); labeled explicitly so it doesn't fall back to raw.
   lexical_baseline_retrieve: "Lexical retrieval",
 };
+
+/**
+ * Labels historically produced by humanizeStepId and used by the compact trace
+ * panel/table. Keep their English copy stable while making known backend step
+ * IDs translatable. Unknown extension step IDs still use the generic fallback.
+ */
+const TRACE_STEP_NAMES = {
+  "t1.metric_match": "Metric Match",
+  "t1.authorize": "Authorize",
+  "t1.firewall": "Firewall",
+  "t1.execute": "Execute",
+  "query.embed": "Embed",
+  "routing.select": "Select",
+  "t2.sql.generate": "Sql Generate",
+  "t2.sql.authorize": "Sql Authorize",
+  "t2.sql.firewall": "Sql Firewall",
+  "t2.sql.execute": "Sql Execute",
+  "t2.sql.failed": "Sql Failed",
+  "t2.vkg.context": "Vkg Context",
+  "t2.vkg.translate": "Vkg Translate",
+  "t2.vkg.validate": "Vkg Validate",
+  "t2.vkg.compile": "Vkg Compile",
+  "t2.vkg.retry": "Vkg Retry",
+  "t2.vkg.authorize": "Vkg Authorize",
+  "t2.vkg.firewall": "Vkg Firewall",
+  "t2.vkg.execute": "Vkg Execute",
+  "t2.vkg.failed": "Vkg Failed",
+  "t2.strategy_selected": "Strategy Selected",
+  "t3.retrieve": "Retrieve",
+  "t3.vector_search": "Vector Search",
+  "t3.graph_traverse": "Graph Traverse",
+  "t3.catalog_context": "Catalog Context",
+  "t3.synthesize": "Synthesize",
+  "t3.guardrail": "Guardrail",
+  "response.assemble": "Response Assemble",
+  lexical_baseline_retrieve: "Lexical Baseline Retrieve",
+  agentic_session_start: "Agentic Session Start",
+  decompose: "Decompose",
+  subquestion_start: "Subquestion Start",
+  next_step_select: "Next Step Select",
+  tools_gated: "Tools Gated",
+  ontology_resolved: "Ontology Resolved",
+  ontology_edge_filter: "Ontology Edge Filter",
+  present_edges_discovered: "Present Edges Discovered",
+  exploration_branch: "Exploration Branch",
+  no_progress_step: "No Progress Step",
+  ad_hoc_query: "Ad Hoc Query",
+  agentic_working_answer: "Agentic Working Answer",
+  agentic_final_semantic_search: "Agentic Final Semantic Search",
+  agentic_retrieval_stop: "Agentic Retrieval Stop",
+  stop_signals: "Stop Signals",
+  subquestion_stop: "Subquestion Stop",
+  sufficiency_confidence_hold: "Sufficiency Confidence Hold",
+  answer_stability: "Answer Stability",
+  llm_synthesize: "Llm Synthesize",
+} satisfies Record<string, AppMessage>;
+
+export function localizeLiveStep(t: AppTranslate, stepId: string): string {
+  const message = STEP_LABELS[stepId as keyof typeof STEP_LABELS];
+  return message ? t(message) : humanizeStepId(stepId);
+}
+
+export function localizeDisplayStep(t: AppTranslate, stepId: string): string {
+  const message = STEP_DISPLAY_NAMES[stepId as keyof typeof STEP_DISPLAY_NAMES];
+  return message ? t(message) : humanizeStepId(stepId);
+}
+
+export function localizeTraceStep(t: AppTranslate, stepId: string): string {
+  const message = TRACE_STEP_NAMES[stepId as keyof typeof TRACE_STEP_NAMES];
+  return message ? t(message) : humanizeStepId(stepId);
+}
+
+/**
+ * Trace step status → label. Same words as the Rationale panel's step list, so
+ * one step reads the same in the panel and on the Trace detail page; the
+ * colour comes from {@link mapTraceStatus}.
+ */
+export const TRACE_STATUS_LABELS: Readonly<Record<string, AppMessage>> = {
+  success: "Resolved",
+  succeeded: "Resolved",
+  ok: "Resolved",
+  allow: "Resolved",
+  completed: "Resolved",
+  skipped: "Skipped",
+  miss: "Skipped",
+  empty: "Empty",
+  error: "Error",
+  denied: "Denied",
+  failed: "Failed",
+  retry: "Retried",
+  retrying: "Retrying",
+  timeout: "Timed out",
+  degraded: "Degraded",
+  multi_metric_bypass: "Skipped",
+  residual_qualifier_bypass: "Skipped",
+};
+
+/** A trace step status in the reader's locale; unknown statuses stay raw. */
+export function localizeTraceStatus(t: AppTranslate, status: string): string {
+  const message = Object.prototype.hasOwnProperty.call(
+    TRACE_STATUS_LABELS,
+    status,
+  )
+    ? TRACE_STATUS_LABELS[status]
+    : undefined;
+  return message ? t(message) : status;
+}
 
 /**
  * Steps hidden from the inline TracePanel summary unless they failed/denied —
@@ -108,6 +236,9 @@ export const HIDDEN_UNLESS_DENIED = new Set<string>([
   "t2.sql.firewall",
   "t2.vkg.authorize",
   "t2.vkg.firewall",
+  "t2.sparql.context",
+  "t2.sparql.validate",
+  "t2.sparql.firewall",
   "t2.strategy_selected",
   "t3.guardrail",
 ]);
@@ -119,12 +250,35 @@ export const CEDAR_STEP_IDS = new Set<string>([
   "t2.vkg.authorize",
 ]);
 
-/** SQL Firewall step IDs across all tiers — for boundary controls. */
+/**
+ * Query-firewall step IDs across all tiers — for boundary controls. Includes
+ * the SPARQL firewall, which gates native graph queries the way the SQL
+ * firewall gates SQL; label the badge with {@link firewallLabel}.
+ */
 export const FIREWALL_STEP_IDS = new Set<string>([
   "t1.firewall",
   "t2.sql.firewall",
   "t2.vkg.firewall",
+  "t2.sparql.firewall",
 ]);
+
+/**
+ * True when the answer came from a native SPARQL query against an RDF_SPARQL
+ * graph source (the t2.sparql.execute step succeeded) rather than from SQL.
+ */
+export function isGraphAnswer(
+  trace: ReadonlyArray<{ step: string; status: string }>,
+): boolean {
+  return trace.some(
+    (s) =>
+      s.step === "t2.sparql.execute" && mapTraceStatus(s.status) === "success",
+  );
+}
+
+/** Badge label for the firewall step that ran: SPARQL for a graph answer, else SQL. */
+export function firewallLabel(stepId: string | undefined): string {
+  return stepId === "t2.sparql.firewall" ? "SPARQL Firewall" : "SQL Firewall";
+}
 
 /** Bedrock Guardrail step IDs — for boundary controls. Only Tier-3 today. */
 export const GUARDRAIL_STEP_IDS = new Set<string>(["t3.guardrail"]);
@@ -145,6 +299,42 @@ export function humanizeStepId(stepId: string): string {
     .replace(/\./g, " ")
     .replace(/_/g, " ")
     .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/**
+ * Tier-2 strategy families, keyed by their trace step prefix. NL→SQL generates
+ * SQL; VKG (Ontop) generates SPARQL and compiles it to SQL; NL→SPARQL (graph)
+ * runs SPARQL directly against an RDF_SPARQL graph source.
+ */
+const TIER2_FAMILIES: ReadonlyArray<{ prefix: string; label: string }> = [
+  { prefix: "t2.sql.", label: "NL→SQL" },
+  { prefix: "t2.vkg.", label: "VKG (Ontop)" },
+  { prefix: "t2.sparql.", label: "NL→SPARQL (graph)" },
+];
+
+/** The Tier-2 strategy families whose steps appear in ``trace``, in display order. */
+export function tier2FamiliesIn(
+  trace: readonly { step: string }[],
+): ReadonlyArray<{ prefix: string; label: string }> {
+  return TIER2_FAMILIES.filter((f) =>
+    trace.some((s) => s.step.startsWith(f.prefix)),
+  );
+}
+
+/**
+ * Title for a Tier 2 result, naming every strategy that ran. Shared by the
+ * Rationale panel and the Trace detail page so both name the strategy the same way.
+ */
+export function tier2Title(
+  t: AppTranslate,
+  trace: readonly { step: string }[],
+): string {
+  const strategies = tier2FamiliesIn(trace).map((f) => f.label);
+  return strategies.length
+    ? t("Tier 2 — Structured Query ({strategies})", {
+        strategies: strategies.join(" + "),
+      })
+    : t("Tier 2 — Structured Query");
 }
 
 /**

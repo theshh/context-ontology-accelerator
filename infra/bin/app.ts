@@ -4,6 +4,7 @@
 
 import * as fs from "fs";
 import * as cdk from "aws-cdk-lib";
+import * as lambda from "aws-cdk-lib/aws-lambda";
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import type { IAlarmActionStrategy } from "cdk-monitoring-constructs/lib/common/alarm/action";
 import {
@@ -29,6 +30,7 @@ import {
 import {
   AuthnzStack,
   EdgeWafStack,
+  EniWarmStack,
   GuardrailStack,
   IdpAuthenticationStack,
   NetworkStack,
@@ -226,6 +228,15 @@ async function deploy(): Promise<void> {
   const network = new NetworkStack(app, `${stackPrefix}-network`, {
     agentCoreAzNames,
   });
+  // Pre-warms the Lambda Hyperplane ENIs off the critical path (see EniWarmStack).
+  const eniWarm = new EniWarmStack(app, `${stackPrefix}-eni-warm`, {
+    vpc: network.vpc,
+    lambdaSecurityGroup: network.lambdaSecurityGroup,
+    discoveryOcspSecurityGroup: network.discoveryOcspSecurityGroup,
+    ecsSecurityGroup: network.ecsSecurityGroup,
+    authorizerSecurityGroup: network.authorizerSecurityGroup,
+    sparqlSourceEgressSecurityGroup: network.sparqlSourceEgressSecurityGroup,
+  });
   const auth = new IdpAuthenticationStack(
     app,
     `${stackPrefix}-auth`,
@@ -262,6 +273,7 @@ async function deploy(): Promise<void> {
   // from valueForStringParameter, so the dependency must be explicit or a fresh
   // account deploys the namespace stack before those params exist.
   smusDomain.addDependency(storage); // needs /opensearch/endpoint + /opensearch/collection-name
+  smusDomain.addDependency(authnz); // /authnz/idempotency-table-name (namespace + grants APIs)
 
   // ── Service stacks ─────────────────────────────────────────────────
   const metricService = new MetricServiceStack(
@@ -280,6 +292,7 @@ async function deploy(): Promise<void> {
   );
   // Metric validation reads SMUS catalog via SSM-resolved params.
   metricService.addDependency(smusDomain); // /namespace/namespaces-table-name, /smus/domain-id, /smus/dz-project-access-role-arn
+  metricService.addDependency(authnz); // /authnz/idempotency-table-name
 
   const api = new ApiStack(app, `${stackPrefix}-api`, {
     allowedOrigin,
@@ -287,6 +300,8 @@ async function deploy(): Promise<void> {
     ...(apiWebAclId && { webAclId: apiWebAclId }),
     alarmAction,
     vpc: network.vpc,
+    lambdaSecurityGroup: network.lambdaSecurityGroup,
+    authorizerSecurityGroup: network.authorizerSecurityGroup,
     rolesTable: authnz.rolesTable,
     resourceRoleMappingsTable: authnz.resourceRoleMappingsTable,
     cacheInvalidationTable: authnz.cacheInvalidationTable,
@@ -426,7 +441,9 @@ async function deploy(): Promise<void> {
   });
   sources.addDependency(smusDomain); // needs SSM params from namespace stack
   sources.addDependency(storage); // needs Neptune/OpenSearch endpoints
-  sources.addDependency(serve); // needs /{env}/serve/runtime-role-arn SSM param (LF consumer grant)
+  // No dependency on serve: DbConnectorFn reads the serve runtime role ARN from SSM at runtime.
+  sources.addDependency(guardrail); // reads /bedrock/retrieval-guardrail-{id,version} at deploy time
+  sources.addDependency(authnz); // /authnz/idempotency-table-name
 
   api.addDependency(sources);
   api.addDependency(metricService);
@@ -462,6 +479,8 @@ async function deploy(): Promise<void> {
     // construct properties, so this stack has no direct reference into the
     // auth stack's resource tree (see PR for the export-lock this avoids).
     isCognitoMode: config.idpType !== IdpType.OIDC,
+    federatedIdentityProviderNames:
+      IdpAuthenticationStack.federatedProviderNames(authProps),
     apiEndpoint: api.api.url,
     apiRestApiId: api.api.restApiId,
     apiStageName: api.api.deploymentStage.stageName,
@@ -502,10 +521,12 @@ async function deploy(): Promise<void> {
     bedrockEmbedDimensions: config.bedrockEmbedDimensions,
     bedrockInductionLlmModelId: config.bedrockInductionLlmModelId,
     bedrockChatModelId: config.bedrockChatModelId,
+    bedrockGroundingLlmModelId: config.bedrockGroundingLlmModelId,
     alarmAction,
   });
   ontology.addDependency(smusDomain); // /namespace/namespaces-table-name, /smus/dz-project-access-role-arn
   ontology.addDependency(sources); // /sources/sources-table-name
+  ontology.addDependency(authnz); // /authnz/idempotency-table-name (api-proxy StartInduction)
 
   // ApiStack reads /ontology-engine/api-fn-arn via SSM (CFN dynamic ref).
   api.addDependency(ontology);
@@ -530,9 +551,32 @@ async function deploy(): Promise<void> {
     agentCoreAzNames,
   });
   mcp.addDependency(serve); // needs CM runtime-arn SSM param
-  mcp.addDependency(metricService); // needs /metric/api-fn-arn SSM param (discovery tools)
-  mcp.addDependency(ontology); // needs /ontology-engine/api-fn-arn SSM param (discovery tools)
-  mcp.addDependency(auth); // needs /issuer, /userpool-client-id, /mcp-client-id SSM params
+  mcp.addDependency(auth); // needs /issuer, /mcp-client-id, /authentication-group-token-name SSM params
+  // web reads ${ssmPrefix}/mcp/runtime-arn (published by mcp) to surface the MCP
+  // endpoint in runtime-config.json for the console's MCP page (#1166). CDK can't
+  // infer the ordering from valueForStringParameter, so declare it explicitly —
+  // otherwise a fresh-account deploy can write runtime-config.json before the
+  // parameter exists.
+  web.addDependency(mcp);
+
+  // Every stack with a VPC Lambda waits for EniWarmStack, so its functions reuse
+  // the pre-warmed Hyperplane ENIs instead of each paying a ~4 min create.
+  // Derived rather than listed, so a new stack with a VPC Lambda is covered too.
+  for (const stack of app.node.children) {
+    if (
+      !(stack instanceof cdk.Stack) ||
+      stack === eniWarm ||
+      stack === network
+    ) {
+      continue;
+    }
+    const hasVpcLambda = stack.node
+      .findAll()
+      .some((c) => c instanceof lambda.Function && c.isBoundToVpc);
+    if (hasVpcLambda) {
+      stack.addDependency(eniWarm);
+    }
+  }
 
   // Inject the resolved brand tokens (BRAND_PREFIX / GRAPH_BASE_URI /
   // EVENT_SOURCE_PREFIX) into every Lambda and ECS container. Applied as an

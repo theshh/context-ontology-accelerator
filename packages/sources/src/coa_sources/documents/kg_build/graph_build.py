@@ -19,10 +19,15 @@ Environment variables:
     DOC_SOURCE_ID            — doc-source identifier (DDB sort key)
     NAMESPACE_ID             — namespace / tenant identifier (DDB partition key)
     STAGING_PREFIX           — S3 prefix containing pre-processed text + metadata sidecars
+    NAMESPACE_LANGUAGE       — canonical namespace-language snapshot resolved by the
+                               Sources API when the ingestion was triggered. Never
+                               re-read from the namespace; a non-``en`` value adds a
+                               fixed output-language instruction to the proposition
+                               and topic extraction prompts.
 
   Optional:
     EXTRACTION_MODE          — "continuous" (default) or "separated"
-    USE_BATCH_INFERENCE      — "true" or "false" (default) — uses Bedrock batch inference
+    USE_BATCH_INFERENCE      — "true" (default) or "false" — uses Bedrock batch inference
     BATCH_INFERENCE_ROLE_ARN — IAM role for Bedrock batch inference (required if USE_BATCH_INFERENCE=true)
     ENABLE_VERSIONING        — "true" (default) or "false"
     ENABLE_PROPOSITION_EXTRACTION — "true" (default) or "false" — skip for ~50% fewer LLM calls
@@ -101,9 +106,13 @@ from coa_common.constants import (
 )
 from coa_common.dao import DynamoDBDAO
 from coa_common.embeddings import make_llama_index_embedding
+from coa_common.language_tags import describe_language, needs_language_instruction
 from coa_common.logging import setup_logging
 from coa_common.s3 import get_s3_client, list_objects, read_file_bytes
 from coa_control_plane_server.models.source_status import SourceStatus
+
+from coa_sources.documents.kg_build import batch_patches
+from coa_sources.namespace_language import NAMESPACE_LANGUAGE_ENV, require_language_snapshot
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -639,6 +648,114 @@ def _patch_graphrag_llm_cache_client_config() -> None:
     _graphrag_llm_client_patched = True
 
 
+# Where the language instruction goes in each toolkit prompt: immediately before
+# the first block that carries document-derived (untrusted) content, so it stays
+# with the trusted instructions and never inside the data the model is told to
+# read. Keyed by the ExtractionConfig parameter the rewritten template feeds.
+_LANGUAGE_INSTRUCTION_ANCHORS: dict[str, tuple[str, str]] = {
+    "extract_propositions_prompt_template": ("EXTRACT_PROPOSITIONS_PROMPT", "<sourceInformation>"),
+    "extract_topics_prompt_template": ("EXTRACT_TOPICS_PROMPT", "<propositions>"),
+}
+
+# The same rule for the entity-classification inference sweep, keyed by the
+# InferClassificationsConfig parameter: the instruction goes ahead of the sample
+# chunks the model reads. The toolkit's ranking prompt is not listed because
+# InferClassificationsConfig has no field for it and LexicalGraphIndex does not
+# pass one to InferClassifications.
+_CLASSIFICATION_LANGUAGE_INSTRUCTION_ANCHORS: dict[str, tuple[str, str]] = {
+    "prompt_template": ("DOMAIN_ENTITY_CLASSIFICATIONS_PROMPT", "Sample text chunks:"),
+}
+
+
+def _extraction_language_instruction(namespace_language: str) -> str:
+    """Fixed output-language instruction for the GraphRAG extraction prompts.
+
+    Only the canonical tag and a name from a fixed table are interpolated. The
+    text contains no braces: the toolkit renders these templates with
+    ``str.format``.
+    """
+    target = describe_language(namespace_language)
+    return f"""# Output Language (REQUIRED)
+
+Write your output in {target}, the language of this knowledge graph.
+
+- The response format is a fixed template read by a program. Keep its fixed labels \
+(`topic:`, `entities:`, `proposition:`, `entity-entity relationships:`, `entity-attributes:`), \
+colons, `|` separators and layout exactly as written, in English. Write only the values that \
+fill its placeholders in {target}, using the words the source text uses. The classification \
+after the `|` separator is a value: write it in {target}.
+- Relationship and attribute names keep the uppercase-with-underscores format, written in \
+{target}. Uppercase applies only to letters that have case, and an underscore stands only \
+where the name would otherwise contain a space.
+- Treat English preferred topics and classifications as concepts, not spellings; name the \
+matching concept in {target}. Do not append an English gloss.
+- Copy identifiers exactly as printed, whatever script they use: model, type, part, drawing \
+and option numbers; standard and regulation designations; company, brand and product names; \
+signal and terminal names; units; codes and IRIs. An identifier that is ASCII in the source \
+stays ASCII.
+- These instructions are in English for your benefit. Do not echo them, and do not treat \
+them as evidence about the language of the output.
+
+"""
+
+
+def _language_instructed_templates(anchors: dict[str, tuple[str, str]], namespace_language: str) -> dict[str, str]:
+    """Toolkit templates from ``anchors`` with the language instruction inserted.
+
+    Empty for a namespace whose primary subtag is ``en``. Otherwise each listed
+    toolkit template gains the fixed instruction immediately before its anchor.
+
+    Raises:
+        RuntimeError: If a toolkit template no longer contains its anchor, so a
+            toolkit upgrade cannot silently move the instruction into (or drop
+            it from) the document-content portion.
+    """
+    if not needs_language_instruction(namespace_language):
+        return {}
+
+    from graphrag_toolkit.lexical_graph.indexing import prompts
+
+    instruction = _extraction_language_instruction(namespace_language)
+    overrides: dict[str, str] = {}
+    for parameter, (template_name, anchor) in anchors.items():
+        template: str = getattr(prompts, template_name)
+        position = template.find(anchor)
+        if position < 0:
+            raise RuntimeError(
+                f"graphrag-toolkit {template_name} has no {anchor} block to anchor the language instruction"
+            )
+        overrides[parameter] = template[:position] + instruction + template[position:]
+    return overrides
+
+
+def _namespace_language_prompts(namespace_language: str) -> dict[str, str]:
+    """ExtractionConfig prompt overrides for a namespace language.
+
+    Empty for a namespace whose primary subtag is ``en``: English and legacy
+    namespaces keep the toolkit prompts unchanged. Otherwise both the
+    proposition and topic templates gain the fixed instruction, placed ahead of
+    their document-content blocks.
+
+    Raises:
+        RuntimeError: If a toolkit template no longer contains its anchor.
+    """
+    return _language_instructed_templates(_LANGUAGE_INSTRUCTION_ANCHORS, namespace_language)
+
+
+def _classification_inference_prompts(namespace_language: str) -> dict[str, str]:
+    """InferClassificationsConfig prompt override for a namespace language.
+
+    Empty for a namespace whose primary subtag is ``en``. Otherwise the
+    toolkit's domain-classification inference template gains the fixed
+    instruction ahead of its sample chunks, so the inferred class vocabulary is
+    named in the namespace language.
+
+    Raises:
+        RuntimeError: If the toolkit template no longer contains its anchor.
+    """
+    return _language_instructed_templates(_CLASSIFICATION_LANGUAGE_INSTRUCTION_ANCHORS, namespace_language)
+
+
 _graphrag_aoss_patched = False
 
 
@@ -956,6 +1073,17 @@ def _setup_graphrag(tenant_id: str):
     # llama_index's OpensearchVectorClient at import time, so our retry wrapper
     # must be assigned last to win.
     _patch_graphrag_bulk_ingest_retry()
+    # AFTER the import: wraps get_request_body in every module that binds it so
+    # batch serialization omits temperature for models that reject it (default is
+    # Sonnet 5). Safe to run post-import — the serializer is read at job build.
+    # Lives in the thin batch_patches module so spawn-started workers that import
+    # the initializer do not pull all of graph_build with them.
+    batch_patches._patch_graphrag_batch_request_body()
+    # AFTER the import: the serializer patch above lives only in THIS process, but
+    # extraction transforms run in spawn-started workers that re-import the toolkit
+    # fresh. Route those workers through our initializer so the patch re-applies in
+    # each one; otherwise the no-temp KeyError resurfaces per worker.
+    batch_patches._patch_graphrag_worker_init()
 
     GraphRAGConfig.aws_region = AWS_REGION
     GraphRAGConfig.enable_versioning = ENABLE_VERSIONING
@@ -1084,7 +1212,7 @@ def _setup_graphrag(tenant_id: str):
     return graph_store_uri, vector_store_uri
 
 
-def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: str):
+def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: str, *, namespace_language: str):
     """Build the IndexingConfig handed to LexicalGraphIndex.
 
     ALWAYS returns an IndexingConfig with a fully-specified ExtractionConfig —
@@ -1151,8 +1279,13 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
         # seed with what it derives from THIS corpus, so the final vocabulary
         # is entirely corpus-driven. Leaving the argument unset would have
         # fallen back to the news/finance list — the exact bug this fixes.
+        # A non-English namespace also passes the inference prompt with the
+        # language instruction; an English one passes no template, as before.
         preferred = []
-        infer_config = InferClassificationsConfig(replace_default_classifications=True)
+        infer_config = InferClassificationsConfig(
+            replace_default_classifications=True,
+            **_classification_inference_prompts(namespace_language),
+        )
     else:
         # Both off → unguided extraction. Logged loudly, since this is the
         # only configuration where the LLM types entities from scratch.
@@ -1168,11 +1301,16 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
     # entity IS. An empty list is passed through unchanged — the toolkit reads it
     # as "no preferred topics", the extractor names them from the chunk text, and
     # behaviour matches every ingest before this field existed.
+    #
+    # A non-English namespace also overrides the proposition and topic prompt
+    # templates with the fixed language instruction; an English one passes no
+    # template arguments, exactly as before.
     extraction_config = ExtractionConfig(
         enable_proposition_extraction=ENABLE_PROPOSITION_EXTRACTION,
         preferred_entity_classifications=preferred,
         infer_entity_classifications=infer_config,
         preferred_topics=PREFERRED_TOPICS,
+        **_namespace_language_prompts(namespace_language),
     )
 
     # --- Chunking ---
@@ -1212,6 +1350,7 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
 
     logger.info(
         "Extraction config built",
+        namespace_language=namespace_language,
         proposition_extraction=ENABLE_PROPOSITION_EXTRACTION,
         preferred_entity_classifications_count=len(preferred),
         infer_entity_classifications=bool(infer_config),
@@ -1225,6 +1364,41 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
     if chunking is not None:
         kwargs["chunking"] = chunking
     return IndexingConfig(**kwargs)
+
+
+def _warn_if_no_topics(graph_store_uri: str, tenant_id: str, doc_source_id: str, docs: int) -> None:
+    """Log ``kg_build_zero_topics_extracted`` when a finished build left the tenant with no topics.
+
+    An extraction reply the toolkit cannot parse (for example translated response labels)
+    yields no topics and no error, so the source would otherwise end COMPLETED with an
+    empty graph. Best-effort: never fails the build.
+
+    ponytail: counts the whole tenant, so an empty source in a namespace that already has
+    topics from a *different* source is not flagged. The caller runs this after
+    DELETE_PREV_VERSIONS, so a re-ingest that regresses to zero is no longer masked by the
+    source's own prior good version. Scoping to this source's current version
+    (``__EXTRACTED_FROM__``/``__MENTIONED_IN__`` as the toolkit's delete_sources.py does, keyed
+    on the toolkit-assigned sourceId — not doc_source_id) would close the cross-source case too.
+    """
+    from graphrag_toolkit.lexical_graph import TenantId
+    from graphrag_toolkit.lexical_graph.storage import GraphStoreFactory
+
+    try:
+        tenant = TenantId(tenant_id)
+        with GraphStoreFactory.for_graph_store(graph_store_uri) as graph_store:
+            topics = graph_store.execute_query(f"MATCH (t:{tenant.format_label('__Topic__')}) RETURN count(t) AS n")
+            if topics[0]["n"] != 0:
+                return
+            chunks = graph_store.execute_query(f"MATCH (c:{tenant.format_label('__Chunk__')}) RETURN count(c) AS n")
+        logger.warning(
+            "kg_build_zero_topics_extracted",
+            doc_source_id=doc_source_id,
+            docs=docs,
+            chunks=chunks[0]["n"],
+            hint="extraction replies were not parsed; check the response format labels in the model output",
+        )
+    except Exception as e:  # noqa: BLE001 — diagnostics must never fail the build
+        logger.debug("kg_build_zero_topics_check_failed", error=type(e).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -1279,8 +1453,28 @@ def _run_continuous(
         except Exception:
             tb = traceback.format_exc()
             logger.error("Continuous build failed", error=tb)
-            ddb.update(ddb_key, {"status": SourceStatus.SCAN_FAILED, "errorMessage": f"SCAN_FAILED_BUILD: {tb[:500]}"})
+            ddb.update(
+                ddb_key,
+                {"status": SourceStatus.SCAN_FAILED, "errorMessage": _stage_failure_message("SCAN_FAILED_BUILD")},
+            )
             return 0, total_docs
+
+
+# Client-facing text per failure stage. errorMessage is returned to callers by
+# GetSource, so it carries the stage code and a fixed explanation; the traceback
+# goes to the log only (it names hosts, ARNs and internal paths).
+_STAGE_FAILURE_TEXT: dict[str, str] = {
+    "SCAN_FAILED_BUILD": "the knowledge-graph build failed",
+    "SCAN_FAILED_EXTRACT": "entity extraction failed",
+    "SCAN_FAILED_LOAD": "the staged documents could not be loaded",
+    "SCAN_FAILED_GRAPH_STORE": "the graph store health check failed",
+    "SCAN_FAILED_VECTOR_STORE": "the vector store health check failed",
+}
+
+
+def _stage_failure_message(code: str) -> str:
+    """Return ``"<code>: <fixed explanation>; see the service logs for details."``."""
+    return f"{code}: {_STAGE_FAILURE_TEXT.get(code, 'processing failed')}; see the service logs for details."
 
 
 # ---------------------------------------------------------------------------
@@ -1313,7 +1507,7 @@ def _check_backend_health(
             ddb_key,
             {
                 "status": SourceStatus.SCAN_FAILED,
-                "errorMessage": f"SCAN_FAILED_GRAPH_STORE: {tb[:500]}",
+                "errorMessage": _stage_failure_message("SCAN_FAILED_GRAPH_STORE"),
             },
         )
         return False
@@ -1338,7 +1532,7 @@ def _check_backend_health(
             ddb_key,
             {
                 "status": SourceStatus.SCAN_FAILED,
-                "errorMessage": f"SCAN_FAILED_VECTOR_STORE: {tb[:500]}",
+                "errorMessage": _stage_failure_message("SCAN_FAILED_VECTOR_STORE"),
             },
         )
         return False
@@ -1411,7 +1605,8 @@ def _run_separated(
             tb = traceback.format_exc()
             logger.error("Extract failed", error=tb)
             ddb.update(
-                ddb_key, {"status": SourceStatus.SCAN_FAILED, "errorMessage": f"SCAN_FAILED_EXTRACT: {tb[:500]}"}
+                ddb_key,
+                {"status": SourceStatus.SCAN_FAILED, "errorMessage": _stage_failure_message("SCAN_FAILED_EXTRACT")},
             )
             return 0, total_docs
 
@@ -1432,7 +1627,10 @@ def _run_separated(
                 collection_id,
                 error=tb,
             )
-            ddb.update(ddb_key, {"status": SourceStatus.SCAN_FAILED, "errorMessage": f"SCAN_FAILED_BUILD: {tb[:500]}"})
+            ddb.update(
+                ddb_key,
+                {"status": SourceStatus.SCAN_FAILED, "errorMessage": _stage_failure_message("SCAN_FAILED_BUILD")},
+            )
             return 0, total_docs
 
         ddb.update(ddb_key, {"docsGraphIngested": total_docs})
@@ -1473,10 +1671,6 @@ def main() -> None:
         logger.error("Input validation failed", error=str(exc))
         sys.exit(1)
 
-    logger.info(
-        "KG Build Task started", doc_source_id=doc_source_id, namespace_id=namespace_id, staging_prefix=staging_prefix
-    )
-
     ddb = DynamoDBDAO(ddb_table, region=AWS_REGION)
     ddb_key = {"PK": f"NS#{namespace_id}", "SK": f"SRC#{doc_source_id}"}
 
@@ -1486,6 +1680,24 @@ def main() -> None:
         logger.info("Doc source already completed, skipping")
         return
 
+    # The job's namespace-language snapshot. A missing or invalid value fails the
+    # build rather than defaulting to English or re-reading the namespace;
+    # re-scanning the source resolves the language again.
+    try:
+        namespace_language = require_language_snapshot(os.environ.get(NAMESPACE_LANGUAGE_ENV))
+    except ValueError as exc:
+        logger.error("Namespace language snapshot invalid", error=str(exc))
+        ddb.update(ddb_key, {"status": SourceStatus.SCAN_FAILED, "errorMessage": f"SCAN_FAILED_CONFIG: {exc}"})
+        sys.exit(1)
+
+    logger.info(
+        "KG Build Task started",
+        doc_source_id=doc_source_id,
+        namespace_id=namespace_id,
+        namespace_language=namespace_language,
+        staging_prefix=staging_prefix,
+    )
+
     # 1. Load. A listing failure raises (transient S3/IAM error must not look
     # like "empty prefix") → mark SCAN_FAILED and exit non-zero. load_failed is
     # the count of listed files that could not be downloaded/decoded.
@@ -1494,7 +1706,9 @@ def main() -> None:
     except Exception:
         tb = traceback.format_exc()
         logger.error("Failed to load staged documents", staging_prefix=staging_prefix, error=tb)
-        ddb.update(ddb_key, {"status": SourceStatus.SCAN_FAILED, "errorMessage": f"SCAN_FAILED_LOAD: {tb[:500]}"})
+        ddb.update(
+            ddb_key, {"status": SourceStatus.SCAN_FAILED, "errorMessage": _stage_failure_message("SCAN_FAILED_LOAD")}
+        )
         sys.exit(1)
     if not documents:
         # Genuinely empty prefix (listing succeeded, zero usable docs). If some
@@ -1518,7 +1732,9 @@ def main() -> None:
 
     # 2. Setup
     graph_store_uri, vector_store_uri = _setup_graphrag(tenant_id)
-    indexing_config = _build_indexing_config(bucket_name, namespace_id, doc_source_id)
+    indexing_config = _build_indexing_config(
+        bucket_name, namespace_id, doc_source_id, namespace_language=namespace_language
+    )
 
     # Build the progress monitor. The toolkit invokes its increment_* methods at
     # document boundaries (single-threaded, main process), and each call atomic-
@@ -1664,6 +1880,11 @@ def main() -> None:
         except Exception:
             tb = traceback.format_exc()
             logger.warning("Failed to delete previous versions (non-fatal)", error=tb)
+
+    # Counts topics only after prior archived versions are deleted, so a re-ingest
+    # that regresses to zero topics is not masked by the previous good version.
+    if docs_ok > 0:
+        _warn_if_no_topics(graph_store_uri, tenant_id, doc_source_id, docs_ok)
 
     elapsed = round(time.time() - start_ts, 2)
 

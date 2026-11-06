@@ -34,10 +34,17 @@ import {
   namespaceTagKey,
   resolveContext,
   resolveLambdaReservedConcurrency,
+  guardrailProfileResources,
 } from "../../context";
 import { Paths, fromRoot } from "../../paths";
 import { bundlePython } from "../../utils/python-bundling";
+import {
+  GRAPH_SOURCES_ENV,
+  graphSourcesEnabled,
+} from "../../utils/graph-sources";
+import { grantIdempotencyTable } from "../../utils/idempotency";
 import { bedrockModelArn } from "../../utils/bedrock-utils";
+import { grantGuardDutyAgentPull } from "../../utils/guardduty-agent";
 import { NetworkStack } from "../foundation/network-stack";
 import { StorageStack } from "../foundation/storage-stack";
 import { TABLE_NAMES } from "@coa/shared";
@@ -625,7 +632,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.minutes(15),
@@ -890,7 +897,7 @@ export class SourcesStack extends SCLStack {
             Paths.commonLib,
             Paths.smithyGeneratedControlPlanePythonServer,
           ],
-          requirementsFile: fromRoot("packages/sources/requirements.txt"),
+          requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
           architecture: "arm64",
         }),
         timeout: cdk.Duration.minutes(5),
@@ -1165,16 +1172,21 @@ export class SourcesStack extends SCLStack {
     dbConnectorFn.addEnvironment("LF_GRANTOR_ROLE_ARN", fedFnRole.roleArn);
 
     // Serve runtime role ARN — the consumer query principal that needs SELECT
-    // grants on LF-governed tables. Read from SSM (written by ServeStack) to
-    // avoid a circular CDK cross-stack reference. Requires addDependency(serve)
-    // in app.ts so the SSM param exists at deploy time.
-    const serveRuntimeRoleArn = ssm.StringParameter.valueForStringParameter(
-      this,
+    // grants on LF-governed tables. Resolved at RUNTIME from SSM (written by
+    // ServeStack), like the federation provisioner does, so this stack does not
+    // have to wait for ServeStack at deploy time.
+    dbConnectorFn.addEnvironment(
+      "CONSUMER_QUERY_ROLE_SSM_PARAM",
       serveRuntimeRoleArnParam,
     );
-    dbConnectorFn.addEnvironment(
-      "CONSUMER_QUERY_ROLE_ARN",
-      serveRuntimeRoleArn,
+    dbConnectorFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "ReadConsumerQueryRoleArn",
+        actions: ["ssm:GetParameter"],
+        resources: [
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${serveRuntimeRoleArnParam}`,
+        ],
+      }),
     );
     dbConnectorFn.addToRolePolicy(
       new iam.PolicyStatement({
@@ -1275,6 +1287,7 @@ export class SourcesStack extends SCLStack {
         memoryLimitMiB: 8192,
       },
     );
+    grantGuardDutyAgentPull(dbEnrichmentTaskDef);
 
     const dbEnrichmentImageUri = this.node.tryGetContext(
       "sources_db_enrichment_image_uri",
@@ -1350,6 +1363,7 @@ export class SourcesStack extends SCLStack {
         actions: ["bedrock:ApplyGuardrail"],
         resources: [
           `arn:aws:bedrock:${this.region}:${this.account}:guardrail/*`,
+          ...guardrailProfileResources(this),
         ],
       }),
     );
@@ -1597,6 +1611,14 @@ export class SourcesStack extends SCLStack {
               name: "NAMESPACE_ID",
               value: sfn.JsonPath.stringAt("$.namespaceId"),
             },
+            // Namespace-language snapshot resolved by the Sources API when the
+            // scan was triggered (always present via the trigger). Enrichment
+            // uses it as-is and never re-reads the namespace, so a retried task
+            // keeps the language its job started with.
+            {
+              name: "NAMESPACE_LANGUAGE",
+              value: sfn.JsonPath.stringAt("$.namespaceLanguage"),
+            },
             { name: "SCAN_TYPE", value: sfn.JsonPath.stringAt("$.scanType") },
             // Re-scan marker (string "true"/"false", always present in the
             // execution input via the trigger). Routes the terminal source
@@ -1692,7 +1714,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.seconds(30),
@@ -1753,6 +1775,119 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
+    // ── Graph-verify Queue + Lambda (RDF_SPARQL reachability) ────────
+    //
+    // A graph source has no schema to scan. Create and re-scan enqueue here
+    // instead of on the db-scan queue, and this Lambda runs the reachability
+    // probe chosen by the source's configuration.store (Neptune:
+    // neptunedata GetEngineStatus over SigV4), then flips the source to
+    // APPROVED/queryable or SCAN_FAILED. One queue and one Lambda serve every
+    // SPARQL engine — a new engine is a new probe in the handler.
+    //
+    // Built only with `-c graph_sources=on`: off, the stack is main's.
+    let graphVerify:
+      | { fn: lambda.Function; queue: sqs.Queue; dlq: sqs.Queue }
+      | undefined;
+    if (graphSourcesEnabled(this.node)) {
+      const sparqlSourceEgressSecurityGroup =
+        props.network.sparqlSourceEgressSecurityGroup;
+      if (!sparqlSourceEgressSecurityGroup) {
+        throw new Error(
+          "graph_sources is on but the NetworkStack has no SPARQL source egress security group",
+        );
+      }
+      const graphVerifyDlq = new sqs.Queue(this, "GraphVerifyDLQ", {
+        queueName: this.prefixed("sources-graph-verify-dlq"),
+        retentionPeriod: cdk.Duration.days(14),
+        encryption: sqs.QueueEncryption.SQS_MANAGED,
+        enforceSSL: true,
+      });
+      // Verify records its last attempt rather than raising, so a source is never left REGISTERED by the DLQ.
+      const graphVerifyMaxReceives = 3;
+      const graphVerifyQueue = new sqs.Queue(this, "GraphVerifyQueue", {
+        queueName: this.prefixed("sources-graph-verify-queue"),
+        // Above the Lambda timeout, so a message stays invisible until the verify
+        // has either recorded its result or failed.
+        visibilityTimeout: cdk.Duration.seconds(90),
+        encryption: sqs.QueueEncryption.SQS_MANAGED,
+        enforceSSL: true,
+        deadLetterQueue: {
+          maxReceiveCount: graphVerifyMaxReceives,
+          queue: graphVerifyDlq,
+        },
+      });
+      const graphVerifyFn = new lambda.Function(this, "GraphVerifyFn", {
+        functionName: this.prefixed("sources-graph-verify"),
+        runtime: lambda.Runtime.PYTHON_3_12,
+        architecture: lambda.Architecture.ARM_64,
+        handler: "coa_sources.database.graph_verify.handler.handler",
+        code: bundlePython({
+          srcDirs: [fromRoot("packages/sources/src"), Paths.commonLib],
+          requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
+          architecture: "arm64",
+        }),
+        // The probe itself is capped at GRAPH_VERIFY_TIMEOUT_S (8s default).
+        timeout: cdk.Duration.seconds(30),
+        memorySize: 256,
+        vpc,
+        vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+        securityGroups: [lambdaSecurityGroup, sparqlSourceEgressSecurityGroup],
+        environment: {
+          SOURCES_TABLE: this.sourcesTable.tableName,
+          SOURCE_SCAN_JOBS_TABLE: this.sourceScanJobsTable.tableName,
+          // The platform catalog cluster: it holds every namespace's ontology, so
+          // verify refuses its endpoints (and approves nothing without it).
+          // The storage stack's fixed `dbClusterIdentifier`: a name, not an import, so
+          // turning the switch off never has to drop an export this stack uses.
+          PLATFORM_NEPTUNE_CLUSTER_ID: this.prefixed("neptune"),
+          GRAPH_VERIFY_MAX_RECEIVES: String(graphVerifyMaxReceives),
+          [GRAPH_SOURCES_ENV]: "true",
+        },
+      });
+      // Reads the source record; writes its status/queryable/errorMessage.
+      this.sourcesTable.grantReadWriteData(graphVerifyFn);
+      // Closes the Scan History row the API opened.
+      this.sourceScanJobsTable.grantReadWriteData(graphVerifyFn);
+      // GetEngineStatus is the whole probe: no data read, write or delete. The
+      // cluster is customer-chosen and its resource id is known only at run time,
+      // so the grant is every cluster in THIS account and region: the verify
+      // refuses a source that signs for another region before it sends anything.
+      // Cross-account Neptune is out of scope.
+      graphVerifyFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: "GraphVerifyNeptuneEngineStatus",
+          actions: ["neptune-db:GetEngineStatus"],
+          resources: [
+            `arn:${cdk.Aws.PARTITION}:neptune-db:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:*/*`,
+          ],
+        }),
+      );
+      // Before it probes, the verify lists this account's Neptune clusters in its
+      // region and probes only one of their endpoints. Custom endpoints are listed
+      // only by DescribeDBClusterEndpoints.
+      graphVerifyFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: "GraphVerifyListAccountNeptuneClusters",
+          actions: ["rds:DescribeDBClusterEndpoints", "rds:DescribeDBClusters"],
+          resources: [
+            `arn:${cdk.Aws.PARTITION}:rds:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:cluster:*`,
+            `arn:${cdk.Aws.PARTITION}:rds:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:cluster-endpoint:*`,
+          ],
+        }),
+      );
+      graphVerifyFn.addEventSource(
+        new lambdaEventSources.SqsEventSource(graphVerifyQueue, {
+          batchSize: 1,
+          maxConcurrency: 5,
+        }),
+      );
+      graphVerify = {
+        fn: graphVerifyFn,
+        queue: graphVerifyQueue,
+        dlq: graphVerifyDlq,
+      };
+    }
+
     // ── Bulk Review Queue + Worker Lambda ────────────────────────────
     //
     // Async pipeline for ApproveSource / RejectSource. The API Lambda
@@ -1799,7 +1934,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.minutes(5),
@@ -1902,7 +2037,7 @@ export class SourcesStack extends SCLStack {
             Paths.commonLib,
             Paths.smithyGeneratedControlPlanePythonServer,
           ],
-          requirementsFile: fromRoot("packages/sources/requirements.txt"),
+          requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
           architecture: "arm64",
         }),
         // The whole point: 15 minutes instead of the API's 30 seconds.
@@ -2110,6 +2245,7 @@ export class SourcesStack extends SCLStack {
         memoryLimitMiB: 16384,
       },
     );
+    grantGuardDutyAgentPull(kgBuildTaskDef);
 
     const kgBuildImageUri = this.node.tryGetContext(
       "sources_kg_build_image_uri",
@@ -2246,6 +2382,7 @@ export class SourcesStack extends SCLStack {
         actions: ["bedrock:ApplyGuardrail"],
         resources: [
           `arn:aws:bedrock:${this.region}:${this.account}:guardrail/*`,
+          ...guardrailProfileResources(this),
         ],
       }),
     );
@@ -2260,8 +2397,11 @@ export class SourcesStack extends SCLStack {
         },
       }),
     );
-    // Bedrock batch job actions scoped to the same model ARN patterns as InvokeModel above.
-    // Prevents launching batch jobs against arbitrary models or stopping jobs from other workloads.
+    // Bedrock batch job actions. CreateModelInvocationJob authorizes against BOTH the
+    // model it runs (foundation-model / inference-profile — same patterns as InvokeModel
+    // above) AND the model-invocation-job resource it creates; Get/List/Stop act on the
+    // job resource. All three ARN patterns are required — omitting model-invocation-job
+    // fails every batch submit with AccessDenied on CreateModelInvocationJob.
     kgBuildTaskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: [
@@ -2273,6 +2413,7 @@ export class SourcesStack extends SCLStack {
         resources: [
           `arn:aws:bedrock:*::foundation-model/*`,
           `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
+          `arn:aws:bedrock:*:${this.account}:model-invocation-job/*`,
         ],
       }),
     );
@@ -2291,7 +2432,7 @@ export class SourcesStack extends SCLStack {
       this,
       "SourcesOSSDataAccessPolicy",
       {
-        name: this.prefixed("src-ingestion-access"),
+        name: this.aossName("src-ingestion-access"),
         type: "data",
         policy: JSON.stringify([
           {
@@ -2318,10 +2459,9 @@ export class SourcesStack extends SCLStack {
                 ],
               },
             ],
-            Principal: [
-              kgBuildTaskDef.taskRole.roleArn,
-              `arn:aws:iam::${this.account}:root`,
-            ],
+            // Named roles only: an account-root principal would admit every
+            // in-account role with aoss:APIAccessAll.
+            Principal: [kgBuildTaskDef.taskRole.roleArn],
           },
         ]),
       },
@@ -2445,6 +2585,12 @@ export class SourcesStack extends SCLStack {
             {
               name: "NAMESPACE_ID",
               value: sfn.JsonPath.stringAt("$.namespace_id"),
+            },
+            // Namespace-language snapshot resolved by the Sources API when the
+            // ingestion was triggered (always present via the trigger Lambda).
+            {
+              name: "NAMESPACE_LANGUAGE",
+              value: sfn.JsonPath.stringAt("$.namespace_language"),
             },
             { name: "TENANT_ID", value: sfn.JsonPath.stringAt("$.tenant_id") },
             {
@@ -2683,7 +2829,7 @@ export class SourcesStack extends SCLStack {
         code: bundlePython({
           srcDirs: [Paths.sourcesDocumentsDeletion, Paths.commonLib],
           requirementsFile: fromRoot(
-            "packages/sources/documents/deletion/requirements.txt",
+            "packages/sources/documents/deletion/requirements.lock.txt",
           ),
           architecture: "arm64",
         }),
@@ -2842,7 +2988,7 @@ export class SourcesStack extends SCLStack {
         code: bundlePython({
           srcDirs: [Paths.sourcesDocumentsTrigger, Paths.commonLib],
           requirementsFile: fromRoot(
-            "packages/sources/documents/trigger/requirements.txt",
+            "packages/sources/documents/trigger/requirements.lock.txt",
           ),
           architecture: "arm64",
         }),
@@ -2859,6 +3005,10 @@ export class SourcesStack extends SCLStack {
             this.region,
             this.account,
           ),
+          // Read only to resolve the namespace language for a message that
+          // predates the API-side snapshot (queued before deploy or redriven
+          // from the DLQ). Current messages carry it and need no read.
+          NAMESPACES_TABLE: namespacesTableName,
         },
         timeout: cdk.Duration.seconds(30),
         memorySize: 128,
@@ -2868,6 +3018,15 @@ export class SourcesStack extends SCLStack {
       },
     );
     docIngestionStateMachine.grantStartExecution(docTriggerFn);
+    // Minimal read of the namespace metadata item for pre-snapshot messages;
+    // deliberately GetItem only, not grantReadData (Query/Scan/Batch).
+    docTriggerFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "ReadNamespaceLanguage",
+        actions: ["dynamodb:GetItem"],
+        resources: [namespacesTable.tableArn],
+      }),
+    );
     docTriggerFn.addEventSource(
       new lambdaEventSources.SqsEventSource(docIngestionQueue, {
         batchSize: 1,
@@ -2890,7 +3049,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.seconds(30),
@@ -2903,6 +3062,10 @@ export class SourcesStack extends SCLStack {
         SOURCE_SCAN_JOBS_TABLE: this.sourceScanJobsTable.tableName,
         NAMESPACES_TABLE: namespacesTableName,
         SCAN_QUEUE_URL: dbScanQueue.queueUrl,
+        ...(graphVerify && {
+          GRAPH_VERIFY_QUEUE_URL: graphVerify.queue.queueUrl,
+          [GRAPH_SOURCES_ENV]: "true",
+        }),
         INGESTION_QUEUE_URL: docIngestionQueue.queueUrl,
         REVIEW_QUEUE_URL: bulkReviewQueue.queueUrl,
         // Database-source deletes hand their unbounded DataZone teardown here.
@@ -2946,6 +3109,8 @@ export class SourcesStack extends SCLStack {
     });
 
     this.sourcesTable.grantReadWriteData(sourcesApiFn);
+    // CreateSource is retry-safe with a caller-supplied clientToken.
+    grantIdempotencyTable(this, sourcesApiFn);
     // Registration verifies that a caller-named bucket carries the
     // `{prefix}:namespace` tag authorizing this namespace, so the customer is told
     // at create time instead of discovering it as a failed scan. Tag metadata
@@ -2978,6 +3143,7 @@ export class SourcesStack extends SCLStack {
     this.sourceScanJobsTable.grantReadWriteData(sourcesApiFn);
     namespacesTable.grantReadWriteData(sourcesApiFn);
     dbScanQueue.grantSendMessages(sourcesApiFn);
+    graphVerify?.queue.grantSendMessages(sourcesApiFn);
     docIngestionQueue.grantSendMessages(sourcesApiFn);
     bulkReviewQueue.grantSendMessages(sourcesApiFn);
     sourceDeleteQueue.grantSendMessages(sourcesApiFn);
@@ -3337,6 +3503,57 @@ export class SourcesStack extends SCLStack {
         action: props.alarmAction,
       });
     }
+    if (graphVerify) {
+      // A cluster claim whose release failed locks the cluster for every other namespace and nothing reaps it,
+      // so verify's and the delete path's release failures are counted from their logs, as one metric.
+      for (const [id, fn] of [
+        ["GraphVerify", graphVerify.fn],
+        ["SourcesApi", sourcesApiFn],
+        ["SourceDeleteWorker", sourceDeleteWorkerFn],
+      ] as const) {
+        new logs.MetricFilter(this, `${id}ClaimReleaseFailedFilter`, {
+          logGroup: fn.logGroup,
+          filterPattern: logs.FilterPattern.stringValue(
+            "$.event",
+            "=",
+            "graph_cluster_claim_release_failed",
+          ),
+          metricNamespace: sourcesNamespace,
+          metricName: "GraphClusterClaimReleaseFailed",
+          metricValue: "1",
+        });
+      }
+      const claimReleaseFailures = new cloudwatch.Metric({
+        namespace: sourcesNamespace,
+        metricName: "GraphClusterClaimReleaseFailed",
+        statistic: "Sum",
+        period: cdk.Duration.minutes(5),
+      });
+      const claimReleaseAlarm = new cloudwatch.Alarm(
+        this,
+        "GraphClusterClaimReleaseFailedAlarm",
+        {
+          alarmName: this.prefixed("graph-cluster-claim-release-failed"),
+          alarmDescription:
+            "A Neptune cluster claim could not be released after a failed verify or a source delete, so the " +
+            "cluster stays registered to that namespace. Search the graph-verify, sources-api and " +
+            "sources-delete-worker logs for " +
+            "graph_cluster_claim_release_failed and delete the GRAPHCLUSTER# claim row if no source uses it.",
+          metric: claimReleaseFailures,
+          threshold: 1,
+          comparisonOperator:
+            cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+          evaluationPeriods: 1,
+          treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        },
+      );
+      if (props.alarmAction) {
+        props.alarmAction.addAlarmActions({
+          alarm: claimReleaseAlarm,
+          action: props.alarmAction,
+        });
+      }
+    }
     // Explicit TransactWriteItems grant (grantReadWriteData covers it but be explicit for audit)
     sourcesApiFn.addToRolePolicy(
       new iam.PolicyStatement({
@@ -3501,7 +3718,20 @@ export class SourcesStack extends SCLStack {
       visibilityTimeout: cdk.Duration.seconds(180),
       deadLetterQueue: { queue: glueEventDlq, maxReceiveCount: 5 },
     });
-    // Allow EventBridge rules in THIS account to deliver to the queue.
+    // The API Lambda names every per-source rule `<prefix>-<sourceId>` and puts
+    // it on the default event bus (no EventBusName), whose rule ARNs are
+    // `rule/<name>`. One ARN pattern serves both the queue policy and the API
+    // Lambda's rule-management grant below, so the two cannot drift: a rule the
+    // Lambda may create is exactly a rule the queue accepts.
+    const glueEventRulePrefix = this.prefixed("glue-rescan");
+    const glueEventRuleArnPattern = this.formatArn({
+      service: "events",
+      resource: "rule",
+      resourceName: `${glueEventRulePrefix}-*`,
+      arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
+    });
+    // Allow only this deployment's Glue re-scan rules to deliver to the queue.
+    // The account check alone admitted any rule anyone in the account created.
     glueEventQueue.addToResourcePolicy(
       new iam.PolicyStatement({
         sid: "AllowEventBridgeSend",
@@ -3509,7 +3739,10 @@ export class SourcesStack extends SCLStack {
         principals: [new iam.ServicePrincipal("events.amazonaws.com")],
         actions: ["sqs:SendMessage"],
         resources: [glueEventQueue.queueArn],
-        conditions: { StringEquals: { "aws:SourceAccount": this.account } },
+        conditions: {
+          StringEquals: { "aws:SourceAccount": this.account },
+          ArnLike: { "aws:SourceArn": glueEventRuleArnPattern },
+        },
       }),
     );
 
@@ -3524,7 +3757,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.seconds(30),
@@ -3539,10 +3772,23 @@ export class SourcesStack extends SCLStack {
         // The re-scan entry point returns an API-shaped response, and
         // api_response raises without this. No HTTP caller here.
         ALLOWED_ORIGIN: allowedOrigin,
+        // The shared re-scan path snapshots the namespace language from the
+        // namespace item before it takes the lock, as manual and scheduled
+        // re-scans do. Without it every EVENT re-scan fails.
+        NAMESPACES_TABLE: namespacesTableName,
       },
     });
     this.sourcesTable.grantReadWriteData(glueEventRescanFn);
     this.sourceScanJobsTable.grantReadWriteData(glueEventRescanFn);
+    // Reads only the namespace metadata item for the language snapshot;
+    // deliberately GetItem only, not grantReadData (Query/Scan/Batch).
+    glueEventRescanFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "ReadNamespaceLanguage",
+        actions: ["dynamodb:GetItem"],
+        resources: [namespacesTable.tableArn],
+      }),
+    );
     dbScanQueue.grantSendMessages(glueEventRescanFn);
     glueEventRescanFn.addEventSource(
       new lambdaEventSources.SqsEventSource(glueEventQueue, {
@@ -3560,7 +3806,6 @@ export class SourcesStack extends SCLStack {
     // The API Lambda manages per-source Glue-event rules (scoped to the rule
     // name prefix). SQS delivery is authorized by the queue policy above, so no
     // target role / PassRole is needed.
-    const glueEventRulePrefix = this.prefixed("glue-rescan");
     sourcesApiFn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: "ManageGlueEventRules",
@@ -3571,14 +3816,7 @@ export class SourcesStack extends SCLStack {
           "events:RemoveTargets",
           "events:DescribeRule",
         ],
-        resources: [
-          this.formatArn({
-            service: "events",
-            resource: "rule",
-            resourceName: `${glueEventRulePrefix}-*`,
-            arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
-          }),
-        ],
+        resources: [glueEventRuleArnPattern],
       }),
     );
     sourcesApiFn.addEnvironment(
@@ -3609,8 +3847,16 @@ export class SourcesStack extends SCLStack {
       .monitorStateMachine(dbScanStateMachine)
       .monitorStateMachine(docIngestionStateMachine)
       .monitorStateMachine(docDeletionStateMachine)
-      .monitorLambda(glueEventRescanFn)
-      .monitorQueueWithDlq(dbScanQueue, dbScanDlq)
+      .monitorLambda(glueEventRescanFn);
+    // Graph verify is monitored in its usual place in the order, when it exists.
+    if (graphVerify) monitoring.monitorLambda(graphVerify.fn);
+    monitoring.monitorQueueWithDlq(dbScanQueue, dbScanDlq);
+    // A DLQ'd verify is a graph source stuck REGISTERED (delete and re-scan
+    // both refuse an active status) — page on it.
+    if (graphVerify) {
+      monitoring.monitorQueueWithDlq(graphVerify.queue, graphVerify.dlq);
+    }
+    monitoring
       .monitorQueueWithDlq(bulkReviewQueue, bulkReviewDlq)
       .monitorQueueWithDlq(docIngestionQueue, docIngestionDlq)
       .monitorQueueWithDlq(glueEventQueue, glueEventDlq)

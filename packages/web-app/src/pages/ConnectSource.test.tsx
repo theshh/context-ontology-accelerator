@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import React from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { LocaleProvider } from "../i18n/LocaleProvider";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { RuntimeConfigContext } from "@components/RuntimeContext";
+import type { RuntimeContext } from "@components/RuntimeContext";
 import { ConnectSource } from "./ConnectSource";
 // The shim defined by the vi.mock factory below, so `instanceof` inside the page
 // sees the same class a real service error would present.
@@ -89,6 +92,7 @@ vi.mock("@api-hooks", () => ({
 // component; provide a minimal shim that satisfies both call sites.
 vi.mock("@coa/control-plane-client", () => ({
   SourceType: { DATABASE: "DATABASE", DOCUMENTS: "DOCUMENTS" },
+  SparqlStore: { NEPTUNE: "neptune" },
   ControlPlaneServiceServiceException: class extends Error {
     constructor(msg = "ControlPlaneServiceServiceException") {
       super(msg);
@@ -117,25 +121,30 @@ vi.mock("@utils/helpers", () => ({
 // Wrapper
 // ---------------------------------------------------------------------------
 
+// LocaleProvider sits at the app root in production and supplies the wizard's
+// and file upload's built-in strings ("Next", "Choose file", …) that the page
+// no longer hand-writes.
 const wrapper = ({ children }: { children: React.ReactNode }) => (
-  <QueryClientProvider client={new QueryClient()}>
-    <MemoryRouter initialEntries={[`/namespaces/${NS_ID}/sources/connect`]}>
-      <Routes>
-        <Route
-          path="/namespaces/:namespaceId/sources/connect"
-          element={children}
-        />
-        <Route
-          path="/namespaces/:namespaceId/sources/:sourceId"
-          element={<div>SOURCE_DETAIL</div>}
-        />
-        <Route
-          path="/namespaces/:namespaceId/sources"
-          element={<div>SOURCE_LIST</div>}
-        />
-      </Routes>
-    </MemoryRouter>
-  </QueryClientProvider>
+  <LocaleProvider>
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter initialEntries={[`/namespaces/${NS_ID}/sources/connect`]}>
+        <Routes>
+          <Route
+            path="/namespaces/:namespaceId/sources/connect"
+            element={children}
+          />
+          <Route
+            path="/namespaces/:namespaceId/sources/:sourceId"
+            element={<div>SOURCE_DETAIL</div>}
+          />
+          <Route
+            path="/namespaces/:namespaceId/sources"
+            element={<div>SOURCE_LIST</div>}
+          />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>
+  </LocaleProvider>
 );
 
 // ---------------------------------------------------------------------------
@@ -1449,6 +1458,177 @@ describe("ConnectSource — document upload failures", () => {
   }, 15000);
 });
 
+describe("ConnectSource — document chunk size", () => {
+  beforeEach(() => {
+    mockCreate.mockReset();
+    mockCreateAsync.mockReset();
+  });
+
+  /** Fill the upload step and open the collapsed "Advanced options" section. */
+  async function openAdvancedOptions() {
+    await fillDocumentUploadStep();
+    await user.click(screen.getByText("Advanced options"));
+  }
+
+  async function submitDocuments() {
+    await clickNext(); // → review (documents skip the enrichment step)
+    await user.click(screen.getByRole("button", { name: /^connect source$/i }));
+  }
+
+  function submittedExtractionConfig(): Record<string, unknown> {
+    expect(mockCreateAsync).toHaveBeenCalledTimes(1);
+    return mockCreateAsync.mock.calls[0][0].body.documentSource
+      .extractionConfig;
+  }
+
+  it("sends no chunk fields when the default is left alone", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillDocumentUploadStep();
+    await submitDocuments();
+
+    const cfg = submittedExtractionConfig();
+    expect(cfg).not.toHaveProperty("chunkSize");
+    expect(cfg).not.toHaveProperty("chunkOverlap");
+  });
+
+  it("sends 1024 and no overlap for the large preset", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await openAdvancedOptions();
+    await user.click(screen.getByText("Default (256 tokens)"));
+    await user.click(
+      screen.getByText("Large, for tabular or CJK text (1024 tokens)"),
+    );
+    await submitDocuments();
+
+    const cfg = submittedExtractionConfig();
+    expect(cfg.chunkSize).toBe(1024);
+    expect(cfg).not.toHaveProperty("chunkOverlap");
+  });
+
+  it("sends the custom size and overlap as numbers", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await openAdvancedOptions();
+    await user.click(screen.getByText("Default (256 tokens)"));
+    await user.click(screen.getByText("Custom"));
+    await user.type(screen.getByPlaceholderText("1024"), "2048");
+    await user.type(screen.getByPlaceholderText("25"), "100");
+    await submitDocuments();
+
+    const cfg = submittedExtractionConfig();
+    expect(cfg.chunkSize).toBe(2048);
+    expect(cfg.chunkOverlap).toBe(100);
+  });
+
+  it("leaves the overlap out when the custom overlap is empty", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await openAdvancedOptions();
+    await user.click(screen.getByText("Default (256 tokens)"));
+    await user.click(screen.getByText("Custom"));
+    await user.type(screen.getByPlaceholderText("1024"), "512");
+    await submitDocuments();
+
+    const cfg = submittedExtractionConfig();
+    expect(cfg.chunkSize).toBe(512);
+    expect(cfg).not.toHaveProperty("chunkOverlap");
+  });
+
+  it.each([
+    ["an empty size", "", "", "Enter a whole number from 1 to 4096."],
+    [
+      "a size above the range",
+      "5000",
+      "",
+      "Enter a whole number from 1 to 4096.",
+    ],
+    ["a decimal size", "10.5", "", "Enter a whole number from 1 to 4096."],
+    // 0 means "use the toolkit default" in the model, so accepting it here
+    // would silently give 256-token chunks to a user who chose Custom.
+    ["a zero size", "0", "", "Enter a whole number from 1 to 4096."],
+    ["an exponent size", "1e3", "", "Enter a whole number from 1 to 4096."],
+    ["a negative size", "-1", "", "Enter a whole number from 1 to 4096."],
+    [
+      "a zero overlap",
+      "1024",
+      "0",
+      "Enter a whole number from 1 to 512, or leave it empty.",
+    ],
+    [
+      "a non-numeric overlap",
+      "1024",
+      "abc",
+      "Enter a whole number from 1 to 512, or leave it empty.",
+    ],
+    [
+      "a size not above the default overlap",
+      "20",
+      "",
+      "Must be larger than the overlap (25 tokens).",
+    ],
+    [
+      "a size not above its own overlap",
+      "100",
+      "100",
+      "Must be larger than the overlap (100 tokens).",
+    ],
+    [
+      "an overlap above the range",
+      "1024",
+      "600",
+      "Enter a whole number from 1 to 512, or leave it empty.",
+    ],
+  ])("blocks submit for %s", async (_case, size, overlap, message) => {
+    render(<ConnectSource />, { wrapper });
+
+    await openAdvancedOptions();
+    await user.click(screen.getByText("Default (256 tokens)"));
+    await user.click(screen.getByText("Custom"));
+    if (size) await user.type(screen.getByPlaceholderText("1024"), size);
+    if (overlap) await user.type(screen.getByPlaceholderText("25"), overlap);
+    await clickNext();
+
+    expect(await screen.findByText(message)).toBeInTheDocument();
+    expect(mockCreateAsync).not.toHaveBeenCalled();
+    expect(mockUploadUrls).not.toHaveBeenCalled();
+  });
+
+  // Leaving Custom must drop what was typed there: an invalid leftover must not
+  // block submit, and a valid one must not be sent under another option.
+  it.each([
+    [
+      "Large",
+      "Large, for tabular or CJK text (1024 tokens)",
+      { chunkSize: 1024 },
+    ],
+    ["Default", "Default (256 tokens)", {}],
+  ])(
+    "drops the custom values after switching back to %s",
+    async (_case, optionLabel, expected) => {
+      render(<ConnectSource />, { wrapper });
+
+      await openAdvancedOptions();
+      await user.click(screen.getByText("Default (256 tokens)"));
+      await user.click(screen.getByText("Custom"));
+      await user.type(screen.getByPlaceholderText("1024"), "5000");
+      await user.type(screen.getByPlaceholderText("25"), "100");
+      await user.click(screen.getByText("Custom"));
+      await user.click(screen.getByText(optionLabel));
+      await submitDocuments();
+
+      const cfg = submittedExtractionConfig();
+      expect(cfg).not.toHaveProperty("chunkOverlap");
+      if ("chunkSize" in expected) {
+        expect(cfg.chunkSize).toBe(expected.chunkSize);
+      } else {
+        expect(cfg).not.toHaveProperty("chunkSize");
+      }
+    },
+  );
+});
+
 describe("ConnectSource — reserved role-name prefix in help text", () => {
   it("names the deployment's derived prefix on the Glue form", async () => {
     render(<ConnectSource />, { wrapper });
@@ -1535,5 +1715,272 @@ describe("ConnectSource — External ID unavailable state", () => {
 
     expect(screen.getByText("Loading…")).toBeInTheDocument();
     expect(screen.queryByText(/Unavailable/)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RDF_SPARQL (graph) source — reachability verify, no enrichment step
+// ---------------------------------------------------------------------------
+
+const SPARQL_ENDPOINT_PLACEHOLDER =
+  "my-graph.cluster-xxxx.us-east-1.neptune.amazonaws.com";
+
+async function fillSparqlStep(
+  endpoint = "db.cluster-abc.us-east-1.neptune.amazonaws.com",
+) {
+  await user.click(screen.getByLabelText("Graph database (SPARQL)"));
+  await clickNext();
+  await user.type(
+    screen.getByPlaceholderText("support-graph"),
+    "support-graph",
+  );
+  await user.type(
+    screen.getByPlaceholderText(SPARQL_ENDPOINT_PLACEHOLDER),
+    endpoint,
+  );
+}
+
+async function submitFromReview() {
+  await clickNext(); // → review (no enrichment step for a graph source)
+  await user.click(screen.getByRole("button", { name: /^connect source$/i }));
+}
+
+const BASE_RUNTIME_CONFIG: RuntimeContext = {
+  region: "us-east-1",
+  authority: "https://issuer.example.com",
+  clientId: "client-abc",
+  oidcConfig: {
+    authority: "https://issuer.example.com",
+    clientId: "client-abc",
+  },
+};
+
+function wrapperWithRuntimeConfig(ctx: RuntimeContext) {
+  return ({ children }: { children: React.ReactNode }) => (
+    <RuntimeConfigContext.Provider value={ctx}>
+      {wrapper({ children })}
+    </RuntimeConfigContext.Provider>
+  );
+}
+
+const graphOnWrapper = wrapperWithRuntimeConfig({
+  ...BASE_RUNTIME_CONFIG,
+  graphSourcesEnabled: true,
+});
+
+describe("ConnectSource — graph sources switch", () => {
+  it("hides the graph tile when there is no runtime config", () => {
+    render(<ConnectSource />, { wrapper });
+    expect(screen.getByLabelText("Glue database")).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Graph database (SPARQL)"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/queried natively with SPARQL/)).toBeNull();
+  });
+
+  it("hides the graph tile when graphSourcesEnabled is false", () => {
+    render(<ConnectSource />, {
+      wrapper: wrapperWithRuntimeConfig({
+        ...BASE_RUNTIME_CONFIG,
+        graphSourcesEnabled: false,
+      }),
+    });
+    expect(
+      screen.queryByLabelText("Graph database (SPARQL)"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the graph tile when graphSourcesEnabled is true", () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    expect(
+      screen.getByLabelText("Graph database (SPARQL)"),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("ConnectSource — RDF_SPARQL graph source", () => {
+  beforeEach(() => {
+    mockCreate.mockReset();
+    mockCreateAsync.mockReset();
+  });
+
+  it("offers the graph source as a step-1 source kind", () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    expect(
+      screen.getByText(/queried natively with SPARQL/),
+    ).toBeInTheDocument();
+  });
+
+  it("goes straight to review — a graph source is not enriched", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep();
+    await clickNext();
+    expect(
+      screen.queryByText(/Enable AI metadata enrichment/i),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /^connect source$/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/coa_import:dataSourceName/)).toBeInTheDocument();
+  }, 15000);
+
+  it("submits only sparqlConfiguration, with the LLD field names", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep();
+    await submitFromReview();
+
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    const body = mockCreate.mock.calls[0][0].body;
+    expect(body.sourceType).toBe("DATABASE");
+    const { databaseSource } = body;
+    expect(databaseSource.name).toBe("support-graph");
+    expect(databaseSource.sparqlConfiguration).toEqual({
+      store: "neptune",
+      dataEndpoint: "db.cluster-abc.us-east-1.neptune.amazonaws.com",
+      port: 8182,
+      region: undefined,
+      dataNamedGraph: undefined,
+    });
+    expect(databaseSource.glueConfiguration).toBeUndefined();
+    expect(databaseSource.jdbcConfiguration).toBeUndefined();
+    expect(databaseSource.customConnectorConfiguration).toBeUndefined();
+    expect(databaseSource.databricksSqlWarehouseConfiguration).toBeUndefined();
+    expect(databaseSource.metadataEnrichmentEnabled).toBeUndefined();
+  }, 15000);
+
+  it("sends the optional region and named graph when given", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep();
+    await user.type(screen.getByPlaceholderText("us-east-1"), "eu-west-1");
+    await user.type(
+      screen.getByPlaceholderText("https://example.com/graphs/support"),
+      "https://coa.example.com/graphs/support",
+    );
+    await submitFromReview();
+    const cfg =
+      mockCreate.mock.calls[0][0].body.databaseSource.sparqlConfiguration;
+    expect(cfg.region).toBe("eu-west-1");
+    expect(cfg.dataNamedGraph).toBe("https://coa.example.com/graphs/support");
+  }, 15000);
+
+  it("omits the port when it is cleared, so the server default applies", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep();
+    await user.clear(screen.getByPlaceholderText("8182"));
+    await submitFromReview();
+    expect(
+      mockCreate.mock.calls[0][0].body.databaseSource.sparqlConfiguration.port,
+    ).toBeUndefined();
+  }, 15000);
+
+  it("warns that only port 8182 is reachable", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await user.click(screen.getByLabelText("Graph database (SPARQL)"));
+    await clickNext();
+    expect(screen.getByText(/allow only port 8182/)).toBeInTheDocument();
+  }, 15000);
+
+  it("shows authentication as read-only SigV4 / IAM", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await user.click(screen.getByLabelText("Graph database (SPARQL)"));
+    await clickNext();
+    expect(screen.getByDisplayValue("SigV4 / IAM")).toHaveAttribute("readonly");
+  }, 15000);
+
+  it("blocks Next without an endpoint", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await user.click(screen.getByLabelText("Graph database (SPARQL)"));
+    await clickNext();
+    await user.type(
+      screen.getByPlaceholderText("support-graph"),
+      "support-graph",
+    );
+    await clickNext();
+    expect(
+      screen.getByText("SPARQL endpoint is required."),
+    ).toBeInTheDocument();
+    expect(mockCreate).not.toHaveBeenCalled();
+  }, 15000);
+
+  it("rejects an endpoint that is not a host or https URL", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep("http://db.example.com");
+    await clickNext();
+    expect(screen.getByText(/Must be a host/)).toBeInTheDocument();
+  }, 15000);
+
+  it("rejects a named graph that could break out of an IRI", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep();
+    await user.type(
+      screen.getByPlaceholderText("https://example.com/graphs/support"),
+      "https://x/a>b",
+    );
+    await clickNext();
+    expect(
+      screen.getByText(/Must be an absolute http\(s\) IRI/),
+    ).toBeInTheDocument();
+  }, 15000);
+
+  it("rejects an out-of-range port", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep();
+    const port = screen.getByPlaceholderText("8182");
+    await user.clear(port);
+    await user.type(port, "70000");
+    await clickNext();
+    expect(screen.getByText(/between 1 and 65535/)).toBeInTheDocument();
+  }, 15000);
+});
+
+describe("ConnectSource — Japanese document configuration", () => {
+  beforeEach(() => {
+    window.localStorage.setItem("scl.locale", "ja");
+  });
+
+  afterEach(() => {
+    window.localStorage.clear();
+    document.documentElement.lang = "";
+  });
+
+  it("localizes the entity classes and topics section", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByText("データソースの種類を選択").length,
+      ).toBeGreaterThan(0);
+    });
+    await user.click(screen.getByLabelText("文書"));
+    await user.click(screen.getByRole("button", { name: "次へ" }));
+
+    expect(
+      await screen.findByText("エンティティクラスとトピック（任意）"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("エンティティクラス")).toBeInTheDocument();
+    expect(screen.getByText("トピック")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Entity classes and topics (optional)"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("localizes the chunk size control", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByText("データソースの種類を選択").length,
+      ).toBeGreaterThan(0);
+    });
+    await user.click(screen.getByLabelText("文書"));
+    await user.click(screen.getByRole("button", { name: "次へ" }));
+    await user.click(await screen.findByText("詳細オプション"));
+
+    expect(screen.getByText("チャンクサイズ")).toBeInTheDocument();
+    await user.click(screen.getByText("既定（256 トークン）"));
+    expect(
+      screen.getByText("大（表や CJK のテキスト向け、1024 トークン）"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Default (256 tokens)")).not.toBeInTheDocument();
   });
 });

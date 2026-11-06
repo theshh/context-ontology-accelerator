@@ -11,6 +11,7 @@
  */
 import React, { useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Container from "@cloudscape-design/components/container";
@@ -37,12 +38,19 @@ import {
   SourceType,
   VkgHealthStatus,
 } from "@coa/control-plane-client";
+import { localizeNamespaceLanguage } from "@utils";
+import {
+  localizeNamespaceStatus,
+  localizeVkgHealth,
+} from "@utils/namespace-status";
+import { useAppI18n } from "../i18n/LocaleProvider";
+import type { AppMessage } from "../i18n/appMessages";
 
 /** Formats an ISO timestamp into a localized short date+time string, or "—" if absent. */
-function formatDate(iso: string | undefined): string {
+function formatDate(iso: string | undefined, locale: string): string {
   if (!iso) return "—";
   try {
-    return new Date(iso).toLocaleDateString(undefined, {
+    return new Date(iso).toLocaleDateString(locale, {
       year: "numeric",
       month: "short",
       day: "numeric",
@@ -59,7 +67,7 @@ function formatDate(iso: string | undefined): string {
  * the namespace detail page. Mirrors the VkgHealthStatus enum docs in
  * models/src/main/smithy/namespace.smithy.
  */
-const VKG_HEALTH_DESCRIPTIONS: Record<VkgHealthStatus, string> = {
+const VKG_HEALTH_DESCRIPTIONS: Record<VkgHealthStatus, AppMessage> = {
   [VkgHealthStatus.HEALTHY]:
     "The VKG translation service is running and able to translate queries.",
   [VkgHealthStatus.DEGRADED]:
@@ -73,9 +81,18 @@ const VKG_HEALTH_DESCRIPTIONS: Record<VkgHealthStatus, string> = {
 };
 
 export const GetNamespace: React.FC = () => {
+  const { locale, t } = useAppI18n();
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const { data, isLoading, error } = useGetNamespace(namespaceId ?? "");
   const [editVisible, setEditVisible] = useState(false);
+
+  const nsName =
+    data?.namespace?.displayName ?? data?.namespace?.name ?? namespaceId ?? "";
+  useBreadcrumbTrail([
+    { text: "Context graphs", href: "/namespaces" },
+    { text: nsName },
+    ...(editVisible ? [{ text: t("Edit") }] : []),
+  ]);
 
   if (isLoading) {
     return (
@@ -89,7 +106,9 @@ export const GetNamespace: React.FC = () => {
     return (
       <Box textAlign="center" padding="xxl">
         <StatusIndicator type="error">
-          Failed to load namespace: {error.message}
+          {t("Failed to load namespace: {message}", {
+            message: error.message,
+          })}
         </StatusIndicator>
       </Box>
     );
@@ -99,7 +118,9 @@ export const GetNamespace: React.FC = () => {
   if (!ns)
     return (
       <Box textAlign="center" padding="xxl">
-        <StatusIndicator type="warning">Namespace not found</StatusIndicator>
+        <StatusIndicator type="warning">
+          {t("Namespace not found")}
+        </StatusIndicator>
       </Box>
     );
 
@@ -118,11 +139,28 @@ export const GetNamespace: React.FC = () => {
         <KeyValuePairs
           columns={3}
           items={[
-            { label: "Namespace ID", value: ns.namespaceId },
-            { label: "Name", value: ns.name },
-            { label: "Owner", value: ns.owner },
+            { label: t("Namespace ID"), value: ns.namespaceId },
+            { label: t("Name"), value: ns.name },
+            { label: t("Owner"), value: ns.owner },
             {
-              label: "Status",
+              label: t("Language"),
+              info: (
+                <Popover
+                  dismissButton={false}
+                  position="top"
+                  triggerType="text"
+                  header={t("Namespace language")}
+                  content={t(
+                    "Set when the namespace was created and cannot be changed.",
+                  )}
+                >
+                  {t("Info")}
+                </Popover>
+              ),
+              value: localizeNamespaceLanguage(ns.language, t),
+            },
+            {
+              label: t("Status"),
               value: (
                 <StatusIndicator
                   type={
@@ -136,24 +174,24 @@ export const GetNamespace: React.FC = () => {
                           : "stopped"
                   }
                 >
-                  {ns.status}
+                  {localizeNamespaceStatus(ns.status, t)}
                 </StatusIndicator>
               ),
             },
             {
-              label: "VKG health",
+              label: t("VKG health"),
               value: (() => {
                 const vkgHealth = ns.vkgHealth ?? VkgHealthStatus.UNKNOWN;
                 // Prefer the server-provided reason (the live cause) when
                 // present; fall back to the static per-status description.
                 const vkgHealthContent =
-                  ns.vkgHealthReason ?? VKG_HEALTH_DESCRIPTIONS[vkgHealth];
+                  ns.vkgHealthReason ?? t(VKG_HEALTH_DESCRIPTIONS[vkgHealth]);
                 return (
                   <Popover
                     dismissButton={false}
                     position="top"
                     triggerType="text"
-                    header="VKG health"
+                    header={t("VKG health")}
                     content={vkgHealthContent}
                   >
                     <StatusIndicator
@@ -168,23 +206,23 @@ export const GetNamespace: React.FC = () => {
                               : "stopped"
                       }
                     >
-                      {vkgHealth}
+                      {localizeVkgHealth(vkgHealth, t)}
                     </StatusIndicator>
                   </Popover>
                 );
               })(),
             },
             {
-              label: "Sources",
+              label: t("Sources"),
               value: String(ns.sourceCount ?? 0),
             },
-            { label: "Created", value: formatDate(ns.createdAt) },
+            { label: t("Created"), value: formatDate(ns.createdAt, locale) },
             {
-              label: "Updated",
-              value: formatDate(ns.updatedAt),
+              label: t("Updated"),
+              value: formatDate(ns.updatedAt, locale),
             },
             {
-              label: "Description",
+              label: t("Description"),
               value: ns.description ?? "—",
             },
           ]}
@@ -210,6 +248,7 @@ const ConnectionsTable: React.FC<{ namespaceId: string }> = ({
   namespaceId,
 }) => {
   const navigate = useNavigate();
+  const { t } = useAppI18n();
   const { data, isLoading, error, refetch, isFetching } =
     useListSources(namespaceId);
 
@@ -239,11 +278,13 @@ const ConnectionsTable: React.FC<{ namespaceId: string }> = ({
       id: "type",
       header: "Source type",
       cell: (item) =>
-        item.sourceType === SourceType.DATABASE ? "Database" : "Documents",
+        item.sourceType === SourceType.DATABASE
+          ? t("Database")
+          : t("Documents"),
     },
     {
       id: "status",
-      header: "Status",
+      header: t("Status"),
       cell: (item) => (
         <StatusIndicator
           type={item.status === SourceStatus.APPROVED ? "success" : "info"}
@@ -254,7 +295,7 @@ const ConnectionsTable: React.FC<{ namespaceId: string }> = ({
     },
     {
       id: "tables",
-      header: "Tables",
+      header: t("Tables"),
       cell: (item) =>
         item.sourceType === SourceType.DATABASE
           ? (item.tablesDiscovered ?? 0)
@@ -268,7 +309,7 @@ const ConnectionsTable: React.FC<{ namespaceId: string }> = ({
       items={sources}
       trackBy="sourceId"
       loading={isLoading}
-      loadingText="Loading sources…"
+      loadingText={t("Loading sources…")}
       columnDefinitions={columns}
       header={
         <Header
@@ -300,7 +341,9 @@ const ConnectionsTable: React.FC<{ namespaceId: string }> = ({
       empty={
         error ? (
           <StatusIndicator type="error">
-            Failed to load sources: {error.message}
+            {t("Failed to load sources: {message}", {
+              message: error.message,
+            })}
           </StatusIndicator>
         ) : (
           <Box textAlign="center" color="text-body-secondary">
@@ -329,6 +372,7 @@ export const EditNamespaceModal: React.FC<EditNamespaceModalProps> = ({
   visible,
   onDismiss,
 }) => {
+  const { t } = useAppI18n();
   const [displayName, setDisplayName] = useState(initialDisplayName);
   const [description, setDescription] = useState(initialDescription);
   const updateNamespace = useUpdateNamespace();
@@ -349,7 +393,7 @@ export const EditNamespaceModal: React.FC<EditNamespaceModalProps> = ({
       { namespaceId, displayName, description },
       {
         onSuccess: () => onDismiss(),
-        onError: (e) => setError(e.message ?? "Failed to update namespace"),
+        onError: (e) => setError(e.message ?? t("Failed to update namespace")),
       },
     );
   };
@@ -358,19 +402,19 @@ export const EditNamespaceModal: React.FC<EditNamespaceModalProps> = ({
     <Modal
       visible={visible}
       onDismiss={onDismiss}
-      header="Edit namespace"
+      header={t("Edit namespace")}
       footer={
         <Box float="right">
           <SpaceBetween direction="horizontal" size="xs">
             <Button variant="link" onClick={onDismiss}>
-              Cancel
+              {t("Cancel")}
             </Button>
             <Button
               variant="primary"
               onClick={handleSubmit}
               loading={updateNamespace.isPending}
             >
-              Save
+              {t("Save")}
             </Button>
           </SpaceBetween>
         </Box>
@@ -378,13 +422,13 @@ export const EditNamespaceModal: React.FC<EditNamespaceModalProps> = ({
     >
       <SpaceBetween size="l">
         {error && <StatusIndicator type="error">{error}</StatusIndicator>}
-        <FormField label="Display name">
+        <FormField label={t("Display name")}>
           <Input
             value={displayName}
             onChange={({ detail }) => setDisplayName(detail.value)}
           />
         </FormField>
-        <FormField label="Description">
+        <FormField label={t("Description")}>
           <Textarea
             value={description}
             onChange={({ detail }) => setDescription(detail.value)}

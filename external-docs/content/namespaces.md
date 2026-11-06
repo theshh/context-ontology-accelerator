@@ -16,15 +16,97 @@ Namespaces are the top-level organizational unit in Context Ontology Accelerator
    - **Display name** — human-friendly label
    - **Description** — purpose of this namespace
    - **Owner** — email of the initial owner (will receive `namespace-owner` role automatically)
-4. Click **Create**
+   - **Language** — **English (en)** (default) or **Japanese (ja)**. Text COA
+     generates (descriptions, synonyms, and labels for document sources) uses
+     this language; source text and table and column names are kept as-is.
+     The language cannot be changed later (see
+     [Namespace Language](#namespace-language))
+4. Click **Create namespace**, check the language in the
+   **Confirm namespace language** dialog, then click **Confirm and create**
 
 ### Via API
 
-`POST /namespaces` with `name`, `displayName`, `description`, and `owner` —
+`POST /namespaces` with `name`, `displayName`, `description`, `owner` and an
+optional `language` —
 see **CreateNamespace** in the [API Reference](#/api-reference) for the full
 request/response schema. Returns `201 Created` with the new namespace
-(`namespaceId`, `status: ACTIVE`, `dataZoneProjectId`, `athenaWorkgroupName`,
-etc.).
+(`namespaceId`, `status: ACTIVE`, `language`, `dataZoneProjectId`,
+`athenaWorkgroupName`, etc.).
+
+### Namespace Language
+
+`language` is the language your sources are written in. COA uses it for the
+text it generates for that namespace, such as descriptions and synonyms. It is
+fixed when the namespace is created.
+
+- **Format:** `language[-script][-region]` — language is 2–8 letters, script is
+  4 letters, region is 2 letters or 3 digits. Examples: `en`, `ja`, `pt-BR`,
+  `es-419`, `zh-Hant`. Variants, extensions and private-use subtags are
+  rejected with `400`. This is a subset of the BCP 47 tag format; see
+  [BCP 47 language tag](https://developer.mozilla.org/en-US/docs/Glossary/BCP_47_language_tag)
+  for how tags are built and the
+  [list of common primary language subtags](https://en.wikipedia.org/wiki/IETF_language_tag#List_of_common_primary_language_subtags)
+  to find the code for your language.
+- **Canonical form:** surrounding spaces are trimmed and case is normalized, so
+  ` JA-jp ` is stored and returned as `ja-JP`.
+- **Default:** omitting `language` creates an English (`en`) namespace.
+- **Immutable:** `UpdateNamespace` has no `language` member. To use another
+  language, create a new namespace and onboard the sources there.
+- **In responses:** every namespace response includes the effective
+  `language`. Namespaces created before this field existed report `en`.
+- **For API clients:** the change is additive. Requests are unchanged
+  (`language` on **CreateNamespace** is optional and defaults to `en`), so an
+  existing caller keeps working. `language` is a required member of
+  `NamespaceSummary` (**ListNamespaces**) and `NamespaceDetail` (**CreateNamespace**,
+  **GetNamespace**, **UpdateNamespace**, **UpdateNamespaceStatus**), so it is
+  always present and never needs a null check. To read it from a typed client,
+  regenerate the client from the Smithy models (`make generate`, see
+  [Smithy Code Generation](smithy-codegen.md)); the console already uses it.
+- **Languages in the console:** the console offers English (`en`) and
+  Japanese (`ja`), the two languages tested end to end, and shows each
+  namespace's language on the namespace list and detail pages. The API
+  accepts any tag in the format above. In a namespace of another language,
+  COA gives the model the same instruction to write in the namespace
+  language, so the text listed under
+  [What the language changes](#what-the-language-changes) as generated in
+  the namespace language should come out in it; only English and Japanese
+  are tested end to end. Two things differ from English and Japanese:
+  - The fixed text COA adds itself, such as foreign-key notes, fallback class
+    descriptions and default proposal titles, stays English, so a proposal
+    can mix English boilerplate with generated text in your language.
+  - Only Korean (`ko`) and Chinese (exactly `zh`) generated text carries an
+    RDF language tag (see
+    [Namespace language](ontologies.md#namespace-language) in the ontology
+    guide). Other languages produce untagged literals. COA still shows them,
+    because the language never filters a label out, but a SPARQL query or RDF
+    tool that filters with `lang()` or `langMatches()` will not find them,
+    and if a resource also has another untagged label, COA picks between the
+    two in lexical order instead of preferring the generated one.
+
+#### What the language changes
+
+- **Generated in the namespace language:** descriptions, synonyms, glossary
+  terms and tags from database enrichment (see
+  [Language of Generated Metadata](sources.md#language-of-generated-metadata));
+  propositions, topics, entity classes, entities and relationships extracted
+  from documents (see
+  [Language of Extracted Content](sources.md#language-of-extracted-content));
+  and class descriptions, foreign-key notes and default proposal titles from
+  ontology induction (the fixed parts of foreign-key notes and proposal titles
+  exist in English and Japanese only, see above).
+- **Kept as they are:** table and column names, catalog comments, document
+  text, metadata a steward wrote, and identifiers such as model numbers,
+  product names, units and codes. COA does not translate them.
+- **Always English:** console text, API error messages, and platform
+  vocabulary in the ontology such as `matchConfidence`.
+- **Queries:** nothing is translated at query time. When a class or property
+  has a label in the namespace language next to an untagged one, query context
+  and the graph views use the namespace-language label; no resource is hidden
+  because of its language. A Tier 3 answer is written in the language of the
+  question. In a conversation, that is the language of the current question,
+  not of earlier turns: an English follow-up to a Japanese question is
+  answered in English. A follow-up with no language of its own, such as a
+  bare part number, keeps the language of the user's earlier questions.
 
 ### What Happens on Create
 
@@ -35,6 +117,28 @@ When you create a namespace, the platform:
 3. Provisions an Athena workgroup for query isolation
 4. Copies built-in role templates into the namespace
 5. Grants the `namespace-owner` role to the specified owner
+
+## Retrying Creates Safely
+
+Create calls accept an optional `clientToken` in the request body: 1–64
+printable ASCII characters with no spaces (a UUID works well). Retrying the
+same request with the same token within 24 hours returns the original response,
+marked with the `X-Idempotent-Replay: true` header, instead of creating a
+duplicate.
+
+- Reusing a token with different parameters, or while the first call is still
+  running, returns `409`.
+- A call that failed (any non-2xx response) is not recorded, so a retry with the
+  same token runs it again.
+- If retry protection is temporarily unavailable, the call returns `503` and
+  nothing is created; retry later with the same token.
+- Tokens are scoped to the caller, the operation, and the namespace, and expire
+  after 24 hours.
+
+Operations that accept `clientToken`: CreateNamespace, CreateGrant,
+CreatePlatformGrant, CreateMetric, ImportOsi, CreateSource, RescanSource,
+StartInduction, IngestOntologyFromS3, LoadFoundationalOntology,
+InferConstraints, and ValidateProposal.
 
 ## Namespace Lifecycle
 
@@ -139,11 +243,14 @@ backoff) before giving up:
 5. **Finalize** — deletes the namespace record and releases its name
    reservation
 
-Steps 1–4 are best-effort and retried — the underlying cleanup calls are
-already designed to be safe to retry (idempotent against a resource that's
-already gone). **Finalize is the only step that must succeed outright**: if
-it fails, the namespace stays visible (rather than silently vanishing while
-"mostly" deleted) so it remains retryable.
+Every step is retried, and the underlying cleanup calls are safe to retry (a
+resource that's already gone counts as deleted). In steps 3 and 4, a resource
+that can't be removed fails the step rather than being left behind: for example,
+a VKG service that can't be deleted ends the deletion in `DELETE_FAILED` instead
+of leaving the service running with no namespace to retry it from. The one
+exception is the ontology's stored artifacts, which step 3 deletes best-effort.
+Finalize runs last, so the namespace record, and with it the ability to retry,
+stays until every earlier step has succeeded.
 
 If **any** step exhausts its retries, the namespace lands in `DELETE_FAILED`.
 Simply retry the `DELETE` call — the pipeline resumes from the beginning, and

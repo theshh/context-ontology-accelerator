@@ -35,6 +35,7 @@ import {
   type R2rmlMapping,
 } from "./grounding";
 import { SHOW_TECHNICAL_VIEWS } from "@constants/ux";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 
 /** Replace a quoted literal value in a Turtle body. */
 function replaceQuoted(body: string, pred: string, newValue: string): string {
@@ -68,6 +69,7 @@ function PropertyEditor({
   onBack: () => void;
   isReadOnly: boolean;
 }) {
+  const { t } = useAppI18n();
   const [label, setLabel] = useState(
     extractQuoted(entity.body, "rdfs:label") ?? entity.subject,
   );
@@ -82,7 +84,7 @@ function PropertyEditor({
   return (
     <SpaceBetween size="m">
       <Button variant="link" iconName="arrow-left" onClick={onBack}>
-        Back to class
+        {t("Back to class")}
       </Button>
 
       {SHOW_TECHNICAL_VIEWS && !isReadOnly && (
@@ -91,7 +93,7 @@ function PropertyEditor({
             checked={editRaw}
             onChange={({ detail }) => setEditRaw(detail.checked)}
           >
-            Edit raw
+            {t("Edit raw")}
           </Toggle>
         </Box>
       )}
@@ -116,13 +118,13 @@ function PropertyEditor({
                 setDirty(false);
               }}
             >
-              Apply
+              {t("Apply")}
             </Button>
           )}
         </SpaceBetween>
       ) : (
         <SpaceBetween size="s">
-          <FormField label="Label">
+          <FormField label={t("Label")}>
             {isReadOnly ? (
               <Box>{label}</Box>
             ) : (
@@ -135,14 +137,14 @@ function PropertyEditor({
               />
             )}
           </FormField>
-          <FormField label="Domain (class)">
+          <FormField label={t("Domain (class)")}>
             <Box>{domain ?? "—"}</Box>
           </FormField>
-          <FormField label="Range">
+          <FormField label={t("Range")}>
             <Box>{range ?? "—"}</Box>
           </FormField>
           {comment && (
-            <FormField label="Description">
+            <FormField label={t("Description")}>
               <Box>{comment}</Box>
             </FormField>
           )}
@@ -155,7 +157,7 @@ function PropertyEditor({
                 setDirty(false);
               }}
             >
-              Apply
+              {t("Apply")}
             </Button>
           )}
         </SpaceBetween>
@@ -232,6 +234,7 @@ export function ClassDetailPanel({
   onMarkGroundingNovel,
   onUpdateTurtle,
 }: Props) {
+  const { t } = useAppI18n();
   const g = group;
   // Absolute IRI for this class — the SuggestionPanel matches ``coa:``
   // annotation triples on the expanded subject, but ``fullSubject`` is the
@@ -293,7 +296,7 @@ export function ClassDetailPanel({
             checked={editRaw}
             onChange={({ detail }) => setEditRaw(detail.checked)}
           >
-            Edit raw Turtle
+            {t("Edit raw Turtle")}
           </Toggle>
         </Box>
       )}
@@ -318,14 +321,14 @@ export function ClassDetailPanel({
                 setDirty(false);
               }}
             >
-              Apply
+              {t("Apply")}
             </Button>
           )}
         </SpaceBetween>
       ) : (
         <SpaceBetween size="m">
           <SpaceBetween size="s">
-            <FormField label="Label">
+            <FormField label={t("Label")}>
               {isReadOnly ? (
                 <Box>{label}</Box>
               ) : (
@@ -338,7 +341,7 @@ export function ClassDetailPanel({
                 />
               )}
             </FormField>
-            <FormField label="Description">
+            <FormField label={t("Description")}>
               {isReadOnly ? (
                 <Box>{description || "—"}</Box>
               ) : (
@@ -357,26 +360,27 @@ export function ClassDetailPanel({
                 foundational target's local name. */}
             {g.matchType === "exact" || g.matchType === "close" ? (
               <Box>
-                <Box variant="awsui-key-label">Grounded to</Box>
+                <Box variant="awsui-key-label">{t("Grounded to")}</Box>
                 <Badge color="blue">{g.groundedTo}</Badge>
                 {g.matchType && (
                   <>
                     <Box variant="small" display="inline">
-                      {" "}
-                      ({g.matchType} match){" "}
+                      {t(" ({type} match) ", { type: g.matchType })}
                     </Box>
                     <InfoPopover
-                      header="Exact vs close match"
-                      ariaLabel="About exact vs close match"
+                      header={t("Exact vs close match")}
+                      ariaLabel={t("About exact vs close match")}
                     >
                       <SpaceBetween size="xs">
                         <Box variant="p">
-                          <strong>Exact</strong>: the same concept as the
-                          foundational class (skos:exactMatch).
+                          {t(
+                            "Exact: the same concept as the foundational class (skos:exactMatch).",
+                          )}
                         </Box>
                         <Box variant="p">
-                          <strong>Close</strong>: closely related but not
-                          identical (skos:closeMatch).
+                          {t(
+                            "Close: closely related but not identical (skos:closeMatch).",
+                          )}
                         </Box>
                       </SpaceBetween>
                     </InfoPopover>
@@ -385,17 +389,20 @@ export function ClassDetailPanel({
               </Box>
             ) : g.matchType === "related" ? (
               <Box>
-                <Box variant="awsui-key-label">Origin</Box>
-                <Badge>Ambiguous match to {g.groundedTo}</Badge>
+                <Box variant="awsui-key-label">{t("Origin")}</Box>
+                <Badge>
+                  {t("Ambiguous match to {name}", {
+                    name: g.groundedTo ?? "",
+                  })}
+                </Badge>
                 <Box variant="small" display="inline">
-                  {" "}
-                  (low confidence, review Grounding tab)
+                  {t(" (low confidence, review Grounding tab)")}
                 </Box>
               </Box>
             ) : (
               <Box>
-                <Box variant="awsui-key-label">Origin</Box>
-                <Badge color="green">Novel</Badge>
+                <Box variant="awsui-key-label">{t("Origin")}</Box>
+                <Badge color="green">{t("Novel")}</Badge>
               </Box>
             )}
 
@@ -403,7 +410,9 @@ export function ClassDetailPanel({
                 not surface these; they explain WHY a subclass edge exists. */}
             {g.pkColumns.length > 0 && (
               <Box>
-                <Box variant="awsui-key-label">Primary key (owl:hasKey)</Box>
+                <Box variant="awsui-key-label">
+                  {t("Primary key (owl:hasKey)")}
+                </Box>
                 <SpaceBetween direction="horizontal" size="xs">
                   {g.pkColumns.map((col) => (
                     <Badge key={col} color="grey">
@@ -415,11 +424,10 @@ export function ClassDetailPanel({
             )}
             {g.subClassProvenance === "PK_SHARING" && (
               <Box>
-                <Box variant="awsui-key-label">Inheritance</Box>
-                <Badge color="blue">PK-sharing</Badge>
+                <Box variant="awsui-key-label">{t("Inheritance")}</Box>
+                <Badge color="blue">{t("PK-sharing")}</Badge>
                 <Box variant="small" display="inline">
-                  {" "}
-                  subclass detected from shared primary key
+                  {t(" subclass detected from shared primary key")}
                 </Box>
               </Box>
             )}
@@ -440,11 +448,10 @@ export function ClassDetailPanel({
             ) : (
               g.hasSuggestedParent && (
                 <Box>
-                  <Box variant="awsui-key-label">Suggested parent</Box>
-                  <Badge color="blue">Suggested subclass</Badge>
+                  <Box variant="awsui-key-label">{t("Suggested parent")}</Box>
+                  <Badge color="blue">{t("Suggested subclass")}</Badge>
                   <Box variant="small" display="inline">
-                    {" "}
-                    unconfirmed — review before accepting
+                    {t(" unconfirmed — review before accepting")}
                   </Box>
                 </Box>
               )
@@ -453,7 +460,7 @@ export function ClassDetailPanel({
 
           {!isReadOnly && dirty && (
             <Button variant="primary" onClick={handleStructuredSave}>
-              Apply
+              {t("Apply")}
             </Button>
           )}
 
@@ -462,7 +469,9 @@ export function ClassDetailPanel({
             tabs={[
               {
                 id: "relationships",
-                label: `Relationships (${g.relationships.length})`,
+                label: t("Relationships ({count})", {
+                  count: g.relationships.length,
+                }),
                 content: (
                   <SortableTable
                     items={g.relationships}
@@ -472,7 +481,7 @@ export function ClassDetailPanel({
                     columnDefinitions={[
                       {
                         id: "name",
-                        header: "Property",
+                        header: t("Property"),
                         isRowHeader: true,
                         sortingComparator: (a, b) =>
                           (
@@ -493,7 +502,7 @@ export function ClassDetailPanel({
                       },
                       {
                         id: "range",
-                        header: "Target class",
+                        header: t("Target class"),
                         sortingComparator: (a, b) =>
                           (
                             extractUri(a.body, "rdfs:range") ?? "—"
@@ -504,14 +513,18 @@ export function ClassDetailPanel({
                       },
                     ]}
                     empty={
-                      <Box color="text-body-secondary">No relationships.</Box>
+                      <Box color="text-body-secondary">
+                        {t("No relationships.")}
+                      </Box>
                     }
                   />
                 ),
               },
               {
                 id: "attributes",
-                label: `Attributes (${g.attributes.length})`,
+                label: t("Attributes ({count})", {
+                  count: g.attributes.length,
+                }),
                 content: (
                   <SortableTable
                     items={g.attributes}
@@ -521,7 +534,7 @@ export function ClassDetailPanel({
                     columnDefinitions={[
                       {
                         id: "name",
-                        header: "Property",
+                        header: t("Property"),
                         isRowHeader: true,
                         sortingComparator: (a, b) =>
                           (
@@ -542,7 +555,7 @@ export function ClassDetailPanel({
                       },
                       {
                         id: "range",
-                        header: "Datatype",
+                        header: t("Datatype"),
                         sortingComparator: (a, b) =>
                           (
                             extractUri(a.body, "rdfs:range") ?? "—"
@@ -553,7 +566,9 @@ export function ClassDetailPanel({
                       },
                     ]}
                     empty={
-                      <Box color="text-body-secondary">No attributes.</Box>
+                      <Box color="text-body-secondary">
+                        {t("No attributes.")}
+                      </Box>
                     }
                   />
                 ),
@@ -566,7 +581,9 @@ export function ClassDetailPanel({
                 // incl. "(0)" for consistency with the sibling tabs. Distinct
                 // from the "Matches" tab below, which counts SIBLING proposal
                 // classes (intra-proposal skos dedup).
-                label: `Grounding (${groundingCandidateCount})`,
+                label: t("Grounding ({count})", {
+                  count: groundingCandidateCount,
+                }),
                 content: (
                   <SpaceBetween size="l">
                     {/* Foundational grounding editor (Item 1) — folded out of
@@ -587,7 +604,9 @@ export function ClassDetailPanel({
                       />
                     ) : (
                       <Box color="text-body-secondary">
-                        No foundational grounding evaluated for this class.
+                        {t(
+                          "No foundational grounding evaluated for this class.",
+                        )}
                       </Box>
                     )}
                   </SpaceBetween>
@@ -599,7 +618,9 @@ export function ClassDetailPanel({
                 // duplicate classes the unstructured/RIGOR normalizer collapsed
                 // against each other. Populated for unstructured proposals; 0 for
                 // the structured path (which emits no intra-proposal matches).
-                label: `Matches (${g.matches?.length ?? 0})`,
+                label: t("Matches ({count})", {
+                  count: g.matches?.length ?? 0,
+                }),
                 content: (
                   <SortableTable
                     items={g.matches ?? []}
@@ -609,7 +630,7 @@ export function ClassDetailPanel({
                     columnDefinitions={[
                       {
                         id: "type",
-                        header: "Match",
+                        header: t("Match"),
                         isRowHeader: true,
                         sortingComparator: (a, b) =>
                           a.matchType.localeCompare(b.matchType),
@@ -617,7 +638,7 @@ export function ClassDetailPanel({
                       },
                       {
                         id: "class",
-                        header: "Class",
+                        header: t("Class"),
                         sortingComparator: (a, b) =>
                           a.label.localeCompare(b.label),
                         cell: (m) => m.label,
@@ -625,7 +646,7 @@ export function ClassDetailPanel({
                     ]}
                     empty={
                       <Box color="text-body-secondary">
-                        No sibling matches to other proposal classes.
+                        {t("No sibling matches to other proposal classes.")}
                       </Box>
                     }
                   />
@@ -639,7 +660,9 @@ export function ClassDetailPanel({
       {/* R2RML — human-readable table with raw toggle */}
       {parsedR2rml && (
         <ExpandableSection
-          headerText={`Mapping: ${parsedR2rml.sourceTable}`}
+          headerText={t("Mapping: {table}", {
+            table: parsedR2rml.sourceTable,
+          })}
           defaultExpanded
         >
           <SpaceBetween size="s">
@@ -651,25 +674,27 @@ export function ClassDetailPanel({
               columnDefinitions={[
                 {
                   id: "column",
-                  header: "Source column",
+                  header: t("Source column"),
                   isRowHeader: true,
                   sortingComparator: (a, b) => a.column.localeCompare(b.column),
                   cell: (m) => m.column,
                 },
                 {
                   id: "property",
-                  header: "Property",
+                  header: t("Property"),
                   sortingComparator: (a, b) =>
                     a.property.localeCompare(b.property),
                   cell: (m) => m.property,
                 },
                 {
                   id: "type",
-                  header: "Type",
+                  header: t("Type"),
                   sortingComparator: (a, b) => a.type.localeCompare(b.type),
                   cell: (m) =>
                     m.type === "relationship" ? (
-                      <Badge color="green">FK → {m.target}</Badge>
+                      <Badge color="green">
+                        {t("FK → {target}", { target: m.target })}
+                      </Badge>
                     ) : (
                       <Box variant="small">{m.target}</Box>
                     ),
@@ -677,12 +702,12 @@ export function ClassDetailPanel({
               ]}
               empty={
                 <Box color="text-body-secondary">
-                  No column mappings parsed.
+                  {t("No column mappings parsed.")}
                 </Box>
               }
             />
             {SHOW_TECHNICAL_VIEWS && r2rml && (
-              <ExpandableSection headerText="View raw R2RML">
+              <ExpandableSection headerText={t("View raw R2RML")}>
                 <TurtleHighlight>{r2rml}</TurtleHighlight>
               </ExpandableSection>
             )}
@@ -692,7 +717,7 @@ export function ClassDetailPanel({
 
       {/* Collapsed raw class source */}
       {SHOW_TECHNICAL_VIEWS && !editRaw && (
-        <ExpandableSection headerText="Source (Turtle)">
+        <ExpandableSection headerText={t("Source (Turtle)")}>
           <TurtleHighlight>{g.classEntity.body}</TurtleHighlight>
         </ExpandableSection>
       )}

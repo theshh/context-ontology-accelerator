@@ -1,8 +1,10 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import { useQueryClient } from "@tanstack/react-query";
 import Alert from "@cloudscape-design/components/alert";
 import Badge from "@cloudscape-design/components/badge";
@@ -56,14 +58,19 @@ import type {
 } from "@coa/control-plane-client";
 import { useControlPlaneClient } from "@components/ControlPlaneClientProvider";
 import { ButtonWithHint } from "@components/ButtonWithHint";
+import { RuntimeConfigContext } from "@components/RuntimeContext";
 import { sourceStatusType, sourceStatusLabel } from "@utils/source-status";
 import { formatTimestamp } from "@utils/helpers";
 import { tableDetailPath } from "@utils/routes";
+import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
+import type { AppMessage } from "../i18n/appMessages";
 
 const TABLES_PAGE_SIZE = 25;
 const METADATA_FRESHNESS_THRESHOLD_DAYS = 30;
 // Matches the enricher's publish throttle; polling faster only re-reads the same row.
 const SCAN_PROGRESS_POLL_MS = 5000;
+// sources_handler._GRAPH_VERIFY_STALE_AFTER.
+const GRAPH_VERIFY_STALE_AFTER_MS = 15 * 60 * 1000;
 
 // ── Status helpers ────────────────────────────────────────────────────────────
 
@@ -79,12 +86,40 @@ const ACTIVE_STATUSES = new Set([
 // Human labels for the DATABASE sub-types. A lookup rather than a ternary so a
 // sub-type without an entry shows its own name instead of being mislabelled as
 // one of the others.
-const DATABASE_SUBTYPE_LABELS: Record<string, string> = {
+const DATABASE_SUBTYPE_LABELS: Record<string, AppMessage> = {
   GLUE_DATABASE: "Glue database",
   JDBC_DATABASE: "JDBC database",
   CUSTOM_CONNECTOR: "Custom connector",
   DATABRICKS_SQL_WAREHOUSE: "Databricks SQL Warehouse",
+  RDF_SPARQL: "Graph database (SPARQL)",
 };
+
+const SOURCE_STATUS_MESSAGES: Record<string, AppMessage> = {
+  APPROVED: "Approved",
+  COMPLETED: "Completed",
+  PENDING_REVIEW: "Pending review",
+  RESCAN_REVIEW: "Re-scan review",
+  REGISTERED: "Registered",
+  SCANNING: "Scanning",
+  ENRICHING: "Enriching",
+  APPROVING: "Approving…",
+  REJECTING: "Rejecting…",
+  APPROVAL_FAILED: "Approval failed",
+  REJECTION_FAILED: "Rejection failed",
+  SCAN_FAILED: "Scan failed",
+  DELETE_FAILED: "Delete failed",
+  DELETING: "Deleting",
+  DELETED: "Deleted",
+  REJECTED: "Rejected",
+};
+
+function localizedSourceStatus(
+  status: string | undefined,
+  t: AppTranslate,
+): string {
+  const message = status ? SOURCE_STATUS_MESSAGES[status] : undefined;
+  return message ? t(message) : sourceStatusLabel(status);
+}
 
 // ── Degraded-scan annotation ──────────────────────────────────────────────────
 //
@@ -173,9 +208,23 @@ const ValueWithLabel: React.FC<{
   </div>
 );
 
+// extractionConfig stores chunkSize and chunkOverlap only when the source set
+// them. An absent value, or 0, means the graphrag-toolkit default applies
+// (256-token chunks, 25-token overlap), so only a positive whole number is shown
+// as a set value. The KG build reads chunkOverlap only when chunkSize > 0, so
+// the caller shows the overlap as the default whenever the size is.
+function chunkTokens(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export const SourceDetail: React.FC = () => {
+  const { t } = useAppI18n();
+  const graphSourcesEnabled =
+    useContext(RuntimeConfigContext)?.graphSourcesEnabled === true;
   const { namespaceId, sourceId } = useParams<{
     namespaceId: string;
     sourceId: string;
@@ -193,6 +242,18 @@ export const SourceDetail: React.FC = () => {
     namespaceId ?? "",
     sourceId ?? "",
   );
+
+  const { name: nsName } = useNamespace(namespaceId);
+  const sourceName = data?.body?.name ?? sourceId ?? "";
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    {
+      text: t("Sources"),
+      href: `/namespaces/${namespaceId}/sources`,
+      namespaceId,
+    },
+    { text: sourceName },
+  ]);
 
   const {
     mutate: deleteSource,
@@ -212,7 +273,7 @@ export const SourceDetail: React.FC = () => {
         {
           id: String(Date.now()),
           type: "success",
-          content: "Re-scan triggered.",
+          content: t("Re-scan triggered."),
         },
       ]);
       refetch();
@@ -221,6 +282,11 @@ export const SourceDetail: React.FC = () => {
 
   const source = data?.body;
   const isDatabase = source?.sourceType === "DATABASE";
+  // A graph (RDF_SPARQL) source is a DATABASE source with no tables: it is
+  // verified for reachability instead of scanned, and its classes come from an
+  // imported ontology. Everything table-shaped below is gated on isTabular.
+  const isGraph = source?.sourceSubType === "RDF_SPARQL";
+  const isTabular = isDatabase && !isGraph;
 
   // Tables — only fetched for DATABASE sources via the new sources-api tables endpoint.
   // Pages render as they arrive; `tablesLoadingMore` means the list on screen is
@@ -231,10 +297,7 @@ export const SourceDetail: React.FC = () => {
     isLoadingMore: tablesLoadingMore,
     isError: tablesError,
     error: tablesErrorObj,
-  } = useListSourceTables(
-    namespaceId ?? "",
-    isDatabase ? (sourceId ?? "") : "",
-  );
+  } = useListSourceTables(namespaceId ?? "", isTabular ? (sourceId ?? "") : "");
   const approveMutation = useApproveSource(namespaceId ?? "", sourceId ?? "");
   const rejectMutation = useRejectSource(namespaceId ?? "", sourceId ?? "");
   const controlPlaneClient = useControlPlaneClient();
@@ -301,12 +364,12 @@ export const SourceDetail: React.FC = () => {
     filtering: {
       empty: (
         <Box textAlign="center" color="text-status-inactive" padding="l">
-          No tables found.
+          {t("No tables found.")}
         </Box>
       ),
       noMatch: (
         <Box textAlign="center" color="text-status-inactive" padding="l">
-          No tables match the filter.
+          {t("No tables match the filter.")}
         </Box>
       ),
     },
@@ -343,7 +406,7 @@ export const SourceDetail: React.FC = () => {
 
   if (error) {
     return (
-      <Alert type="error" header="Failed to load source">
+      <Alert type="error" header={t("Failed to load source")}>
         {error.message}
       </Alert>
     );
@@ -354,19 +417,39 @@ export const SourceDetail: React.FC = () => {
   const isDocuments = source.sourceType === "DOCUMENTS";
   const isActive = ACTIVE_STATUSES.has(source.status ?? "");
   const status = source.status ?? "";
+  // With graph sources off no verify will ever move a waiting graph source on, and
+  // the backend lets it be deleted (sources_handler._handle_delete).
+  const strandedGraphSource =
+    isGraph && !graphSourcesEnabled && status === SourceStatus.REGISTERED;
+  // With them on, the backend re-verifies a graph source left REGISTERED longer
+  // than any verify can take (sources_handler._waits_for_a_lost_verify).
+  const graphVerifyLost =
+    isGraph &&
+    graphSourcesEnabled &&
+    status === SourceStatus.REGISTERED &&
+    source.updatedAt !== undefined &&
+    Date.now() - new Date(source.updatedAt).getTime() >
+      GRAPH_VERIFY_STALE_AFTER_MS;
 
   // Re-scan entry points mirror the backend's allowed statuses (RescanSource):
   // DATABASE from SCAN_FAILED (recovery), APPROVED / RESCAN_REVIEW (schema-drift
   // re-scan of a live source); DOCUMENTS from COMPLETED (re-ingest) or
   // SCAN_FAILED (retry). Enabling APPROVED is what makes the drift re-scan
   // review flow reachable from the UI.
-  const canRescan = isDatabase
+  // A graph source re-runs its reachability check from APPROVED or SCAN_FAILED,
+  // or after its verify was lost; it never has a re-scan review open.
+  const canRescan = isGraph
     ? status === SourceStatus.SCAN_FAILED ||
       status === SourceStatus.APPROVED ||
-      status === SourceStatus.RESCAN_REVIEW
-    : isDocuments
-      ? status === SourceStatus.COMPLETED || status === SourceStatus.SCAN_FAILED
-      : status === SourceStatus.SCAN_FAILED;
+      graphVerifyLost
+    : isDatabase
+      ? status === SourceStatus.SCAN_FAILED ||
+        status === SourceStatus.APPROVED ||
+        status === SourceStatus.RESCAN_REVIEW
+      : isDocuments
+        ? status === SourceStatus.COMPLETED ||
+          status === SourceStatus.SCAN_FAILED
+        : status === SourceStatus.SCAN_FAILED;
 
   // Type-specific detail objects
   const dbDetails = source.databaseDetails;
@@ -394,8 +477,9 @@ export const SourceDetail: React.FC = () => {
             {
               id: String(Date.now()),
               type: "success",
-              content:
+              content: t(
                 "Bulk approve started. Status will update when complete.",
+              ),
             },
           ]),
         onError: (e) =>
@@ -415,7 +499,9 @@ export const SourceDetail: React.FC = () => {
             {
               id: String(Date.now()),
               type: "success",
-              content: "Bulk reject started. Status will update when complete.",
+              content: t(
+                "Bulk reject started. Status will update when complete.",
+              ),
             },
           ]),
         onError: (e) =>
@@ -429,8 +515,7 @@ export const SourceDetail: React.FC = () => {
   const handleBatchReviewTables = async (decision: ReviewDecision) => {
     if (selectedTables.length === 0) return;
     setIsBatchReviewing(true);
-    const label =
-      decision === ReviewDecision.APPROVED ? "approved" : "rejected";
+    const approved = decision === ReviewDecision.APPROVED;
     try {
       const results = await Promise.allSettled(
         selectedTables.map((t) =>
@@ -451,7 +536,12 @@ export const SourceDetail: React.FC = () => {
           {
             id: String(Date.now()),
             type: "success",
-            content: `${succeeded} table(s) ${label}.`,
+            content: t(
+              approved
+                ? "{count} table(s) approved."
+                : "{count} table(s) rejected.",
+              { count: succeeded },
+            ),
           },
         ]);
       } else {
@@ -459,7 +549,16 @@ export const SourceDetail: React.FC = () => {
           {
             id: String(Date.now()),
             type: "error",
-            content: `${succeeded} of ${selectedTables.length} table(s) ${label}. ${failed} failed.`,
+            content: t(
+              approved
+                ? "{succeeded} of {total} table(s) approved. {failed} failed."
+                : "{succeeded} of {total} table(s) rejected. {failed} failed.",
+              {
+                succeeded,
+                total: selectedTables.length,
+                failed,
+              },
+            ),
           },
         ]);
       }
@@ -488,7 +587,10 @@ export const SourceDetail: React.FC = () => {
             {
               id: String(Date.now()),
               type: "success",
-              content: `Keeping "${tableId}". Approving the re-scan will no longer delete it.`,
+              content: t(
+                'Keeping "{name}". Approving the re-scan will no longer delete it.',
+                { name: tableId },
+              ),
             },
           ]),
         onError: (e) =>
@@ -519,7 +621,7 @@ export const SourceDetail: React.FC = () => {
           <SpaceBetween direction="horizontal" size="xs">
             <Button
               iconName="refresh"
-              ariaLabel="Refresh"
+              ariaLabel={t("Refresh")}
               onClick={() => {
                 // RESCAN_REVIEW is terminal, so the source stops polling the
                 // moment the review opens, and the tables list and per-table diff
@@ -537,15 +639,19 @@ export const SourceDetail: React.FC = () => {
                 });
               }}
             >
-              Refresh
+              {t("Refresh")}
             </Button>
-            {isDatabase && (
+            {isTabular && (
               <>
                 <ButtonWithHint
                   hint={
                     status === SourceStatus.RESCAN_REVIEW
-                      ? "Discards this re-scan: restores changed tables to their last approved version, removes newly-added tables, and returns the source to Approved."
-                      : "Marks all pending tables and columns in this source as rejected. Already-approved or already-rejected items are not affected."
+                      ? t(
+                          "Discards this re-scan: restores changed tables to their last approved version, removes newly-added tables, and returns the source to Approved.",
+                        )
+                      : t(
+                          "Marks all pending tables and columns in this source as rejected. Already-approved or already-rejected items are not affected.",
+                        )
                   }
                   onClick={handleRejectAll}
                   loading={rejectMutation.isPending}
@@ -555,15 +661,21 @@ export const SourceDetail: React.FC = () => {
                     tables.length === 0
                   }
                 >
-                  Reject source
+                  {t("Reject source")}
                 </ButtonWithHint>
                 <ButtonWithHint
                   hint={
                     status === SourceStatus.RESCAN_REVIEW
-                      ? "Approves the re-scan's changes and deletes the tables and columns it found were removed from the source. Already-rejected items are not affected."
+                      ? t(
+                          "Approves the re-scan's changes and deletes the tables and columns it found were removed from the source. Already-rejected items are not affected.",
+                        )
                       : status === SourceStatus.APPROVAL_FAILED
-                        ? "Retries approving all pending tables and columns in this source. Already-rejected items are not affected."
-                        : "Approves all pending tables and columns in this source, making them queryable. Already-rejected items are not affected."
+                        ? t(
+                            "Retries approving all pending tables and columns in this source. Already-rejected items are not affected.",
+                          )
+                        : t(
+                            "Approves all pending tables and columns in this source, making them queryable. Already-rejected items are not affected.",
+                          )
                   }
                   variant="primary"
                   onClick={handleApproveAll}
@@ -575,36 +687,38 @@ export const SourceDetail: React.FC = () => {
                   }
                 >
                   {status === SourceStatus.APPROVAL_FAILED
-                    ? "Retry approve source"
-                    : "Approve source"}
+                    ? t("Retry approve source")
+                    : t("Approve source")}
                 </ButtonWithHint>
               </>
             )}
             <Button
               onClick={() => setShowDeleteModal(true)}
-              disabled={isActive}
+              disabled={isActive && !strandedGraphSource}
             >
-              Delete
+              {t("Delete")}
             </Button>
-            <Button
-              onClick={() => {
-                // An open re-scan review is the only state a re-scan destroys
-                // work in, so it is the only one that asks first.
-                if (status === SourceStatus.RESCAN_REVIEW) {
-                  setShowRescanConfirm(true);
-                  return;
-                }
-                rescan({});
-              }}
-              loading={isRescanning}
-              disabled={!canRescan}
-            >
-              Re-scan
-            </Button>
+            {(!isGraph || graphSourcesEnabled) && (
+              <Button
+                onClick={() => {
+                  // An open re-scan review is the only state a re-scan destroys
+                  // work in, so it is the only one that asks first.
+                  if (status === SourceStatus.RESCAN_REVIEW) {
+                    setShowRescanConfirm(true);
+                    return;
+                  }
+                  rescan({});
+                }}
+                loading={isRescanning}
+                disabled={!canRescan}
+              >
+                {isGraph ? t("Re-verify") : t("Re-scan")}
+              </Button>
+            )}
             <Button
               onClick={() => navigate(`/namespaces/${namespaceId}/sources`)}
             >
-              Back to sources
+              {t("Back to sources")}
             </Button>
           </SpaceBetween>
         }
@@ -613,43 +727,69 @@ export const SourceDetail: React.FC = () => {
       </Header>
 
       {rescanError && (
-        <Alert type="error" header="Failed to start re-scan">
+        <Alert type="error" header={t("Failed to start re-scan")}>
           {rescanError.message}
         </Alert>
       )}
 
       {status === SourceStatus.APPROVAL_FAILED && (
-        <Alert type="error" header="Bulk approval failed">
-          The background worker encountered an error. You can retry by clicking
-          &quot;Retry approve source&quot;.
+        <Alert type="error" header={t("Bulk approval failed")}>
+          {t(
+            'The background worker encountered an error. You can retry by clicking "Retry approve source".',
+          )}
         </Alert>
       )}
 
       {status === SourceStatus.REJECTION_FAILED && (
-        <Alert type="error" header="Bulk rejection failed">
-          The background worker encountered an error. You can retry by clicking
-          &quot;Reject source&quot;.
+        <Alert type="error" header={t("Bulk rejection failed")}>
+          {t(
+            'The background worker encountered an error. You can retry by clicking "Reject source".',
+          )}
         </Alert>
       )}
 
       {isTransient && (
-        <Alert type="info" header="Processing">
+        <Alert type="info" header={t("Processing")}>
           {status === SourceStatus.APPROVING
-            ? "Bulk approval is in progress. This page will update automatically."
-            : "Bulk rejection is in progress. This page will update automatically."}
+            ? t(
+                "Bulk approval is in progress. This page will update automatically.",
+              )
+            : t(
+                "Bulk rejection is in progress. This page will update automatically.",
+              )}
         </Alert>
       )}
 
       {docDetails?.errorMessage && (
-        <Alert type="error" header="Error">
+        <Alert type="error" header={t("Error")}>
           {docDetails.errorMessage}
+        </Alert>
+      )}
+
+      {isGraph && status === SourceStatus.APPROVED && graphSourcesEnabled && (
+        <Alert type="info" header={t("Endpoint verified")}>
+          {t(
+            'The graph endpoint is reachable. Questions are answered from it once an imported ontology names this source on its classes with coa_import:dataSourceName "{name}".',
+            { name: source.name ?? "" },
+          )}
+        </Alert>
+      )}
+
+      {isGraph && !graphSourcesEnabled && (
+        <Alert type="warning" header={t("Graph sources are off")}>
+          {t(
+            "Graph sources are turned off in this deployment, so questions are not answered from this source. You can still view or delete it.",
+          )}
         </Alert>
       )}
 
       {isDatabase &&
         status === SourceStatus.SCAN_FAILED &&
         scanJobData?.errorMessage && (
-          <Alert type="error" header="Scan failed">
+          <Alert
+            type="error"
+            header={isGraph ? t("Reachability check failed") : t("Scan failed")}
+          >
             {scanJobData.errorMessage}
           </Alert>
         )}
@@ -657,14 +797,22 @@ export const SourceDetail: React.FC = () => {
       {isDatabase && scanProgress && (
         <ProgressBar
           value={scanProgress.percent}
-          label="Enrichment progress"
-          description={`${scanProgress.processed} of ${scanProgress.total} tables processed`}
-          additionalInfo="Tables already reviewed count as processed without being regenerated."
+          label={t("Enrichment progress")}
+          description={t("{processed} of {total} tables processed", {
+            processed: scanProgress.processed,
+            total: scanProgress.total,
+          })}
+          additionalInfo={t(
+            "Tables already reviewed count as processed without being regenerated.",
+          )}
         />
       )}
 
       {isDatabase && filterWarnings.length > 0 && (
-        <Alert type="warning" header="A filter had no effect on the last scan">
+        <Alert
+          type="warning"
+          header={t("A filter had no effect on the last scan")}
+        >
           <SpaceBetween size="xs">
             {filterWarnings.map((warning) => (
               <Box variant="p" key={warning}>
@@ -678,24 +826,30 @@ export const SourceDetail: React.FC = () => {
       {isDatabase && degradedScan && (
         <Alert
           type="warning"
-          header="Scan completed, but metadata is incomplete"
+          header={t("Scan completed, but metadata is incomplete")}
         >
           <SpaceBetween size="xs">
             <Box variant="p">
-              The last scan succeeded but could not read{" "}
-              {degradedScan.tablesFailed === 1
-                ? "1 of the tables"
-                : `${degradedScan.tablesFailed} of the tables`}{" "}
-              it listed. Those tables have no columns, no comments and no
-              declared keys below, and any AI-generated descriptions were
-              produced over that gap — do not review this source as complete.
-              Re-scan once the tables are readable.
+              {t(
+                "The last scan succeeded but could not read {failedTables} it listed. Those tables have no columns, no comments and no declared keys below, and any AI-generated descriptions were produced over that gap — do not review this source as complete. Re-scan once the tables are readable.",
+                {
+                  failedTables:
+                    degradedScan.tablesFailed === 1
+                      ? t("1 of the tables")
+                      : t("{count} of the tables", {
+                          count: degradedScan.tablesFailed,
+                        }),
+                },
+              )}
             </Box>
             {degradedScan.failedTables.length > 0 && (
               <Box variant="p">
                 {degradedScan.failedTables.length < degradedScan.tablesFailed
-                  ? `Affected tables (${degradedScan.failedTables.length} of ${degradedScan.tablesFailed} shown): `
-                  : "Affected tables: "}
+                  ? t("Affected tables ({shown} of {total} shown):", {
+                      shown: degradedScan.failedTables.length,
+                      total: degradedScan.tablesFailed,
+                    })
+                  : t("Affected tables:")}{" "}
                 <Box variant="code">{degradedScan.failedTables.join(", ")}</Box>
               </Box>
             )}
@@ -704,336 +858,402 @@ export const SourceDetail: React.FC = () => {
       )}
 
       {isDatabase && isMetadataStale && (
-        <Alert type="warning" header="Metadata may be stale">
-          This source was last scanned more than 30 days ago. The underlying
-          schema may have changed since approval. Consider refreshing the source
-          to ensure ontology induction uses up-to-date metadata.
+        <Alert type="warning" header={t("Metadata may be stale")}>
+          {t(
+            "This source was last scanned more than 30 days ago. The underlying schema may have changed since approval. Consider refreshing the source to ensure ontology induction uses up-to-date metadata.",
+          )}
         </Alert>
       )}
 
       {isDatabase && status === SourceStatus.RESCAN_REVIEW && (
-        <Alert type="info" header="Re-scan ready for review">
-          This source was re-scanned. New and changed tables and columns are
-          marked <b>Pending review</b> — edit and approve them just like a first
-          scan. Items the re-scan no longer found in the source are marked{" "}
-          <b>Pending deletion</b>; approving the source deletes them. If a
-          removal looks wrong (for example a partial scan or a changed
-          include/exclude filter), use <b>Keep</b> to retain the table or
-          column.
+        <Alert type="info" header={t("Re-scan ready for review")}>
+          {t(
+            "This source was re-scanned. New and changed tables and columns are marked Pending review — edit and approve them just like a first scan. Items the re-scan no longer found in the source are marked Pending deletion; approving the source deletes them. If a removal looks wrong (for example a partial scan or a changed include/exclude filter), use Keep to retain the table or column.",
+          )}
         </Alert>
       )}
 
       {/* ── DATABASE layout — matches DataSourceDetail ── */}
       {isDatabase && (
         <>
-          <Container header={<Header variant="h2">Source summary</Header>}>
+          <Container
+            header={<Header variant="h2">{t("Source summary")}</Header>}
+          >
             <KeyValuePairs
               columns={4}
               items={[
                 {
-                  label: "Source type",
+                  label: t("Source type"),
                   value:
-                    DATABASE_SUBTYPE_LABELS[source.sourceSubType ?? ""] ??
-                    source.sourceSubType ??
-                    "—",
+                    (DATABASE_SUBTYPE_LABELS[source.sourceSubType ?? ""]
+                      ? t(DATABASE_SUBTYPE_LABELS[source.sourceSubType ?? ""])
+                      : source.sourceSubType) ?? "—",
                 },
                 {
-                  label: "Status",
+                  label: t("Status"),
                   value: (
                     <StatusIndicator type={sourceStatusType(status)}>
-                      {sourceStatusLabel(status)}
+                      {localizedSourceStatus(status, t)}
                     </StatusIndicator>
                   ),
                 },
+                ...(isGraph
+                  ? [
+                      {
+                        label: t("SPARQL endpoint"),
+                        value: String(
+                          dbDetails?.sparqlConfiguration?.dataEndpoint ?? "—",
+                        ),
+                      },
+                      {
+                        label: t("Named graph"),
+                        value: String(
+                          dbDetails?.sparqlConfiguration?.dataNamedGraph ??
+                            t("(default graph)"),
+                        ),
+                      },
+                    ]
+                  : [
+                      {
+                        label: t("Tables discovered"),
+                        value: String(dbDetails?.tablesDiscovered ?? 0),
+                      },
+                      {
+                        label: t("Tables approved"),
+                        value: `${dbDetails?.tablesApproved ?? 0} / ${dbDetails?.tablesDiscovered ?? 0}`,
+                      },
+                      {
+                        label: t("Metadata enrichment"),
+                        value:
+                          dbDetails?.metadataEnrichmentEnabled === false
+                            ? t("Disabled")
+                            : t("Enabled"),
+                      },
+                    ]),
                 {
-                  label: "Tables discovered",
-                  value: String(dbDetails?.tablesDiscovered ?? 0),
-                },
-                {
-                  label: "Tables approved",
-                  value: `${dbDetails?.tablesApproved ?? 0} / ${dbDetails?.tablesDiscovered ?? 0}`,
-                },
-                {
-                  label: "Metadata enrichment",
-                  value:
-                    dbDetails?.metadataEnrichmentEnabled === false
-                      ? "Disabled"
-                      : "Enabled",
-                },
-                {
-                  label: "Last scan",
+                  label: isGraph ? t("Last verified") : t("Last scan"),
                   value: dbDetails?.lastScanAt
                     ? formatTimestamp(dbDetails.lastScanAt)
                     : "—",
                 },
-                { label: "Created", value: formatTimestamp(source.createdAt) },
-                { label: "Source ID", value: source.sourceId },
+                {
+                  label: t("Created"),
+                  value: formatTimestamp(source.createdAt),
+                },
+                { label: t("Source ID"), value: source.sourceId },
               ]}
             />
           </Container>
 
           <Tabs
             tabs={[
-              {
-                id: "tables",
-                label: `Tables (${tables.length}${tablesLoadingMore ? "+" : ""})`,
-                content: (
-                  <SpaceBetween size="m">
-                    {tablesError && (
-                      <Alert type="error" header="Failed to load tables">
-                        {tablesErrorObj instanceof Error
-                          ? tablesErrorObj.message
-                          : "The table list could not be retrieved."}{" "}
-                        {(tablesData?.items?.length ?? 0) > 0
-                          ? "The list below is partial."
-                          : ""}
-                      </Alert>
-                    )}
-                    {(tablesData?.skippedAssets ?? 0) > 0 && (
-                      <Alert type="warning">
-                        {tablesData?.skippedAssets === 1
-                          ? "1 table could not be loaded due to a data issue."
-                          : `${tablesData?.skippedAssets} tables could not be loaded due to data issues.`}{" "}
-                        The list below may be incomplete.
-                      </Alert>
-                    )}
-                    <Table
-                      {...collectionProps}
-                      variant="container"
-                      selectionType="multi"
-                      selectedItems={selectedTables}
-                      onSelectionChange={({ detail }) =>
-                        setSelectedTables(detail.selectedItems)
-                      }
-                      loading={tablesLoading}
-                      items={pagedTables}
-                      trackBy="tableId"
-                      columnDefinitions={[
-                        {
-                          id: "name",
-                          header: "Table",
-                          sortingField: "tableId",
-                          cell: (item: TableSummary) => (
-                            <Link
-                              onFollow={(e) => {
-                                e.preventDefault();
-                                navigate(
-                                  tableDetailPath(
-                                    namespaceId!,
-                                    sourceId!,
-                                    item.tableId!,
-                                  ),
-                                );
-                              }}
+              ...(isGraph
+                ? []
+                : [
+                    {
+                      id: "tables",
+                      label: t("Tables ({count})", {
+                        count: `${tables.length}${tablesLoadingMore ? "+" : ""}`,
+                      }),
+                      content: (
+                        <SpaceBetween size="m">
+                          {tablesError && (
+                            <Alert
+                              type="error"
+                              header={t("Failed to load tables")}
                             >
-                              {item.tableId}
-                            </Link>
-                          ),
-                        },
-                        {
-                          id: "database",
-                          header: "Database",
-                          sortingField: "database",
-                          cell: (item: TableSummary) => item.database,
-                        },
-                        {
-                          id: "columns",
-                          header: "Columns",
-                          // No scalar field for the approved/total ratio; sort by
-                          // total column count.
-                          sortingComparator: (
-                            a: TableSummary,
-                            b: TableSummary,
-                          ) => (a.columnCount ?? 0) - (b.columnCount ?? 0),
-                          cell: (item: TableSummary) => {
-                            const total = item.columnCount ?? 0;
-                            const approved = item.columnsApproved ?? 0;
-                            const allApproved = approved >= total && total > 0;
-                            return (
-                              <StatusIndicator
-                                type={allApproved ? "success" : "warning"}
-                              >
-                                {`${approved}/${total}`}
-                              </StatusIndicator>
-                            );
-                          },
-                        },
-                        {
-                          id: "enriched",
-                          header: "Enriched",
-                          sortingField: "enrichmentSource",
-                          cell: (item: TableSummary) =>
-                            item.enrichmentSource ? (
-                              <Badge color="blue">
-                                {item.enrichmentSource}
-                              </Badge>
-                            ) : (
-                              "—"
-                            ),
-                        },
-                        {
-                          id: "status",
-                          header: "Review status",
-                          sortingField: "reviewStatus",
-                          cell: (item: TableSummary) => {
-                            const s = item.reviewStatus as string;
-                            const type =
-                              s === ReviewStatus.APPROVED
-                                ? "success"
-                                : s === ReviewStatus.REJECTED
-                                  ? "error"
-                                  : "warning";
-                            const label =
-                              s === ReviewStatus.APPROVED
-                                ? "Approved"
-                                : s === ReviewStatus.REJECTED
-                                  ? "Rejected"
-                                  : "Pending review";
-                            return (
-                              <SpaceBetween size="xxs">
-                                <StatusIndicator type={type}>
-                                  {label}
-                                </StatusIndicator>
-                                {item.added && <Badge color="green">New</Badge>}
-                                {item.pendingDeletion && (
+                              {tablesErrorObj instanceof Error
+                                ? tablesErrorObj.message
+                                : t(
+                                    "The table list could not be retrieved.",
+                                  )}{" "}
+                              {(tablesData?.items?.length ?? 0) > 0
+                                ? t("The list below is partial.")
+                                : ""}
+                            </Alert>
+                          )}
+                          {(tablesData?.skippedAssets ?? 0) > 0 && (
+                            <Alert type="warning">
+                              {tablesData?.skippedAssets === 1
+                                ? t(
+                                    "1 table could not be loaded due to a data issue. The list below may be incomplete.",
+                                  )
+                                : t(
+                                    "{count} tables could not be loaded due to data issues. The list below may be incomplete.",
+                                    { count: tablesData?.skippedAssets ?? 0 },
+                                  )}
+                            </Alert>
+                          )}
+                          <Table
+                            {...collectionProps}
+                            variant="container"
+                            selectionType="multi"
+                            selectedItems={selectedTables}
+                            onSelectionChange={({ detail }) =>
+                              setSelectedTables(detail.selectedItems)
+                            }
+                            loading={tablesLoading}
+                            items={pagedTables}
+                            trackBy="tableId"
+                            columnDefinitions={[
+                              {
+                                id: "name",
+                                header: t("Table"),
+                                sortingField: "tableId",
+                                cell: (item: TableSummary) => (
+                                  <Link
+                                    onFollow={(e) => {
+                                      e.preventDefault();
+                                      navigate(
+                                        tableDetailPath(
+                                          namespaceId!,
+                                          sourceId!,
+                                          item.tableId!,
+                                        ),
+                                      );
+                                    }}
+                                  >
+                                    {item.tableId}
+                                  </Link>
+                                ),
+                              },
+                              {
+                                id: "database",
+                                header: t("Database"),
+                                sortingField: "database",
+                                cell: (item: TableSummary) => item.database,
+                              },
+                              {
+                                id: "columns",
+                                header: t("Columns"),
+                                // No scalar field for the approved/total ratio; sort by
+                                // total column count.
+                                sortingComparator: (
+                                  a: TableSummary,
+                                  b: TableSummary,
+                                ) =>
+                                  (a.columnCount ?? 0) - (b.columnCount ?? 0),
+                                cell: (item: TableSummary) => {
+                                  const total = item.columnCount ?? 0;
+                                  const approved = item.columnsApproved ?? 0;
+                                  const allApproved =
+                                    approved >= total && total > 0;
+                                  return (
+                                    <StatusIndicator
+                                      type={allApproved ? "success" : "warning"}
+                                    >
+                                      {`${approved}/${total}`}
+                                    </StatusIndicator>
+                                  );
+                                },
+                              },
+                              {
+                                id: "enriched",
+                                header: t("Enriched"),
+                                sortingField: "enrichmentSource",
+                                cell: (item: TableSummary) =>
+                                  item.enrichmentSource ? (
+                                    <Badge color="blue">
+                                      {item.enrichmentSource}
+                                    </Badge>
+                                  ) : (
+                                    "—"
+                                  ),
+                              },
+                              {
+                                id: "status",
+                                header: t("Review status"),
+                                sortingField: "reviewStatus",
+                                cell: (item: TableSummary) => {
+                                  const s = item.reviewStatus as string;
+                                  const type =
+                                    s === ReviewStatus.APPROVED
+                                      ? "success"
+                                      : s === ReviewStatus.REJECTED
+                                        ? "error"
+                                        : "warning";
+                                  const label =
+                                    s === ReviewStatus.APPROVED
+                                      ? t("Approved")
+                                      : s === ReviewStatus.REJECTED
+                                        ? t("Rejected")
+                                        : t("Pending review");
+                                  return (
+                                    <SpaceBetween size="xxs">
+                                      <StatusIndicator type={type}>
+                                        {label}
+                                      </StatusIndicator>
+                                      {item.added && (
+                                        <Badge color="green">{t("New")}</Badge>
+                                      )}
+                                      {item.pendingDeletion && (
+                                        <SpaceBetween
+                                          direction="horizontal"
+                                          size="xs"
+                                        >
+                                          <Badge color="red">
+                                            {t("Pending deletion")}
+                                          </Badge>
+                                          <Button
+                                            variant="inline-link"
+                                            loading={
+                                              keepingTableId === item.tableId
+                                            }
+                                            disabled={keepMutation.isPending}
+                                            onClick={() =>
+                                              handleKeepTable(
+                                                item.tableId ?? "",
+                                              )
+                                            }
+                                          >
+                                            {t("Keep")}
+                                          </Button>
+                                        </SpaceBetween>
+                                      )}
+                                      {(item.columnsPendingDeletion ?? 0) >
+                                        0 && (
+                                        <Badge color="red">
+                                          {t(
+                                            item.columnsPendingDeletion === 1
+                                              ? "{count} column pending deletion"
+                                              : "{count} columns pending deletion",
+                                            {
+                                              count:
+                                                item.columnsPendingDeletion ??
+                                                0,
+                                            },
+                                          )}
+                                        </Badge>
+                                      )}
+                                      {(item.pendingRelationships ?? 0) > 0 && (
+                                        <Badge color="blue">
+                                          {t(
+                                            item.pendingRelationships === 1
+                                              ? "{count} relationship pending review"
+                                              : "{count} relationships pending review",
+                                            {
+                                              count:
+                                                item.pendingRelationships ?? 0,
+                                            },
+                                          )}
+                                        </Badge>
+                                      )}
+                                    </SpaceBetween>
+                                  );
+                                },
+                              },
+                            ]}
+                            filter={
+                              <SpaceBetween direction="horizontal" size="xs">
+                                <TextFilter
+                                  {...filterProps}
+                                  filteringPlaceholder={t("Find tables")}
+                                  filteringAriaLabel={t("Filter tables")}
+                                />
+                                <Select
+                                  selectedOption={
+                                    statusFilter
+                                      ? {
+                                          value: statusFilter,
+                                          label: statusFilter,
+                                        }
+                                      : { value: "", label: t("All statuses") }
+                                  }
+                                  onChange={({ detail }) =>
+                                    setStatusFilter(
+                                      detail.selectedOption.value || null,
+                                    )
+                                  }
+                                  options={[
+                                    { value: "", label: t("All statuses") },
+                                    {
+                                      value: ReviewStatus.PENDING_REVIEW,
+                                      label: t("Pending review"),
+                                    },
+                                    {
+                                      value: ReviewStatus.APPROVED,
+                                      label: t("Approved"),
+                                    },
+                                    {
+                                      value: ReviewStatus.REJECTED,
+                                      label: t("Rejected"),
+                                    },
+                                  ]}
+                                  placeholder={t("Filter by status")}
+                                />
+                              </SpaceBetween>
+                            }
+                            pagination={<Pagination {...paginationProps} />}
+                            header={
+                              <Header
+                                variant="h2"
+                                counter={`(${tables.length}${tablesLoadingMore ? "+" : ""})`}
+                                // Text, not just a spinner: a partial list that looks
+                                // complete is worse than a slow one, and screen-reader
+                                // users get no signal from a loading glyph alone.
+                                description={
+                                  tablesLoadingMore
+                                    ? t(
+                                        "Still loading tables — the list below is incomplete.",
+                                      )
+                                    : undefined
+                                }
+                                actions={
                                   <SpaceBetween
                                     direction="horizontal"
                                     size="xs"
                                   >
-                                    <Badge color="red">Pending deletion</Badge>
                                     <Button
-                                      variant="inline-link"
-                                      loading={keepingTableId === item.tableId}
-                                      disabled={keepMutation.isPending}
                                       onClick={() =>
-                                        handleKeepTable(item.tableId ?? "")
+                                        handleBatchReviewTables(
+                                          ReviewDecision.REJECTED,
+                                        )
                                       }
+                                      loading={isBatchReviewing}
+                                      disabled={selectedTables.length === 0}
                                     >
-                                      Keep
+                                      {t("Reject selected")}
+                                    </Button>
+                                    <Button
+                                      onClick={() =>
+                                        handleBatchReviewTables(
+                                          ReviewDecision.APPROVED,
+                                        )
+                                      }
+                                      loading={isBatchReviewing}
+                                      disabled={selectedTables.length === 0}
+                                    >
+                                      {t("Approve selected")}
                                     </Button>
                                   </SpaceBetween>
-                                )}
-                                {(item.columnsPendingDeletion ?? 0) > 0 && (
-                                  <Badge color="red">
-                                    {`${item.columnsPendingDeletion} column${
-                                      item.columnsPendingDeletion === 1
-                                        ? ""
-                                        : "s"
-                                    } pending deletion`}
-                                  </Badge>
-                                )}
-                                {(item.pendingRelationships ?? 0) > 0 && (
-                                  <Badge color="blue">
-                                    {`${item.pendingRelationships} relationship${
-                                      item.pendingRelationships === 1 ? "" : "s"
-                                    } pending review`}
-                                  </Badge>
-                                )}
-                              </SpaceBetween>
-                            );
-                          },
-                        },
-                      ]}
-                      filter={
-                        <SpaceBetween direction="horizontal" size="xs">
-                          <TextFilter
-                            {...filterProps}
-                            filteringPlaceholder="Find tables"
-                            filteringAriaLabel="Filter tables"
-                          />
-                          <Select
-                            selectedOption={
-                              statusFilter
-                                ? { value: statusFilter, label: statusFilter }
-                                : { value: "", label: "All statuses" }
+                                }
+                              >
+                                {t("Tables")}
+                              </Header>
                             }
-                            onChange={({ detail }) =>
-                              setStatusFilter(
-                                detail.selectedOption.value || null,
-                              )
+                            empty={
+                              <Box
+                                textAlign="center"
+                                color="text-status-inactive"
+                                padding="l"
+                              >
+                                {status === "SCANNING" || status === "ENRICHING"
+                                  ? t(
+                                      "Tables will appear here once the scan completes.",
+                                    )
+                                  : status === "REGISTERED"
+                                    ? t("Scan has not started yet.")
+                                    : t("No tables discovered.")}
+                              </Box>
                             }
-                            options={[
-                              { value: "", label: "All statuses" },
-                              {
-                                value: ReviewStatus.PENDING_REVIEW,
-                                label: "Pending review",
-                              },
-                              {
-                                value: ReviewStatus.APPROVED,
-                                label: "Approved",
-                              },
-                              {
-                                value: ReviewStatus.REJECTED,
-                                label: "Rejected",
-                              },
-                            ]}
-                            placeholder="Filter by status"
                           />
                         </SpaceBetween>
-                      }
-                      pagination={<Pagination {...paginationProps} />}
-                      header={
-                        <Header
-                          variant="h2"
-                          counter={`(${tables.length}${tablesLoadingMore ? "+" : ""})`}
-                          // Text, not just a spinner: a partial list that looks
-                          // complete is worse than a slow one, and screen-reader
-                          // users get no signal from a loading glyph alone.
-                          description={
-                            tablesLoadingMore
-                              ? "Still loading tables — the list below is incomplete."
-                              : undefined
-                          }
-                          actions={
-                            <SpaceBetween direction="horizontal" size="xs">
-                              <Button
-                                onClick={() =>
-                                  handleBatchReviewTables(
-                                    ReviewDecision.REJECTED,
-                                  )
-                                }
-                                loading={isBatchReviewing}
-                                disabled={selectedTables.length === 0}
-                              >
-                                Reject selected
-                              </Button>
-                              <Button
-                                onClick={() =>
-                                  handleBatchReviewTables(
-                                    ReviewDecision.APPROVED,
-                                  )
-                                }
-                                loading={isBatchReviewing}
-                                disabled={selectedTables.length === 0}
-                              >
-                                Approve selected
-                              </Button>
-                            </SpaceBetween>
-                          }
-                        >
-                          Tables
-                        </Header>
-                      }
-                      empty={
-                        <Box
-                          textAlign="center"
-                          color="text-status-inactive"
-                          padding="l"
-                        >
-                          {status === "SCANNING" || status === "ENRICHING"
-                            ? "Tables will appear here once the scan completes."
-                            : status === "REGISTERED"
-                              ? "Scan has not started yet."
-                              : "No tables discovered."}
-                        </Box>
-                      }
-                    />
-                  </SpaceBetween>
-                ),
-              },
+                      ),
+                    },
+                  ]),
               {
                 id: "history",
-                label: "Scan history",
+                label: isGraph ? t("Verification history") : t("Scan history"),
                 content: (
                   <ScanHistoryTable
                     createdAt={source.createdAt}
@@ -1050,39 +1270,41 @@ export const SourceDetail: React.FC = () => {
               },
               {
                 id: "settings",
-                label: "Settings",
+                label: t("Settings"),
                 content: (
                   <SpaceBetween size="l">
                     <Container
-                      header={<Header variant="h2">Connection settings</Header>}
+                      header={
+                        <Header variant="h2">{t("Connection settings")}</Header>
+                      }
                     >
                       {dbDetails?.glueConfiguration && (
                         <KeyValuePairs
                           columns={2}
                           items={[
                             {
-                              label: "Catalog ID",
+                              label: t("Catalog ID"),
                               value: String(
                                 dbDetails.glueConfiguration.catalogId ?? "—",
                               ),
                             },
                             {
-                              label: "Region",
+                              label: t("Region"),
                               value: String(
                                 dbDetails.glueConfiguration.region ?? "—",
                               ),
                             },
                             {
-                              label: "Database",
+                              label: t("Database"),
                               value: String(
                                 dbDetails.glueConfiguration.databaseName ?? "—",
                               ),
                             },
                             {
-                              label: "Table filter",
+                              label: t("Table filter"),
                               value: String(
                                 dbDetails.glueConfiguration.tableFilter ??
-                                  "(none)",
+                                  t("(none)"),
                               ),
                             },
                           ]}
@@ -1093,45 +1315,45 @@ export const SourceDetail: React.FC = () => {
                           columns={2}
                           items={[
                             {
-                              label: "Engine",
+                              label: t("Engine"),
                               value: String(
                                 dbDetails.jdbcConfiguration.engine ?? "—",
                               ),
                             },
                             {
-                              label: "Host",
+                              label: t("Host"),
                               value: String(
                                 dbDetails.jdbcConfiguration.host ?? "—",
                               ),
                             },
                             {
-                              label: "Port",
+                              label: t("Port"),
                               value: String(
                                 dbDetails.jdbcConfiguration.port ?? "—",
                               ),
                             },
                             {
-                              label: "Database",
+                              label: t("Database"),
                               value: String(
                                 dbDetails.jdbcConfiguration.databaseName ?? "—",
                               ),
                             },
                             {
-                              label: "Schema filter",
+                              label: t("Schema filter"),
                               value: String(
                                 dbDetails.jdbcConfiguration.schemaFilter ??
-                                  "(none)",
+                                  t("(none)"),
                               ),
                             },
                             {
-                              label: "Table filter",
+                              label: t("Table filter"),
                               value: String(
                                 dbDetails.jdbcConfiguration.tableFilter ??
-                                  "(none)",
+                                  t("(none)"),
                               ),
                             },
                             {
-                              label: "Auth",
+                              label: t("Auth"),
                               value: "Secrets Manager",
                             },
                           ]}
@@ -1146,31 +1368,31 @@ export const SourceDetail: React.FC = () => {
                               // connector Lambda serves both the metadata and record
                               // paths. Athena's split metadata/record pair is not
                               // offered anywhere — see that Smithy shape for why.
-                              label: "Connector function ARN",
+                              label: t("Connector function ARN"),
                               value: String(
                                 dbDetails.customConnectorConfiguration
                                   .connectorFunctionArn ?? "—",
                               ),
                             },
                             {
-                              label: "Database",
+                              label: t("Database"),
                               value: String(
                                 dbDetails.customConnectorConfiguration
                                   .databaseName ?? "—",
                               ),
                             },
                             {
-                              label: "Table filter",
+                              label: t("Table filter"),
                               value: String(
                                 dbDetails.customConnectorConfiguration
-                                  .tableFilter ?? "(none)",
+                                  .tableFilter ?? t("(none)"),
                               ),
                             },
                             {
-                              label: "Table exclude filter",
+                              label: t("Table exclude filter"),
                               value: String(
                                 dbDetails.customConnectorConfiguration
-                                  .tableExcludeFilter ?? "(none)",
+                                  .tableExcludeFilter ?? t("(none)"),
                               ),
                             },
                           ]}
@@ -1181,28 +1403,28 @@ export const SourceDetail: React.FC = () => {
                           columns={2}
                           items={[
                             {
-                              label: "Workspace hostname",
+                              label: t("Workspace hostname"),
                               value: String(
                                 dbDetails.databricksSqlWarehouseConfiguration
                                   .workspaceHostname ?? "—",
                               ),
                             },
                             {
-                              label: "HTTP path",
+                              label: t("HTTP path"),
                               value: String(
                                 dbDetails.databricksSqlWarehouseConfiguration
                                   .httpPath ?? "—",
                               ),
                             },
                             {
-                              label: "Unity Catalog catalog",
+                              label: t("Unity Catalog catalog"),
                               value: String(
                                 dbDetails.databricksSqlWarehouseConfiguration
                                   .databricksCatalog ?? "—",
                               ),
                             },
                             {
-                              label: "Unity Catalog schema",
+                              label: t("Unity Catalog schema"),
                               value: String(
                                 dbDetails.databricksSqlWarehouseConfiguration
                                   .databaseName ?? "—",
@@ -1211,46 +1433,90 @@ export const SourceDetail: React.FC = () => {
                             // Role before secret: the credential is read only as a session
                             // assumed from the role. Neither ARN is itself a secret.
                             {
-                              label:
+                              label: t(
                                 "Credential access role (assumed to read the secret)",
+                              ),
                               value: String(
                                 dbDetails.databricksSqlWarehouseConfiguration
                                   .crossAccountRoleArn ?? "—",
                               ),
                             },
                             {
-                              label:
+                              label: t(
                                 "Credential secret (read through that role)",
+                              ),
                               value: String(
                                 dbDetails.databricksSqlWarehouseConfiguration
                                   .credentialSecretArn ?? "—",
                               ),
                             },
                             {
-                              label: "Table filter",
+                              label: t("Table filter"),
                               value: String(
                                 dbDetails.databricksSqlWarehouseConfiguration
-                                  .tableFilter ?? "(none)",
+                                  .tableFilter ?? t("(none)"),
                               ),
                             },
                             {
-                              label: "Table exclude filter",
+                              label: t("Table exclude filter"),
                               value: String(
                                 dbDetails.databricksSqlWarehouseConfiguration
-                                  .tableExcludeFilter ?? "(none)",
+                                  .tableExcludeFilter ?? t("(none)"),
                               ),
                             },
                           ]}
                         />
                       )}
+                      {dbDetails?.sparqlConfiguration && (
+                        <KeyValuePairs
+                          columns={2}
+                          items={[
+                            { label: t("Engine"), value: "Amazon Neptune" },
+                            {
+                              label: t("SPARQL endpoint"),
+                              value: String(
+                                dbDetails.sparqlConfiguration.dataEndpoint ??
+                                  "—",
+                              ),
+                            },
+                            {
+                              label: t("Region"),
+                              value: String(
+                                dbDetails.sparqlConfiguration.region ?? "—",
+                              ),
+                            },
+                            {
+                              label: t("Port"),
+                              value: String(
+                                dbDetails.sparqlConfiguration.port ?? 8182,
+                              ),
+                            },
+                            {
+                              label: t("Named graph"),
+                              value: String(
+                                dbDetails.sparqlConfiguration.dataNamedGraph ??
+                                  t("(default graph)"),
+                              ),
+                            },
+                            {
+                              label: t("Authentication"),
+                              value: "SigV4 / IAM",
+                            },
+                          ]}
+                        />
+                      )}
                     </Container>
-                    <RescanScheduleControl
-                      namespaceId={namespaceId ?? ""}
-                      sourceId={sourceId ?? ""}
-                      isGlue={source.sourceSubType === "GLUE_DATABASE"}
-                      schedule={dbDetails?.rescanSchedule}
-                      eventRescan={dbDetails?.eventRescan}
-                    />
+                    {/* A graph source has no schema to re-scan on a schedule or
+                        on Glue events; Re-verify re-checks reachability. */}
+                    {isTabular && (
+                      <RescanScheduleControl
+                        namespaceId={namespaceId ?? ""}
+                        sourceId={sourceId ?? ""}
+                        isGlue={source.sourceSubType === "GLUE_DATABASE"}
+                        schedule={dbDetails?.rescanSchedule}
+                        eventRescan={dbDetails?.eventRescan}
+                      />
+                    )}
                   </SpaceBetween>
                 ),
               },
@@ -1262,21 +1528,21 @@ export const SourceDetail: React.FC = () => {
       {/* ── DOCUMENTS layout — matches DocSourceDetail ── */}
       {isDocuments && (
         <>
-          <Container header={<Header variant="h2">Overview</Header>}>
+          <Container header={<Header variant="h2">{t("Overview")}</Header>}>
             <ColumnLayout columns={3} variant="text-grid">
-              <ValueWithLabel label="Status">
+              <ValueWithLabel label={t("Status")}>
                 <StatusIndicator type={sourceStatusType(status)}>
-                  {sourceStatusLabel(status)}
+                  {localizedSourceStatus(status, t)}
                 </StatusIndicator>
               </ValueWithLabel>
-              <ValueWithLabel label="Source">
+              <ValueWithLabel label={t("Source")}>
                 {source.sourceSubType === "LOCAL_UPLOAD"
-                  ? "File upload"
-                  : "S3 bucket"}
+                  ? t("File upload")
+                  : t("S3 bucket")}
               </ValueWithLabel>
               {source.sourceSubType !== "LOCAL_UPLOAD" && (
                 <>
-                  <ValueWithLabel label="S3 Prefixes">
+                  <ValueWithLabel label={t("S3 Prefixes")}>
                     {docDetails?.s3Prefixes &&
                     docDetails.s3Prefixes.length > 0 ? (
                       docDetails.s3Prefixes.map((p, i) => (
@@ -1285,49 +1551,49 @@ export const SourceDetail: React.FC = () => {
                         </div>
                       ))
                     ) : (
-                      <span>— (entire bucket)</span>
+                      <span>{t("— (entire bucket)")}</span>
                     )}
                   </ValueWithLabel>
-                  <ValueWithLabel label="Source Bucket ARN">
+                  <ValueWithLabel label={t("Source Bucket ARN")}>
                     {String(docDetails?.sourceBucketArn ?? "—")}
                   </ValueWithLabel>
-                  <ValueWithLabel label="Cross-account Role">
+                  <ValueWithLabel label={t("Cross-account Role")}>
                     {String(docDetails?.roleArn ?? "—")}
                   </ValueWithLabel>
                 </>
               )}
-              <ValueWithLabel label="Created">
+              <ValueWithLabel label={t("Created")}>
                 {formatTimestamp(source.createdAt)}
               </ValueWithLabel>
-              <ValueWithLabel label="Last Updated">
+              <ValueWithLabel label={t("Last Updated")}>
                 {formatTimestamp(source.updatedAt)}
               </ValueWithLabel>
             </ColumnLayout>
           </Container>
 
           <Container
-            header={<Header variant="h2">Ingestion Statistics</Header>}
+            header={<Header variant="h2">{t("Ingestion Statistics")}</Header>}
           >
             <ColumnLayout columns={3} variant="text-grid">
-              <ValueWithLabel label="Total Files">
+              <ValueWithLabel label={t("Total Files")}>
                 {String(docDetails?.filesTotal ?? "—")}
               </ValueWithLabel>
-              <ValueWithLabel label="Skipped">
+              <ValueWithLabel label={t("Skipped")}>
                 {String(docDetails?.filesSkipped ?? "—")}
               </ValueWithLabel>
-              <ValueWithLabel label="Errored">
+              <ValueWithLabel label={t("Errored")}>
                 {String(docDetails?.filesErrored ?? "—")}
               </ValueWithLabel>
-              <ValueWithLabel label="Documents Processed">
+              <ValueWithLabel label={t("Documents Processed")}>
                 {String(docDetails?.documentsProcessed ?? "—")}
               </ValueWithLabel>
-              <ValueWithLabel label="Text Chunks AI Processed">
+              <ValueWithLabel label={t("Text Chunks AI Processed")}>
                 {String(docDetails?.chunksLLM ?? "—")}
               </ValueWithLabel>
-              <ValueWithLabel label="Text Chunks Embeddings">
+              <ValueWithLabel label={t("Text Chunks Embeddings")}>
                 {String(docDetails?.chunksEmbed ?? "—")}
               </ValueWithLabel>
-              <ValueWithLabel label="Text Chunks Added To Graph">
+              <ValueWithLabel label={t("Text Chunks Added To Graph")}>
                 {String(docDetails?.chunksGraph ?? "—")}
               </ValueWithLabel>
             </ColumnLayout>
@@ -1340,18 +1606,18 @@ export const SourceDetail: React.FC = () => {
                   variant="h2"
                   counter={`(${preprocessingIssues.length})`}
                 >
-                  File Issues
+                  {t("File Issues")}
                 </Header>
               }
               columnDefinitions={[
                 {
                   id: "filename",
-                  header: "Filename",
+                  header: t("Filename"),
                   cell: (item) => item.filename,
                 },
                 {
                   id: "type",
-                  header: "Type",
+                  header: t("Type"),
                   cell: (item) => (
                     <StatusIndicator
                       type={item.type === "error" ? "error" : "warning"}
@@ -1360,24 +1626,39 @@ export const SourceDetail: React.FC = () => {
                     </StatusIndicator>
                   ),
                 },
-                { id: "reason", header: "Reason", cell: (item) => item.reason },
+                {
+                  id: "reason",
+                  header: t("Reason"),
+                  cell: (item) => item.reason,
+                },
               ]}
               items={preprocessingIssues}
             />
           )}
 
           {extractionConfig && (
-            <Container header={<Header variant="h2">Advanced Options</Header>}>
+            <Container
+              header={<Header variant="h2">{t("Advanced options")}</Header>}
+            >
               <ColumnLayout columns={2} variant="text-grid">
-                <ValueWithLabel label="Versioning">
+                <ValueWithLabel label={t("Versioning")}>
                   {(extractionConfig.enableVersioning as boolean)
-                    ? "Enabled"
-                    : "Disabled"}
+                    ? t("Enabled")
+                    : t("Disabled")}
                 </ValueWithLabel>
-                <ValueWithLabel label="Delete Previous Versions">
+                <ValueWithLabel label={t("Delete previous versions")}>
                   {(extractionConfig.deletePrevVersions as boolean)
-                    ? "Yes"
-                    : "No"}
+                    ? t("Yes")
+                    : t("No")}
+                </ValueWithLabel>
+                <ValueWithLabel label={t("Chunk size (tokens)")}>
+                  {chunkTokens(extractionConfig.chunkSize) ??
+                    t("Default (256 tokens)")}
+                </ValueWithLabel>
+                <ValueWithLabel label={t("Chunk overlap (tokens)")}>
+                  {(chunkTokens(extractionConfig.chunkSize) !== undefined
+                    ? chunkTokens(extractionConfig.chunkOverlap)
+                    : undefined) ?? t("Default (25 tokens)")}
                 </ValueWithLabel>
               </ColumnLayout>
             </Container>
@@ -1386,7 +1667,7 @@ export const SourceDetail: React.FC = () => {
       )}
 
       {deleteError && (
-        <Alert type="error" header="Failed to delete source">
+        <Alert type="error" header={t("Failed to delete source")}>
           {deleteError.message}
         </Alert>
       )}
@@ -1395,7 +1676,9 @@ export const SourceDetail: React.FC = () => {
         <Modal
           visible
           onDismiss={() => setShowDeleteModal(false)}
-          header={isDocuments ? "Delete document source" : "Delete data source"}
+          header={
+            isDocuments ? t("Delete document source") : t("Delete data source")
+          }
           footer={
             <Box float="right">
               <SpaceBetween direction="horizontal" size="xs">
@@ -1403,7 +1686,7 @@ export const SourceDetail: React.FC = () => {
                   variant="link"
                   onClick={() => setShowDeleteModal(false)}
                 >
-                  Cancel
+                  {t("Cancel")}
                 </Button>
                 <Button
                   variant="normal"
@@ -1413,7 +1696,7 @@ export const SourceDetail: React.FC = () => {
                     deleteSource();
                   }}
                 >
-                  Delete
+                  {t("Delete")}
                 </Button>
               </SpaceBetween>
             </Box>
@@ -1421,20 +1704,17 @@ export const SourceDetail: React.FC = () => {
         >
           <SpaceBetween size="m">
             <Box>
-              {isDocuments ? (
-                <>
-                  Permanently delete <b>{source.name}</b>? This will remove all
-                  associated files from S3, the DynamoDB record, and the
-                  knowledge graph data from Neptune and OpenSearch.
-                </>
-              ) : (
-                <>
-                  Permanently delete <b>{source.name}</b>? This will remove all
-                  associated data.
-                </>
-              )}
+              {isDocuments
+                ? t(
+                    "Permanently delete {name}? This will remove all associated files from S3, the DynamoDB record, and the knowledge graph data from Neptune and OpenSearch.",
+                    { name: source.name ?? "" },
+                  )
+                : t(
+                    "Permanently delete {name}? This will remove all associated data.",
+                    { name: source.name ?? "" },
+                  )}
             </Box>
-            <Alert type="warning">This action cannot be undone.</Alert>
+            <Alert type="warning">{t("This action cannot be undone.")}</Alert>
           </SpaceBetween>
         </Modal>
       )}
@@ -1443,7 +1723,7 @@ export const SourceDetail: React.FC = () => {
         <Modal
           visible
           onDismiss={() => setShowRescanConfirm(false)}
-          header="Discard the open re-scan review?"
+          header={t("Discard the open re-scan review?")}
           footer={
             <Box float="right">
               <SpaceBetween direction="horizontal" size="xs">
@@ -1451,7 +1731,7 @@ export const SourceDetail: React.FC = () => {
                   variant="link"
                   onClick={() => setShowRescanConfirm(false)}
                 >
-                  Cancel
+                  {t("Cancel")}
                 </Button>
                 <Button
                   variant="primary"
@@ -1461,7 +1741,7 @@ export const SourceDetail: React.FC = () => {
                     rescan({ confirmDiscardOpenReview: true });
                   }}
                 >
-                  Discard and re-scan
+                  {t("Discard and re-scan")}
                 </Button>
               </SpaceBetween>
             </Box>
@@ -1469,15 +1749,15 @@ export const SourceDetail: React.FC = () => {
         >
           <SpaceBetween size="m">
             <Box>
-              <b>{source.name}</b> has a re-scan waiting for your review. A new
-              re-scan compares the database against the last version you
-              approved, so anything you already approved, rejected, or edited
-              inside this review is discarded.
+              <b>{source.name}</b>
+              {t(
+                " has a re-scan waiting for your review. A new re-scan compares the database against the last version you approved, so anything you already approved, rejected, or edited inside this review is discarded.",
+              )}
             </Box>
             <Alert type="info">
-              Your approved tables and columns are not affected. To keep the
-              decisions you have made in this review instead, cancel and finish
-              reviewing it first.
+              {t(
+                "Your approved tables and columns are not affected. To keep the decisions you have made in this review instead, cancel and finish reviewing it first.",
+              )}
             </Alert>
           </SpaceBetween>
         </Modal>
@@ -1513,12 +1793,20 @@ function toIso(value: Date | string | undefined): string | undefined {
 
 // Map one ListSourceScanJobs SCAN row to a history entry. A row with no
 // explicit eventType is treated as a SCAN (legacy rows predate review events).
-function scanEntryToRow(entry: ScanJobEntry, index: number): ScanHistoryEntry {
+function scanEntryToRow(
+  entry: ScanJobEntry,
+  index: number,
+  t: AppTranslate,
+): ScanHistoryEntry {
   const at = toIso(entry.at) ?? "";
   const id = `scan-${at}-${index}`;
   const tables = entry.tablesDiscovered ?? 0;
   const status = entry.status ?? "";
   const trigger = entry.triggerType ?? undefined;
+  // A graph source's "scan" is a reachability check of its SPARQL endpoint.
+  if (entry.scanType === "reachability") {
+    return reachabilityEntryToRow(entry, id, at, status, trigger, t);
+  }
   if (status === "FAILED") {
     return {
       id,
@@ -1526,10 +1814,10 @@ function scanEntryToRow(entry: ScanJobEntry, index: number): ScanHistoryEntry {
       kind: "scan",
       trigger,
       type: "error",
-      label: "Scan failed",
+      label: t("Scan failed"),
       detail: entry.errorMessage
-        ? `Error: ${entry.errorMessage}`
-        : "The scan did not complete. Use Re-scan to try again.",
+        ? t("Error: {message}", { message: entry.errorMessage })
+        : t("The scan did not complete. Use Re-scan to try again."),
     };
   }
   if (
@@ -1543,8 +1831,8 @@ function scanEntryToRow(entry: ScanJobEntry, index: number): ScanHistoryEntry {
       kind: "scan",
       trigger,
       type: "in-progress",
-      label: "Scan in progress",
-      detail: "The scan or enrichment pipeline is still running.",
+      label: t("Scan in progress"),
+      detail: t("The scan or enrichment pipeline is still running."),
     };
   }
   if (status === "CANCELLED") {
@@ -1554,8 +1842,8 @@ function scanEntryToRow(entry: ScanJobEntry, index: number): ScanHistoryEntry {
       kind: "scan",
       trigger,
       type: "stopped",
-      label: "Scan cancelled",
-      detail: "The scan was cancelled.",
+      label: t("Scan cancelled"),
+      detail: t("The scan was cancelled."),
     };
   }
   return {
@@ -1564,8 +1852,46 @@ function scanEntryToRow(entry: ScanJobEntry, index: number): ScanHistoryEntry {
     kind: "scan",
     trigger,
     type: "success",
-    label: "Scan completed",
-    detail: `Scanned ${tables} table${tables === 1 ? "" : "s"}.`,
+    label: t("Scan completed"),
+    detail: t(
+      tables === 1 ? "Scanned {count} table." : "Scanned {count} tables.",
+      { count: tables },
+    ),
+  };
+}
+
+function reachabilityEntryToRow(
+  entry: ScanJobEntry,
+  id: string,
+  at: string,
+  status: string,
+  trigger: string | undefined,
+  t: AppTranslate,
+): ScanHistoryEntry {
+  const base = { id, at, kind: "scan" as const, trigger };
+  if (status === "FAILED") {
+    return {
+      ...base,
+      type: "error",
+      label: t("Reachability check failed"),
+      detail: entry.errorMessage
+        ? t("Error: {message}", { message: entry.errorMessage })
+        : t("The endpoint could not be reached. Use Re-verify to try again."),
+    };
+  }
+  if (status === "COMPLETED") {
+    return {
+      ...base,
+      type: "success",
+      label: t("Endpoint verified"),
+      detail: t("The SPARQL endpoint is reachable and authorized."),
+    };
+  }
+  return {
+    ...base,
+    type: "in-progress",
+    label: t("Checking endpoint"),
+    detail: t("Verifying that the SPARQL endpoint is reachable."),
   };
 }
 
@@ -1575,6 +1901,7 @@ function scanEntryToRow(entry: ScanJobEntry, index: number): ScanHistoryEntry {
 function reviewEntryToRow(
   entry: ScanJobEntry,
   index: number,
+  t: AppTranslate,
 ): ScanHistoryEntry {
   const at = toIso(entry.at) ?? "";
   const id = `review-${at}-${index}`;
@@ -1583,19 +1910,22 @@ function reviewEntryToRow(
   const failed = (entry.status ?? "").endsWith("_FAILED");
   const label = isRescan
     ? approved
-      ? "Re-scan approved"
-      : "Re-scan rejected"
+      ? t("Re-scan approved")
+      : t("Re-scan rejected")
     : approved
-      ? "Source approved"
-      : "Source rejected";
+      ? t("Source approved")
+      : t("Source rejected");
   const count = entry.tablesApproved ?? 0;
   let detail: string;
   if (approved) {
-    detail = `${count} table${count === 1 ? "" : "s"} approved.`;
+    detail = t(
+      count === 1 ? "{count} table approved." : "{count} tables approved.",
+      { count },
+    );
   } else if (isRescan) {
-    detail = "Re-scan discarded; the previously approved tables were kept.";
+    detail = t("Re-scan discarded; the previously approved tables were kept.");
   } else {
-    detail = "Source rejected; no tables were published.";
+    detail = t("Source rejected; no tables were published.");
   }
   return {
     id,
@@ -1615,6 +1945,7 @@ function buildScanHistory(args: {
   status: string;
   tablesDiscovered: number;
   tablesApproved: number;
+  t: AppTranslate;
   errorMessage?: string;
   /** Tables lost to a per-table read failure while the scan itself succeeded. */
   tablesFailed?: number;
@@ -1634,15 +1965,15 @@ function buildScanHistory(args: {
         at: createdAt,
         kind: "registered",
         type: "info",
-        label: "Source registered",
-        detail: "Source created and queued for initial scan.",
+        label: args.t("Source registered"),
+        detail: args.t("Source created and queued for initial scan."),
       });
     }
     args.scanJobs.forEach((entry, i) => {
       rows.push(
         entry.eventType === "REVIEW"
-          ? reviewEntryToRow(entry, i)
-          : scanEntryToRow(entry, i),
+          ? reviewEntryToRow(entry, i, args.t)
+          : scanEntryToRow(entry, i, args.t),
       );
     });
     // Most recent first so stewards see the latest state at the top.
@@ -1659,8 +1990,8 @@ function buildScanHistory(args: {
       at: createdAt,
       kind: "registered",
       type: "info",
-      label: "Source registered",
-      detail: "Source created and queued for initial scan.",
+      label: args.t("Source registered"),
+      detail: args.t("Source created and queued for initial scan."),
     });
   }
 
@@ -1671,10 +2002,12 @@ function buildScanHistory(args: {
         at: lastScanAt,
         kind: "scan",
         type: "error",
-        label: "Scan failed",
+        label: args.t("Scan failed"),
         detail: args.errorMessage
-          ? `Error: ${args.errorMessage}`
-          : "The most recent scan did not complete. Use Re-scan to try again.",
+          ? args.t("Error: {message}", { message: args.errorMessage })
+          : args.t(
+              "The most recent scan did not complete. Use Re-scan to try again.",
+            ),
       });
     } else if (
       args.status === SourceStatus.PENDING_REVIEW ||
@@ -1684,7 +2017,12 @@ function buildScanHistory(args: {
       args.status === SourceStatus.APPROVAL_FAILED ||
       args.status === SourceStatus.REJECTION_FAILED
     ) {
-      const scanned = `Scanned ${args.tablesDiscovered} table${args.tablesDiscovered === 1 ? "" : "s"}.`;
+      const scanned = args.t(
+        args.tablesDiscovered === 1
+          ? "Scanned {count} table."
+          : "Scanned {count} tables.",
+        { count: args.tablesDiscovered },
+      );
       const lost = args.tablesFailed ?? 0;
       events.push({
         id: `scan-${lastScanAt}`,
@@ -1693,10 +2031,15 @@ function buildScanHistory(args: {
         // A scan that dropped tables completed, but not cleanly — flag it so
         // the activity log doesn't read as a clean success.
         type: lost > 0 ? "warning" : "success",
-        label: "Scan completed",
+        label: args.t("Scan completed"),
         detail:
           lost > 0
-            ? `${scanned} ${lost} table${lost === 1 ? "" : "s"} could not be read and ${lost === 1 ? "was" : "were"} skipped.`
+            ? args.t(
+                lost === 1
+                  ? "{scanned} {count} table could not be read and was skipped."
+                  : "{scanned} {count} tables could not be read and were skipped.",
+                { scanned, count: lost },
+              )
             : scanned,
       });
     } else if (
@@ -1708,8 +2051,8 @@ function buildScanHistory(args: {
         at: lastScanAt,
         kind: "scan",
         type: "in-progress",
-        label: "Scan in progress",
-        detail: "The scan or enrichment pipeline is still running.",
+        label: args.t("Scan in progress"),
+        detail: args.t("The scan or enrichment pipeline is still running."),
       });
     }
   }
@@ -1724,8 +2067,11 @@ function buildScanHistory(args: {
       at: updatedAt,
       kind: "review",
       type: "success",
-      label: "All tables approved",
-      detail: `${args.tablesApproved} of ${args.tablesDiscovered} tables approved.`,
+      label: args.t("All tables approved"),
+      detail: args.t("{approved} of {discovered} tables approved.", {
+        approved: args.tablesApproved,
+        discovered: args.tablesDiscovered,
+      }),
     });
   }
 
@@ -1735,8 +2081,8 @@ function buildScanHistory(args: {
       at: updatedAt,
       kind: "deletion",
       type: "in-progress",
-      label: "Deletion in progress",
-      detail: "The source and all associated data are being removed.",
+      label: args.t("Deletion in progress"),
+      detail: args.t("The source and all associated data are being removed."),
     });
   }
 
@@ -1757,6 +2103,7 @@ interface ScanHistoryTableProps {
 }
 
 const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
+  const { t } = useAppI18n();
   // Real event store: scan + review rows, newest first.
   const { data: scanJobs } = useListSourceScanJobs(
     props.namespaceId,
@@ -1784,6 +2131,7 @@ const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
         status: props.status,
         tablesDiscovered: props.tablesDiscovered,
         tablesApproved: props.tablesApproved,
+        t,
         errorMessage: scanJob?.errorMessage,
         tablesFailed,
       }),
@@ -1795,6 +2143,7 @@ const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
       props.status,
       props.tablesDiscovered,
       props.tablesApproved,
+      t,
       scanJob?.errorMessage,
       tablesFailed,
     ],
@@ -1808,14 +2157,14 @@ const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
       columnDefinitions={[
         {
           id: "at",
-          header: "Time",
+          header: t("Time"),
           isRowHeader: true,
           cell: (e) => formatTimestamp(e.at),
           minWidth: 180,
         },
         {
           id: "status",
-          header: "Status",
+          header: t("Status"),
           cell: (e) => (
             <StatusIndicator type={e.type}>{e.label}</StatusIndicator>
           ),
@@ -1823,24 +2172,24 @@ const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
         },
         {
           id: "trigger",
-          header: "Trigger",
+          header: t("Trigger"),
           cell: (e) => e.trigger ?? "-",
           minWidth: 120,
         },
         {
           id: "detail",
-          header: "Details",
+          header: t("Details"),
           cell: (e) => e.detail,
         },
       ]}
       header={
         <Header variant="h2" counter={`(${events.length})`}>
-          Activity
+          {t("Activity")}
         </Header>
       }
       empty={
         <Box textAlign="center" color="text-status-inactive" padding="l">
-          No activity yet.
+          {t("No activity yet.")}
         </Box>
       }
     />
@@ -1867,6 +2216,7 @@ const RescanScheduleControl: React.FC<RescanScheduleControlProps> = ({
   schedule,
   eventRescan,
 }) => {
+  const { t } = useAppI18n();
   const [enabled, setEnabled] = useState<boolean>(schedule?.enabled ?? false);
   const [expression, setExpression] = useState<string>(
     schedule?.scheduleExpression ?? "rate(1 day)",
@@ -1923,15 +2273,19 @@ const RescanScheduleControl: React.FC<RescanScheduleControlProps> = ({
       header={
         <Header
           variant="h2"
-          description="Automatically re-scan this source on a recurring cadence to pick up upstream schema changes. Unchanged tables keep their enrichment and review status."
+          description={t(
+            "Automatically re-scan this source on a recurring cadence to pick up upstream schema changes. Unchanged tables keep their enrichment and review status.",
+          )}
         >
-          Automatic rescans
+          {t("Automatic rescans")}
         </Header>
       }
     >
       <SpaceBetween size="m">
         {error && <Alert type="error">{error.message}</Alert>}
-        {isSuccess && <Alert type="success">Rescan schedule saved.</Alert>}
+        {isSuccess && (
+          <Alert type="success">{t("Rescan schedule saved.")}</Alert>
+        )}
         <Toggle
           checked={enabled}
           onChange={({ detail }) => {
@@ -1939,13 +2293,15 @@ const RescanScheduleControl: React.FC<RescanScheduleControlProps> = ({
             setDirty(true);
           }}
         >
-          Enable scheduled rescans
+          {t("Enable scheduled rescans")}
         </Toggle>
         {enabled && (
           <>
             <FormField
-              label="Schedule expression"
-              description="EventBridge expression, e.g. rate(1 day) or cron(0 3 * * ? *)."
+              label={t("Schedule expression")}
+              description={t(
+                "EventBridge expression, e.g. rate(1 day) or cron(0 3 * * ? *).",
+              )}
             >
               <Input
                 value={expression}
@@ -1957,8 +2313,10 @@ const RescanScheduleControl: React.FC<RescanScheduleControlProps> = ({
               />
             </FormField>
             <FormField
-              label="Timezone"
-              description="IANA timezone for cron evaluation (e.g. America/New_York)."
+              label={t("Timezone")}
+              description={t(
+                "IANA timezone for cron evaluation (e.g. America/New_York).",
+              )}
             >
               <Input
                 value={timezone}
@@ -1973,18 +2331,23 @@ const RescanScheduleControl: React.FC<RescanScheduleControlProps> = ({
         )}
         <Box>
           <Button variant="primary" loading={isPending} onClick={save}>
-            Save schedule
+            {t("Save schedule")}
           </Button>
         </Box>
         {isGlue && eventError && (
-          <Alert type="error" header="Could not change event-driven rescans">
+          <Alert
+            type="error"
+            header={t("Could not change event-driven rescans")}
+          >
             {eventError.message}
           </Alert>
         )}
         {isGlue && (
           <FormField
-            label="Event-driven rescans"
-            description="Re-scan automatically when this source's Glue Data Catalog changes (new/changed tables). Bursts are coalesced."
+            label={t("Event-driven rescans")}
+            description={t(
+              "Re-scan automatically when this source's Glue Data Catalog changes (new/changed tables). Bursts are coalesced.",
+            )}
           >
             <Toggle
               checked={eventEnabled}
@@ -1994,7 +2357,7 @@ const RescanScheduleControl: React.FC<RescanScheduleControlProps> = ({
                 setEventRescan(detail.checked);
               }}
             >
-              Re-scan on Glue catalog changes
+              {t("Re-scan on Glue catalog changes")}
             </Toggle>
           </FormField>
         )}

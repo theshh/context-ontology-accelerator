@@ -9,11 +9,14 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as ssm from "aws-cdk-lib/aws-ssm";
 import { DockerImageAsset, Platform } from "aws-cdk-lib/aws-ecr-assets";
 import { Construct } from "constructs";
-import { resolveContext } from "../../context";
+import { prefixedLambdaArn, resolveContext } from "../../context";
 import { agentCoreSupportedSubnets } from "../../utils/agentcore-az";
+import { retainAgentCoreSecurityGroup } from "../../utils/agentcore-teardown";
 import { brandEnv } from "../../utils/brand-env";
 import { parseEcrImageUri } from "../../utils/ecr-utils";
 import { Paths } from "../../paths";
+import { METRIC_API_FUNCTION_NAME } from "./metric-service-stack";
+import { ONTOLOGY_API_PROXY_FUNCTION_NAME } from "./ontology-stack";
 import { SCLStack } from "../../constructs";
 
 export interface McpStackProps extends cdk.StackProps {
@@ -58,16 +61,12 @@ export class McpStack extends SCLStack {
       `${ssmPrefix}/serve/runtime-arn`,
     );
 
-    // IdP issuer/client IDs via SSM (avoids a cross-stack export on the auth
-    // stack's UserPool/UserPoolClient/McpClient — see idp-authentication-stack.ts
-    // for the writer).
+    // IdP issuer and MCP client ID via SSM (avoids a cross-stack export on the
+    // auth stack's UserPool/McpClient — see idp-authentication-stack.ts for the
+    // writer).
     const issuerUrl = ssm.StringParameter.valueForStringParameter(
       this,
       `${ssmPrefix}/issuer`,
-    );
-    const clientId = ssm.StringParameter.valueForStringParameter(
-      this,
-      `${ssmPrefix}/userpool-client-id`,
     );
     const mcpClientId = ssm.StringParameter.valueForStringParameter(
       this,
@@ -83,14 +82,18 @@ export class McpStack extends SCLStack {
       `${ssmPrefix}/authentication-group-token-name`,
     );
 
-    // ── Resolve backend Lambda ARNs from SSM (discovery tools) ────────
-    const metricServiceLambdaArn = ssm.StringParameter.valueForStringParameter(
+    // ── Backend Lambda ARNs (discovery tools) ─────────────────────────
+    // Built from the functions' fixed names so this stack needs no dependency on
+    // the metric-service and ontology stacks. Keep it that way: serve and mcp
+    // share one image asset, and CDK makes that publish wait for all of mcp's
+    // dependencies, so an edge here would delay ServeStack too.
+    const metricServiceLambdaArn = prefixedLambdaArn(
       this,
-      `${ssmPrefix}/metric/api-fn-arn`,
+      METRIC_API_FUNCTION_NAME,
     );
-    const ontologyProxyLambdaArn = ssm.StringParameter.valueForStringParameter(
+    const ontologyProxyLambdaArn = prefixedLambdaArn(
       this,
-      `${ssmPrefix}/ontology-engine/api-fn-arn`,
+      ONTOLOGY_API_PROXY_FUNCTION_NAME,
     );
 
     // ── Security Group (minimal: HTTPS only) ──────────────────────────
@@ -99,6 +102,8 @@ export class McpStack extends SCLStack {
       description: "AgentCore Runtime - MCP Server (thin proxy)",
       allowAllOutbound: false,
     });
+    // Its ENIs outlive the runtime by hours; destroy.sh deletes it afterwards.
+    retainAgentCoreSecurityGroup(mcpSg);
 
     // HTTPS to VPC endpoints (AgentCore invocations)
     mcpSg.addEgressRule(
@@ -141,10 +146,13 @@ export class McpStack extends SCLStack {
         bedrockagentcore.RuntimeAuthorizerConfiguration.usingJWT(
           `${issuerUrl}/.well-known/openid-configuration`,
           // allowedClients omitted: AgentCore uses AND semantics, and ID tokens
-          // don't carry client_id. We use allowedAudience (aud claim) instead,
-          // which is present on both ID tokens and works with the CM runtime.
+          // don't carry client_id. We use allowedAudience (aud claim) instead.
+          // Only the MCP client: this must match JWT_CLIENT_ID below, because
+          // the server's own JWT check rejects any other audience. Admitting
+          // more here would let initialize succeed and every tool call fail.
+          // (The serve runtime, which MCP forwards to, accepts both clients.)
           undefined,
-          [clientId, mcpClientId],
+          [mcpClientId],
         ),
       networkConfiguration:
         bedrockagentcore.RuntimeNetworkConfiguration.usingVpc(this, {
@@ -180,7 +188,7 @@ export class McpStack extends SCLStack {
         SCL_MCP_MODE: "true",
         // Independent JWT signature verification in claims.py, as
         // defense-in-depth behind the AgentCore RuntimeAuthorizerConfiguration
-        // below. Same issuer/audience trust anchor, IdP-agnostic (Cognito,
+        // above. Same issuer/audience trust anchor, IdP-agnostic (Cognito,
         // Okta, EntraID, ...) via coa_common.auth.build_token_authorizer.
         // MCP callers authenticate as the MCP/CLI client, so JWT_CLIENT_ID
         // uses mcpClientId (not the web app's clientId).

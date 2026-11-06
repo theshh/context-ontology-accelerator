@@ -4,18 +4,24 @@
 """Unit tests for the Orchestrator — tiered resolution pipeline."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import structlog
+from coa_common.constants import StructuredBackend
 from coa_serve.clients.base import QueryResult
 from coa_serve.exceptions import AccessDeniedError, NoResultError
+from coa_serve.graph_context import encode_supporting_statements
 from coa_serve.models import InvokeRequest, InvokeResponse
 from coa_serve.orchestrator import Orchestrator, TierGating
 from coa_serve.tier1.metric_resolver import MetricMatch
 from coa_serve.tier2.sql_firewall import FirewallResult, SQLFirewall
 from coa_serve.tier2.strategy import StrategyOption, StrategyResult, StructuredQueryTier
+from coa_serve.tier3.agentic.context import AccumulatedContext
+from coa_serve.tier3.agentic.retriever import AgenticRetriever
 from coa_serve.tier3.knowledge_retriever import Tier3Result
+from coa_serve.tier3.vector_retriever import ChunkResult
 from coa_serve.trace import TraceCollector
 
 
@@ -96,6 +102,7 @@ def _make_orchestrator(
 
     mock_strategy = MagicMock()
     mock_strategy.name = StrategyOption.ONTOP
+    mock_strategy.supported_backends = frozenset({StructuredBackend.SQL})
     mock_strategy.resolve = strategy_resolve
     structured_query_tier = StructuredQueryTier(strategies=[mock_strategy])
 
@@ -329,6 +336,47 @@ class TestOntologyVersionTruthfulness:
 
         assert response.result.metadata["mode"] == "deep-reasoning"
         assert response.result.ontology_version is None
+        # #1166 cut #2: mode is ALSO surfaced structurally (not only in free-form
+        # metadata) so the console labels by mode instead of mis-reading tier=3.
+        assert response.result.execution_mode == "deep-reasoning"
+
+    @pytest.mark.asyncio
+    async def test_deep_reasoning_query_artifacts_gated_by_debug_info(self):
+        """#1166 cut #3: Deep Reasoning returns the SQL/SPARQL its agentic loop ran
+        — but only when the caller opts in via options.includeDebugInfo (same gate
+        as Standard mode). Default request withholds them (info-disclosure)."""
+
+        def _make_dr_orch():
+            orch = _make_orchestrator()
+            orch._agentic_retriever = AsyncMock()
+            orch._agentic_retriever.resolve.return_value = Tier3Result(
+                synthesized_answer="Answer from executed queries.",
+                supporting_content=(),
+                graph_context=(),
+                confidence=0.7,
+                trace_steps=(),
+                query_used="SELECT revenue FROM t",
+                sparql_generated="SELECT ?r WHERE { ?x :revenue ?r }",
+            )
+            return orch
+
+        # Opted in → artifacts surfaced.
+        on = await _make_dr_orch().resolve(
+            InvokeRequest(
+                query="q",
+                namespace="demo",
+                options={"mode": "deep-reasoning", "includeDebugInfo": True},
+            )
+        )
+        assert on.result.query_used == "SELECT revenue FROM t"
+        assert on.result.sparql_generated == "SELECT ?r WHERE { ?x :revenue ?r }"
+
+        # Default (no includeDebugInfo) → withheld.
+        off = await _make_dr_orch().resolve(
+            InvokeRequest(query="q", namespace="demo", options={"mode": "deep-reasoning"})
+        )
+        assert off.result.query_used is None
+        assert off.result.sparql_generated is None
 
 
 # ── Tier 1: Metric Resolution ───────────────────────────────────────────
@@ -1078,6 +1126,223 @@ class TestOrchestratorTier3Fallback:
         assert call_kwargs["catalog_summary"] == catalog
 
 
+# ── includeSupporting option ─────────────────────────────────────────────
+
+
+_INCLUDE_SUPPORTING_KEEPS = [{}, {"includeSupporting": True}, {"includeSupporting": None}]
+
+
+def _serialized_result(response: InvokeResponse) -> dict:
+    """The result dict exactly as the handler puts it on the wire (main.py / sse_emitter.py)."""
+    return response.model_dump(by_alias=True, exclude_none=True, mode="json")["result"]
+
+
+def _deep_reasoning_orchestrator() -> Orchestrator:
+    orch = _make_orchestrator()
+    orch._agentic_retriever = AsyncMock()
+    orch._agentic_retriever.resolve.return_value = Tier3Result(
+        synthesized_answer="Combined structured and document evidence answer.",
+        supporting_content=({"chunkId": "a1", "text": "Evidence...", "relevanceScore": 0.8},),
+        graph_context=(),
+        confidence=0.7,
+        trace_steps=(),
+    )
+    return orch
+
+
+@pytest.mark.unit
+class TestIncludeSupporting:
+    """options.includeSupporting=False omits supportingContent from a Tier-3 response.
+
+    Any other value (absent, True, None) keeps the chunks — the documented default.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("options", _INCLUDE_SUPPORTING_KEEPS)
+    async def test_resolve_include_supporting_not_false_returns_chunks(self, options):
+        orch = _make_orchestrator(tier2_success=False)
+        response = await orch.resolve(InvokeRequest(query="Explain the data model", namespace="demo", options=options))
+
+        assert [c["chunkId"] for c in _serialized_result(response)["supportingContent"]] == ["c1"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("options", _INCLUDE_SUPPORTING_KEEPS)
+    async def test_resolve_deep_reasoning_include_supporting_not_false_returns_chunks(self, options):
+        orch = _deep_reasoning_orchestrator()
+        request = InvokeRequest(query="q", namespace="demo", options={"mode": "deep-reasoning", **options})
+        response = await orch.resolve(request)
+
+        assert [c["chunkId"] for c in _serialized_result(response)["supportingContent"]] == ["a1"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_include_supporting_false_omits_field(self):
+        orch = _make_orchestrator(tier2_success=False)
+        request = InvokeRequest(query="Explain the data model", namespace="demo", options={"includeSupporting": False})
+        response = await orch.resolve(request)
+
+        result = _serialized_result(response)
+        assert result["tier"] == 3
+        assert "claims are insurance" in result["synthesizedAnswer"].lower()
+        assert "supportingContent" not in result
+
+    @pytest.mark.asyncio
+    async def test_resolve_deep_reasoning_include_supporting_false_omits_field(self):
+        orch = _deep_reasoning_orchestrator()
+        request = InvokeRequest(
+            query="q", namespace="demo", options={"mode": "deep-reasoning", "includeSupporting": False}
+        )
+        response = await orch.resolve(request)
+
+        result = _serialized_result(response)
+        assert result["metadata"]["mode"] == "deep-reasoning"
+        assert "supportingContent" not in result
+
+
+_CONTRACT_SOURCE_DOC = "aws:tenant:source:document-17"
+_CONTRACT_CHUNK_TEXT = "Claims must be filed within 30 days of the incident."
+_CONTRACT_LEGACY_LABEL = "Legacy display label"
+_CONTRACT_GRAPH_STATEMENT = "A claim filed late is reviewed by the appeals board."
+_CONTRACT_RELATIONSHIP = {
+    "sourceUri": "urn:Claim",
+    "predicateUri": "urn:coveredBy",
+    "targetUri": "urn:Policy",
+    "predicateLabel": "covered by",
+}
+
+
+def _contract_tier3_result() -> Tier3Result:
+    """A Tier3Result whose supportingContent comes from the real #984 mapper.
+
+    ``AgenticRetriever._supporting_content`` applies the document-provenance filter
+    (the graph-only chunk is not a citation) and ``_supporting_content_from_chunk``
+    emits the Smithy fields plus the deprecated ``sourceDoc`` / ``label`` aliases.
+    """
+    document_chunk = ChunkResult(
+        chunk_id="c-contract",
+        text=_CONTRACT_CHUNK_TEXT,
+        source_doc=_CONTRACT_SOURCE_DOC,
+        source_doc_name="policy.pdf",
+        relevance_score=0.81,
+        label=_CONTRACT_LEGACY_LABEL,
+    )
+    graph_only_chunk = ChunkResult(
+        chunk_id="g-statement",
+        text="A graph-only statement.",
+        source_doc="",
+        relevance_score=0.5,
+        uri="urn:Claim",
+    )
+    return Tier3Result(
+        synthesized_answer="Filing deadline answer.",
+        supporting_content=AgenticRetriever._supporting_content(
+            AccumulatedContext(chunks=[document_chunk, graph_only_chunk])
+        ),
+        graph_context=(
+            {
+                "uri": "urn:Claim",
+                "label": "Claim",
+                "type": "owl:Class",
+                "properties": {
+                    "jurisdiction": "EU",
+                    "supportingStatements": encode_supporting_statements([_CONTRACT_GRAPH_STATEMENT]),
+                },
+                "relationships": (_CONTRACT_RELATIONSHIP,),
+            },
+        ),
+        confidence=0.7,
+        trace_steps=(),
+    )
+
+
+def _contract_orchestrator(*, deep_reasoning: bool) -> Orchestrator:
+    orch = _make_orchestrator(tier2_success=False)
+    if deep_reasoning:
+        orch._agentic_retriever = AsyncMock()
+        orch._agentic_retriever.resolve.return_value = _contract_tier3_result()
+    else:
+        orch._knowledge_retriever.resolve.return_value = _contract_tier3_result()
+    return orch
+
+
+def _mode_options(deep_reasoning: bool) -> dict:
+    return {"mode": "deep-reasoning"} if deep_reasoning else {}
+
+
+@pytest.mark.unit
+class TestIncludeSupportingWireContract:
+    """includeSupporting gates the #984 Smithy-shaped supportingContent as a whole.
+
+    The fixtures above carry pre-shaped dicts. These go through the real mapper, so
+    the deprecated aliases are on each item, and through the canonical graph
+    mapping, so the top-level ``relationships`` list is on the response. The graph
+    entity also carries ``supportingStatements``, the graph-only text #984 moved out
+    of ``supportingContent``, which the opt-out has to drop as well.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("deep_reasoning", [False, True], ids=["standard", "deep-reasoning"])
+    async def test_resolve_include_supporting_false_omits_contract_fields_and_aliases(self, deep_reasoning):
+        orch = _contract_orchestrator(deep_reasoning=deep_reasoning)
+        options = {**_mode_options(deep_reasoning), "includeSupporting": False}
+        response = await orch.resolve(InvokeRequest(query="q", namespace="demo", options=options))
+
+        result = _serialized_result(response)
+        assert result["tier"] == 3
+        assert result["synthesizedAnswer"] == "Filing deadline answer."
+        assert "supportingContent" not in result
+        # Neither the Smithy fields nor the deprecated aliases leak anywhere else.
+        wire = json.dumps(result)
+        for leaked in (
+            '"sourceDoc"',
+            '"sourceDocumentId"',
+            '"sourceDocumentName"',
+            '"relevanceScore"',
+            _CONTRACT_SOURCE_DOC,
+            _CONTRACT_CHUNK_TEXT,
+            _CONTRACT_LEGACY_LABEL,
+        ):
+            assert leaked not in wire
+        # The graph statement is retrieved text that was a supportingContent
+        # item before #984, so it goes with the opt-out too.
+        assert _CONTRACT_GRAPH_STATEMENT not in wire
+        assert "supportingStatements" not in wire
+        # The rest of graphContext is not governed by includeSupporting: the
+        # entity, its other properties and the top-level relationships ship.
+        [entity] = result["graphContext"]["entities"]
+        assert entity["properties"] == {"jurisdiction": "EU"}
+        assert result["graphContext"]["relationships"] == [_CONTRACT_RELATIONSHIP]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("deep_reasoning", [False, True], ids=["standard", "deep-reasoning"])
+    @pytest.mark.parametrize("options", _INCLUDE_SUPPORTING_KEEPS)
+    async def test_resolve_include_supporting_not_false_keeps_contract_fields_and_aliases(
+        self, deep_reasoning, options
+    ):
+        orch = _contract_orchestrator(deep_reasoning=deep_reasoning)
+        request = InvokeRequest(query="q", namespace="demo", options={**_mode_options(deep_reasoning), **options})
+        response = await orch.resolve(request)
+
+        result = _serialized_result(response)
+        # Only the document-backed chunk is a citation; the graph-only one is not.
+        assert result["supportingContent"] == [
+            {
+                "chunkId": "c-contract",
+                "text": _CONTRACT_CHUNK_TEXT,
+                "sourceDocumentId": _CONTRACT_SOURCE_DOC,
+                "sourceDocumentName": "policy.pdf",
+                "relevanceScore": 0.81,
+                "sourceDoc": _CONTRACT_SOURCE_DOC,
+                "label": _CONTRACT_LEGACY_LABEL,
+            }
+        ]
+        [entity] = result["graphContext"]["entities"]
+        assert entity["properties"] == {
+            "jurisdiction": "EU",
+            "supportingStatements": encode_supporting_statements([_CONTRACT_GRAPH_STATEMENT]),
+        }
+        assert result["graphContext"]["relationships"] == [_CONTRACT_RELATIONSHIP]
+
+
 # ── startTier option ─────────────────────────────────────────────────────
 
 
@@ -1412,6 +1677,98 @@ def _registry_with_composition(*, has_structured_source, has_unstructured_source
     return registry
 
 
+def _backend_registry(*backends, has_unstructured_source=False):
+    from coa_serve.clients.sources_registry import SourceComposition
+
+    registry = MagicMock()
+    registry.get_source_composition = AsyncMock(
+        return_value=SourceComposition(
+            has_structured_source=bool(backends),
+            has_unstructured_source=has_unstructured_source,
+            structured_backends=frozenset(backends),
+        )
+    )
+    return registry
+
+
+def _spy_tier(orch):
+    """Wrap the structured tier's resolve to capture the backends it is given."""
+    real = orch._structured_query_tier.resolve
+    spy = AsyncMock(side_effect=real)
+    orch._structured_query_tier.resolve = spy
+    return spy
+
+
+@pytest.mark.unit
+@pytest.mark.usefixtures("graph_sources_on")
+class TestStructuredBackendRouting:
+    """Composition → which tiers run and which Tier-2 strategies are eligible."""
+
+    SQL = StructuredBackend.SQL
+    GRAPH = StructuredBackend.RDF_SPARQL
+
+    async def test_graph_only_namespace_skips_tier1_and_selects_graph_strategies(self):
+        orch, parts = _make_orchestrator(
+            metric_found=True, sources_registry=_backend_registry(self.GRAPH), return_parts=True
+        )
+        spy = _spy_tier(orch)
+        await orch.resolve(InvokeRequest(query="q", namespace="ns-graph"))
+        parts["metric_resolver"].match.assert_not_called()
+        assert spy.call_args.kwargs["structured_backends"] == {self.GRAPH}
+
+    async def test_mixed_namespace_keeps_tier1_and_selects_both(self):
+        orch, parts = _make_orchestrator(sources_registry=_backend_registry(self.SQL, self.GRAPH), return_parts=True)
+        spy = _spy_tier(orch)
+        await orch.resolve(InvokeRequest(query="q", namespace="ns-mixed"))
+        parts["metric_resolver"].match.assert_awaited()
+        assert spy.call_args.kwargs["structured_backends"] == {self.SQL, self.GRAPH}
+
+    async def test_a_tier2_pin_on_a_graph_namespace_keeps_the_graph_backend(self):
+        orch = _make_orchestrator(sources_registry=_backend_registry(self.GRAPH))
+        spy = _spy_tier(orch)
+        # The only registered strategy here is a SQL one, so nothing is eligible and
+        # the pinned tier reports "no result" rather than running a SQL strategy.
+        with pytest.raises(NoResultError):
+            await orch.resolve(InvokeRequest(query="q", namespace="ns-graph", options={"tierOverride": 2}))
+        assert spy.call_args.kwargs["structured_backends"] == {self.GRAPH}
+
+    async def test_an_unknown_composition_selects_the_sql_default(self):
+        orch = _make_orchestrator(
+            sources_registry=_registry_with_composition(
+                has_structured_source=True, has_unstructured_source=True, unknown=True
+            )
+        )
+        spy = _spy_tier(orch)
+        await orch.resolve(InvokeRequest(query="q", namespace="ns"))
+        assert spy.call_args.kwargs["structured_backends"] == {self.SQL}
+
+    async def test_a_sparql_answer_names_its_graph_source_and_carries_no_sql(self):
+        orch = _make_orchestrator(sources_registry=_backend_registry(self.GRAPH))
+        orch._structured_query_tier.resolve = AsyncMock(
+            return_value=StrategyResult(
+                sql="",
+                rows=[{"ticket": "t1"}],
+                columns=["ticket"],
+                confidence=0.85,
+                strategy_name=StrategyOption.NL_TO_SPARQL,
+                trace_steps=[],
+                data_source_id="src-g1",
+                row_count=1,
+                sparql="SELECT ?ticket WHERE { ?ticket ?p ?o } LIMIT 10",
+            )
+        )
+        response = await orch.resolve(
+            InvokeRequest(query="q", namespace="ns-graph", options={"includeDebugInfo": True})
+        )
+        result = response.result
+        assert result.tier == 2
+        assert result.query_used is None
+        assert result.sparql_generated.startswith("SELECT ?ticket")
+        assert result.data_sources == ["src-g1"]
+        assert result.metadata["strategy"] == StrategyOption.NL_TO_SPARQL
+        assert result.result_rows == [{"ticket": "t1"}]
+
+
 @pytest.mark.unit
 class TestSourceCompositionGating:
     """Skip inapplicable tiers based on a namespace's source composition.
@@ -1506,9 +1863,25 @@ class TestSourceCompositionGating:
         parts["strategy_resolve"].assert_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("graph_sources_on")
     async def test_explicit_tier_override_bypasses_gating(self):
         """A user tierOverride is intent — gating must not override it. tierOverride=2
-        on a document-only namespace still runs Tier 2 (registry not consulted)."""
+        on a document-only namespace still runs Tier 2. The registry IS read, but only
+        to select strategies by backend; an empty backend set keeps the SQL default."""
+        registry = _registry_with_composition(has_structured_source=False, has_unstructured_source=True)
+        orch, parts = _make_orchestrator(tier2_success=True, sources_registry=registry, return_parts=True)
+        request = InvokeRequest(query="q", namespace="doc-only", options={"tierOverride": 2})
+        response = await orch.resolve(request)
+
+        assert response.result.tier == 2
+        parts["strategy_resolve"].assert_awaited()
+        registry.get_source_composition.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("graph_sources_off")
+    async def test_explicit_tier_override_skips_the_lookup_without_graph_sources(self):
+        """As on main: tierOverride=2 on a document-only namespace still runs Tier 2, and
+        the registry is not consulted (no backend selection to feed)."""
         registry = _registry_with_composition(has_structured_source=False, has_unstructured_source=True)
         orch, parts = _make_orchestrator(tier2_success=True, sources_registry=registry, return_parts=True)
         request = InvokeRequest(query="q", namespace="doc-only", options={"tierOverride": 2})
@@ -1517,6 +1890,31 @@ class TestSourceCompositionGating:
         assert response.result.tier == 2
         parts["strategy_resolve"].assert_awaited()
         registry.get_source_composition.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("graph_sources_off")
+    async def test_graph_only_namespace_skips_tier2_without_graph_sources(self):
+        """Its graph sources answer nothing, so it gates like a namespace with no
+        structured source: no empty Tier-2 pass before Tier 3."""
+        registry = _backend_registry(StructuredBackend.RDF_SPARQL, has_unstructured_source=True)
+        orch, parts = _make_orchestrator(metric_found=True, sources_registry=registry, return_parts=True)
+        spy = _spy_tier(orch)
+        response = await orch.resolve(InvokeRequest(query="q", namespace="ns-graph"))
+
+        assert response.result.tier == 3
+        parts["metric_resolver"].match.assert_not_called()
+        spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("graph_sources_off")
+    async def test_mixed_namespace_selects_only_sql_without_graph_sources(self):
+        registry = _backend_registry(StructuredBackend.SQL, StructuredBackend.RDF_SPARQL)
+        orch, parts = _make_orchestrator(sources_registry=registry, return_parts=True)
+        spy = _spy_tier(orch)
+        await orch.resolve(InvokeRequest(query="q", namespace="ns-mixed"))
+
+        parts["metric_resolver"].match.assert_awaited()
+        assert spy.call_args.kwargs["structured_backends"] == {StructuredBackend.SQL}
 
     @pytest.mark.asyncio
     async def test_no_registry_skips_nothing(self):
@@ -1819,3 +2217,119 @@ class TestRunTier3SeedsEntityUris:
 
         _, kwargs = parts["knowledge_retriever"].resolve.call_args
         assert kwargs["entity_uris"] is None
+
+
+@pytest.mark.unit
+class TestResolveIncludeDebugInfo:
+    """`_resolve_include_debug_info` (#1166): artifacts returned ONLY when the
+    caller opted in (includeDebugInfo) AND holds viewNamespace — the same right
+    that gates the Sources/Tables schema view. Decoupled from the hidden default.
+    """
+
+    _NS = "ns-1166"
+
+    def _orch_with_real_cedar(self, *, fail_open_no_roles=False):
+        from coa_serve.tier2.cedar_authorizer import RealCedarAuthorizer
+
+        orch = _make_orchestrator()
+        assert isinstance(orch, Orchestrator)  # return_parts=False → single orchestrator
+        orch._firewall = SQLFirewall(cedar_authorizer=RealCedarAuthorizer(fail_open_no_roles=fail_open_no_roles))
+        return orch
+
+    def _profile(self, role_ns):
+        return {"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceUID": role_ns}]}
+
+    def test_flag_off_short_circuits_to_false(self):
+        """No opt-in → False without even consulting Cedar (and so no leak)."""
+        orch = self._orch_with_real_cedar()
+        assert orch._resolve_include_debug_info({}, self._NS, self._profile(self._NS)) is False
+        assert orch._resolve_include_debug_info({"includeDebugInfo": False}, self._NS, self._profile(self._NS)) is False
+
+    def test_flag_on_and_can_view_returns_true(self):
+        """Opt-in + viewNamespace on this namespace → artifacts allowed."""
+        orch = self._orch_with_real_cedar()
+        assert orch._resolve_include_debug_info({"includeDebugInfo": True}, self._NS, self._profile(self._NS)) is True
+
+    def test_flag_on_but_cannot_view_returns_false(self):
+        """NEGATIVE CONTROL: opt-in set but principal lacks viewNamespace on this
+        namespace → artifacts STRIPPED. This is the escalation the gate blocks."""
+        orch = self._orch_with_real_cedar()
+        assert (
+            orch._resolve_include_debug_info({"includeDebugInfo": True}, self._NS, self._profile("other-ns")) is False
+        )
+
+    def test_flag_on_no_roles_prod_returns_false(self):
+        """Opt-in + no resolved roles in prod → fail-closed, no artifacts."""
+        orch = self._orch_with_real_cedar(fail_open_no_roles=False)
+        assert orch._resolve_include_debug_info({"includeDebugInfo": True}, self._NS, {"userId": "u"}) is False
+
+    def test_none_options_returns_false(self):
+        orch = self._orch_with_real_cedar()
+        assert orch._resolve_include_debug_info(None, self._NS, self._profile(self._NS)) is False
+
+
+@pytest.mark.unit
+class TestArtifactVisibilityEndToEnd:
+    """End-to-end through ``resolve()`` (orchestrator → firewall → Cedar →
+    assembler → response): the role gate decides whether the assembled response
+    actually carries query_used / sparql_generated (#1166)."""
+
+    def _real_cedar_orch(self):
+        from coa_serve.tier2.cedar_authorizer import RealCedarAuthorizer
+
+        orch = _make_orchestrator(tier2_success=True, tier2_ontop_assembly=True)
+        assert isinstance(orch, Orchestrator)
+        orch._firewall = SQLFirewall(cedar_authorizer=RealCedarAuthorizer(fail_open_no_roles=False))
+        return orch
+
+    @pytest.mark.asyncio
+    async def test_viewnamespace_holder_sees_artifacts(self):
+        """A data-analyst on the namespace (holds query AND viewNamespace) opting
+        in gets the SQL/SPARQL in the assembled response — gate must not
+        over-block a legitimate user who can already see the schema."""
+        orch = self._real_cedar_orch()
+        request = InvokeRequest(
+            query="Show all claims",
+            namespace="demo",
+            options={"tierOverride": 2, "includeDebugInfo": True},
+            profile={"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceUID": "demo"}]},
+        )
+        response = await orch.resolve(request)
+        assert response.result.query_used == "SELECT id FROM claims"
+        assert response.result.sparql_generated == "SELECT ?x WHERE { ?x a :Claim }"
+
+    @pytest.mark.asyncio
+    async def test_artifacts_stripped_when_viewnamespace_denied(self):
+        """NEGATIVE CONTROL end-to-end: a caller admitted to query but WITHOUT
+        viewNamespace (modeled via an authorizer whose two actions diverge) opts
+        in, yet the assembled response omits the artifacts. Proves the gate is
+        enforced at assembly, not merely at the flag."""
+
+        class _QueryButNoViewAuthorizer:
+            """Allows the query admission gate but denies viewNamespace — the
+            exact split the artifact gate must honor independently of query."""
+
+            def authorize(self, **kwargs):
+                from coa_serve.tier2.cedar_authorizer import CedarDecision
+
+                return CedarDecision(allowed=True)
+
+            def can_view_namespace(self, **kwargs):
+                return False
+
+        orch = _make_orchestrator(tier2_success=True, tier2_ontop_assembly=True)
+        assert isinstance(orch, Orchestrator)
+        orch._firewall = SQLFirewall(cedar_authorizer=_QueryButNoViewAuthorizer())
+        request = InvokeRequest(
+            query="Show all claims",
+            namespace="demo",
+            options={"tierOverride": 2, "includeDebugInfo": True},
+            profile={"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceUID": "demo"}]},
+        )
+        response = await orch.resolve(request)
+        # Query succeeded (admitted) ...
+        assert response.result.tier == 2
+        assert response.result.result_rows == [{"id": "1"}]
+        # ... but artifacts are withheld because viewNamespace was denied.
+        assert response.result.query_used is None
+        assert response.result.sparql_generated is None

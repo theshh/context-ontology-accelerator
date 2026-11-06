@@ -41,6 +41,9 @@ export class StorageStack extends SCLStack {
   /** Neptune cluster writer endpoint (host reachable from VPC). */
   public readonly neptuneClusterEndpoint: string;
 
+  /** Neptune cluster identifier: graph-verify refuses this cluster's endpoints as a graph source. */
+  public readonly neptuneClusterIdentifier: string;
+
   /** Neptune Gremlin/SPARQL port. */
   public readonly neptunePort: number;
 
@@ -134,6 +137,10 @@ export class StorageStack extends SCLStack {
 
     this.neptunePort = 8182;
     this.neptuneClusterEndpoint = neptuneCluster.attrEndpoint;
+    this.neptuneClusterIdentifier = neptuneCluster.ref;
+    // Kept whatever the graph-sources switch says: a sources stack deployed from an
+    // earlier version imports it, and this stack is updated first.
+    this.exportValue(neptuneCluster.ref);
 
     // Neptune IAM data-access ARN uses the cluster *resource* ID
     // (e.g. cluster-ABCD1234...), NOT the cluster identifier.
@@ -167,14 +174,14 @@ export class StorageStack extends SCLStack {
     // data migration is needed — re-run ingestion against existing source documents.
     // =====================================================================
 
-    const collectionName = this.prefixed(VECTOR_COLLECTION_SUFFIX);
+    const collectionName = this.aossName(VECTOR_COLLECTION_SUFFIX);
 
     // Encryption policy - required before collection creation
     const encryptionPolicy = new opensearchserverless.CfnSecurityPolicy(
       this,
       "OSSEncryptionPolicy",
       {
-        name: this.prefixed("encryption"),
+        name: this.aossName("encryption"),
         type: "encryption",
         policy: JSON.stringify({
           Rules: [
@@ -188,7 +195,8 @@ export class StorageStack extends SCLStack {
       },
     );
 
-    // Network policy — VPC-only access via standard EC2 Interface Endpoint (NextGen)
+    // Network policy — VPC-only on every stage: only the deployment's AOSS
+    // interface endpoint may reach the collection. No public rule, dev included.
     const networkRules = [
       {
         Rules: [
@@ -205,25 +213,11 @@ export class StorageStack extends SCLStack {
       },
     ];
 
-    // Dev only: allow public access for integration tests run from developer laptops and CICD pipeline.
-    // All other environments (tst, demo, prod) are VPC-only.
-    if (this.envName === "dev") {
-      networkRules.push({
-        Rules: [
-          {
-            ResourceType: "collection",
-            Resource: [`collection/${collectionName}`],
-          },
-        ],
-        AllowFromPublic: true,
-      } as any);
-    }
-
     const networkPolicy = new opensearchserverless.CfnSecurityPolicy(
       this,
       "OSSNetworkPolicy",
       {
-        name: this.prefixed("network"),
+        name: this.aossName("network"),
         type: "network",
         policy: JSON.stringify(networkRules),
       },
@@ -291,7 +285,7 @@ export class StorageStack extends SCLStack {
       this,
       "VectorStoreGroup",
       {
-        name: this.prefixed("vector-store-group"),
+        name: this.aossName("vector-store-group"),
         standbyReplicas: "ENABLED",
         generation: "NEXTGEN",
         capacityLimits: {

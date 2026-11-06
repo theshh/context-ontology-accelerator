@@ -8,12 +8,36 @@ This guide walks you through deploying Context Ontology Accelerator into your AW
 |-------------|---------|---------|
 | AWS Account | — | Target deployment account |
 | AWS CLI v2 | 2.x | Credential management, stack operations |
-| Node.js | 22+ | CDK CLI, web-app build |
+| Node.js | 22.23.4+ | CDK CLI, web-app build |
 | Python | 3.12 | Backend services |
 | pnpm | 10+ | TypeScript package management |
-| uv | 0.4+ | Python package management |
-| Java | 17+ | Smithy code generation |
-| Docker | — | Container image builds |
+| uv | 0.13.4+ | Python package management |
+| Java | 17–24 (21 recommended) | Smithy code generation, Databricks connector build |
+| Maven | 3.6.3+ (`.mise.toml` pins 3.9.16) | Databricks connector build (`make deploy-dev` deploys the connector) |
+| Docker or Finch | — | Container image builds (required) |
+
+The preflight check (`scripts/preflight-deploy.sh`) stops the deploy when the
+Node.js or uv on your `PATH` is older than the minimum above, or when Java is
+outside 17–24. Maven is only needed to build a connector: `make deploy-dev` checks
+it before it starts, and `make deploy-databricks-connector` and
+`make deploy-example-connector` before they build. They stop when Maven is missing, older
+than 3.6.3, or runs on a JDK outside 17–24; `make preflight` and a platform-only
+`./scripts/deploy.sh` don't need Maven. JDK 25+ is not supported yet: the Athena
+Federation SDK the connector bundles fails on it.
+Maven runs on `JAVA_HOME`, which can differ from the `java` on your `PATH`, and
+`brew install maven` runs it on the newest OpenJDK: check `mvn -v`, and if it
+shows Java 25+, point `JAVA_HOME` at JDK 21. `mise install` provides a supported
+JDK and Maven from `.mise.toml`; if another `mvn` comes first on your `PATH`, run
+the deploy through mise, as `mise exec -- make deploy-dev`.
+
+A running container engine is required: the MCP, Ontology, Serve, Sources and
+VKG stacks build container images, and there is no fallback without one. The
+preflight check stops the deploy when it finds no running engine. It uses
+`CDK_DOCKER` when set, otherwise a running Finch, otherwise Docker.
+
+If you know no container image changed since the last deploy, CDK reuses the
+images already in ECR and needs no engine. Set `SCL_ALLOW_NO_CONTAINER_ENGINE=1`
+to deploy without one; any changed image still fails the deploy at build time.
 
 ### Cross-architecture container builds
 
@@ -90,19 +114,23 @@ Context Ontology Accelerator deploys into a single AWS account and region. Ensur
 
 ### Service Quotas
 
-Two account service quotas can block a deploy. The preflight check
-(`scripts/preflight-deploy.sh`) validates both before CDK runs, but on a fresh
+Four account service quotas can block a deploy. The preflight check
+(`scripts/preflight-deploy.sh`) validates all four before CDK runs, but on a fresh
 or sandbox account it is worth confirming them up front:
 
 | Quota | Code | Requirement | If too low |
 |-------|------|-------------|------------|
-| **VPC** (VPCs per Region) | `L-F678F1CE` | Room for one more VPC in the target region | Delete an unused VPC or request an increase |
+| **VPC** (VPCs per Region) | `L-F678F1CE` | Room for one more VPC in the target region. Only checked when the deploy creates a VPC: not on an update of an existing deployment, and not with `SCL_VPC_ID` | Delete an unused VPC or request an increase |
+| **Internet gateways** (per Region) | `L-A4707A72` | Room for one more, for the new VPC's public subnets. Detached gateways count too. Checked when the VPC quota is | Delete an unused Internet gateway or request an increase |
+| **Elastic IPs** (EC2-VPC Elastic IPs) | `L-0263D0A3` | Room for one more, for the new VPC's NAT gateway. Shared with every other Elastic IP in the region, so it can run out before VPCs do. Checked when the VPC quota is | Release an unused Elastic IP or request an increase |
 | **Lambda** (Concurrent executions) | `L-B99A9384` | Enough unreserved headroom to reserve the deployment's Lambda concurrency (default 5 × 2 functions = 10) above Lambda's account-wide minimum of 10 | Request an increase, **or** deploy with `SCL_LAMBDA_RESERVED_CONCURRENCY=0` (see [Lambda reserved concurrency](#lambda-reserved-concurrency)) |
 
 Check them with:
 
 ```bash
 aws ec2 describe-vpcs --query 'length(Vpcs)' --output text
+aws ec2 describe-internet-gateways --query 'length(InternetGateways)' --output text
+aws ec2 describe-addresses --query 'length(Addresses)' --output text
 aws lambda get-account-settings \
   --query 'AccountLimit.[ConcurrentExecutions,UnreservedConcurrentExecutions]'
 ```
@@ -113,7 +141,7 @@ Raising it (`L-B99A9384`) opens an AWS Support case rather than being granted
 immediately, so if you are on a reduced-quota account and want to deploy now,
 disable the reservations with `SCL_LAMBDA_RESERVED_CONCURRENCY=0`.
 
-These two are the only quotas the preflight check validates. Several others —
+These four are the only quotas the preflight check validates. Several others —
 OpenSearch Serverless OCUs, Bedrock per-model invocation limits, Fargate vCPU,
 ENIs, S3 buckets — can still block a deploy on a new or sandbox account. See
 [Appendix A: Quotas to check](#a3-quotas-to-check-before-deploying) for the
@@ -121,7 +149,7 @@ fuller list and why each one matters here.
 
 ### Region Selection
 
-Context Ontology Accelerator defaults to `us-east-1` if no region is set. To deploy to a different region, export `AWS_DEFAULT_REGION` (used by the AWS CLI and preflight checks) **and** `CDK_DEFAULT_REGION` (used by CDK/`bin/app.ts` for AZ resolution and region-specific config) before running any deploy command:
+If no region is set in the environment, Context Ontology Accelerator deploys to the region of your active AWS CLI profile (`aws configure get region`, which honors `AWS_PROFILE`), and to `us-east-1` if the profile has none. The CDK CLI and the deploy, preflight and destroy scripts resolve it the same way. To deploy to a different region, export `AWS_DEFAULT_REGION` (used by the AWS CLI and preflight checks) **and** `CDK_DEFAULT_REGION` (used by CDK/`bin/app.ts` for AZ resolution and region-specific config) before running any deploy command:
 
 ```bash
 export AWS_DEFAULT_REGION=us-west-2
@@ -181,8 +209,8 @@ or the bare in-region model ID. The models to check:
 
 | Model | Used for |
 |-------|----------|
-| Claude Sonnet 4.6 | Induction, grounding |
-| Claude Haiku 4.5 | Rerank, enrichment, document ingestion |
+| Claude Sonnet 4.6 | Induction |
+| Claude Haiku 4.5 | Grounding rerank, enrichment, document ingestion |
 | Claude Sonnet 5 | Serve query resolution (NL-to-SPARQL, synthesis) |
 | Cohere Embed v4 | All embeddings |
 
@@ -203,11 +231,25 @@ exactly as it does today; outside the US the defaults are unusable (see the warn
 
 | Config key | Sets the model for | Default |
 |------------|--------------------|---------|
-| `bedrockLlmModelId` | Serve query LLM (NL-to-SPARQL, synthesis) | `us.anthropic.claude-sonnet-5` |
+| `bedrockLlmModelId` | Serve query LLM (NL-to-SPARQL, synthesis, GraphRAG lexical retrieval) | `us.anthropic.claude-sonnet-5` |
 | `bedrockEmbedModelId` | **All** embeddings — induction, doc-KG-build, metric matching, serve retrieval | `us.cohere.embed-v4:0` |
 | `bedrockEmbedDimensions` | Vector dimension for the embedding model above | `1024` |
-| `bedrockInductionLlmModelId` | Ontology induction, grounding rerank, description generation | `us.anthropic.claude-sonnet-5` |
+| `bedrockInductionLlmModelId` | Ontology induction, description generation | `us.anthropic.claude-sonnet-5` |
 | `bedrockChatModelId` | Source enrichment, constraint inference, document-ingestion extraction | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
+| `bedrockGroundingLlmModelId` | Ontology-engine grounding reranker | *follows `bedrockChatModelId`* |
+
+Grounding rerank is a cheap, high-volume call, so `bedrockGroundingLlmModelId` defaults to
+whatever `bedrockChatModelId` resolves to (a Haiku-class model) rather than the heavier
+induction model. Set it to a region-valid profile id (e.g. a `jp.`/`global.` Haiku) when
+deploying outside the US so the rerank call does not reject the default `us.` profile.
+It feeds the ontology-engine `GROUNDING_LLM_MODEL_ID` environment variable; the
+grounding region follows `LLM_REGION` (the deploy region). Like the other model keys it is
+geography-validated at `cdk synth`.
+
+GraphRAG lexical retrieval calls the model through llama-index's `BedrockConverse`, which accepts only
+the models in its own table (Claude Sonnet 4.6 and Sonnet 5 in the pinned version). If `bedrockLlmModelId`
+names another model, the Tier 3 lexical retrieval strategies fail when they start, while the rest of serve
+keeps working.
 
 Both **geographic inference profiles** (`us.`, `eu.`, `apac.`, `jp.`, `global.`) and **bare in-region model
 IDs** (e.g. `cohere.embed-v4:0`) are accepted — bare IDs matter because some models publish geo
@@ -304,12 +346,12 @@ npx cdk bootstrap aws://<ACCOUNT_ID>/<REGION>
 ```bash
 git clone <repo-url> && cd ontology-accelerator
 
-# Install pinned tool versions (Python 3.12, Java 17, Node 22, pnpm 10.27.0)
+# Install pinned tool versions (Python 3.12, Java 17, Maven, Node.js, pnpm)
 curl https://mise.run | sh
 mise install
 
-# make setup runs smithy-generate.sh (make generate) + setup-dev.sh
-# (uv sync --all-packages, pnpm install, pre-commit hooks)
+# make setup installs the pinned pnpm if it is missing, then runs smithy-generate.sh + setup-dev.sh
+# (uv sync --all-packages, pnpm install --frozen-lockfile, pre-commit hooks)
 make setup
 ```
 
@@ -321,12 +363,17 @@ make setup
 make deploy-dev
 ```
 
-This runs `scripts/deploy.sh` which:
+This checks Maven, which the connector build below needs, and runs `scripts/deploy.sh` which:
 
-1. **Preflight checks** — verifies toolchain versions (Node, Java, pnpm), Docker (including ARM64 emulation on x86_64 hosts), regenerates Smithy artifacts if missing/stale, authenticates to ECR Public, checks VPC quota
+1. **Preflight checks** — verifies toolchain versions (Node.js, uv, Java, pnpm), Docker (including ARM64 emulation on x86_64 hosts), regenerates Smithy artifacts if missing/stale, authenticates to ECR Public, checks that no teardown of the same prefix is still finishing, checks the VPC, Internet gateway and Elastic IP quotas
 2. **Builds all packages** — compiles TypeScript, bundles Lambdas
 3. **Synthesizes CloudFormation** — generates templates from CDK
-4. **Deploys all stacks** — CDK handles ordering via dependency graph
+4. **Deploys all stacks** — CDK handles ordering via the dependency graph, deploying up to three independent stacks at once
+
+`make deploy-dev` then deploys the [Databricks SQL Warehouse connector](#the-databricks-sql-warehouse-connector). On a first deploy it starts as soon as the stacks it reads from exist, alongside the remaining platform stacks.
+
+!!! note "Existing namespaces move to a new VKG image after the deploy"
+    When a deploy changes the VKG container image (for example after `git pull` to a new release), the VKG stack starts a rollout of every existing namespace's VKG service to the new image as its last step. The rollout runs in the background: the deploy does not wait for it, and a namespace whose VKG cannot start (for example because of bad ontology artifacts) does not fail the deploy. Each service is replaced with zero downtime and rolls back on its own if the new task never becomes healthy. A service whose running tasks already have the image the deploy points at is not restarted. This is checked by image digest, so an image tag that is reused for a new build (for example `-latest`) still rolls out; if the digest cannot be read, the service is restarted to be safe. The weekly VKG sweep works the same way.
 
 !!! note "ECR Public authentication is automatic"
     `make deploy-dev` authenticates to ECR Public (`us-east-1`) as part of its preflight checks. No manual `docker login` step is needed.
@@ -335,38 +382,45 @@ This runs `scripts/deploy.sh` which:
 
 ### Stacks Deployed
 
+Each stack is named `<prefix>-<env>-<name>`, where `<prefix>` is `SCL_PREFIX` (default `coa`)
+and `<env>` is the environment (`make deploy-dev` uses `dev`). With the defaults, the auth stack is
+`coa-dev-auth`.
+
 | Stack | Purpose |
 |-------|---------|
-| `coa-dev-network` | VPC, subnets, security groups |
-| `coa-dev-auth` | Cognito User Pool, OIDC configuration |
-| `coa-dev-guardrail` | Bedrock guardrails |
-| `coa-dev-storage` | Neptune (graph DB), OpenSearch Serverless |
-| `coa-dev-authnz` | DynamoDB tables for roles, grants, Cedar policies |
-| `coa-dev-vkg` | Virtual Knowledge Graph (Ontop) |
-| `coa-dev-namespace` | Namespace service (SMUS domain) |
-| `coa-dev-metric-service` | Metric authoring and validation |
-| `coa-dev-api` | API Gateway (routes, authorizer) |
-| `coa-dev-serve` | Context Manager (query orchestration) |
-| `coa-dev-sources` | Data source ingestion (Glue, JDBC) |
-| `coa-dev-data-layer` | REST API for queries |
-| `coa-dev-edge-waf` | CloudFront WAF WebACL (us-east-1, auto-created unless an existing ARN is supplied) |
-| `coa-dev-web` | CloudFront + S3 (React frontend) |
-| `coa-dev-ontology` | Ontology engine (induction, reasoning) |
-| `coa-dev-mcp` | MCP Server on AgentCore Runtime |
+| `<prefix>-<env>-network` | VPC, subnets, security groups |
+| `<prefix>-<env>-eni-warm` | Never-invoked Lambda functions that pre-create the VPC network interfaces the service stacks' Lambdas share (see below) |
+| `<prefix>-<env>-auth` | Cognito User Pool, OIDC configuration |
+| `<prefix>-<env>-guardrail` | Bedrock guardrails |
+| `<prefix>-<env>-storage` | Neptune (graph DB), OpenSearch Serverless |
+| `<prefix>-<env>-authnz` | DynamoDB tables for roles, grants, Cedar policies, and `clientToken` retry records (on-demand billing, 24-hour TTL; if the retry table is unreachable, creates that carry a `clientToken` return `503`) |
+| `<prefix>-<env>-vkg` | Virtual Knowledge Graph (Ontop) |
+| `<prefix>-<env>-namespace` | Namespace service (SMUS domain) |
+| `<prefix>-<env>-metric-service` | Metric authoring and validation |
+| `<prefix>-<env>-api` | API Gateway (routes, authorizer) |
+| `<prefix>-<env>-serve` | Context Manager (query orchestration) |
+| `<prefix>-<env>-sources` | Data source ingestion (Glue, JDBC) |
+| `<prefix>-<env>-data-layer` | REST API for queries |
+| `<prefix>-<env>-edge-waf` | CloudFront WAF WebACL (us-east-1, auto-created unless an existing ARN is supplied) |
+| `<prefix>-<env>-web` | CloudFront + S3 (React frontend) |
+| `<prefix>-<env>-ontology` | Ontology engine (induction, reasoning) |
+| `<prefix>-<env>-mcp` | MCP Server on AgentCore Runtime |
 
-Total fresh deploy: **~1.5 hours** for CDK/CloudFormation provisioning of all 16 stacks, once dependencies are installed and Smithy artifacts are generated. Neptune and OpenSearch Serverless provisioning, AgentCore Runtime setup, and cross-stack SSM dependency waits account for most of that time — individual stacks vary widely and several run in parallel, so a per-stack breakdown understates the real end-to-end wall-clock time. CDK resolves the deploy order automatically from the dependency graph declared in `bin/app.ts` — you don't need to deploy stacks individually or in this order by hand.
+Total fresh deploy: **about 40 minutes** for `make deploy-dev` to provision all 17 stacks and the connector, once dependencies are installed and Smithy artifacts are generated (measured from a laptop deploying to `us-east-1`; image build and push time depend on your machine and uplink). Running `cdk deploy --all` directly, without `--concurrency`, deploys one stack at a time and takes about 1.5 hours. Most of the time is spent along one chain of dependent stacks — network → storage (Neptune) → vkg → namespace (DataZone) → serve (AgentCore Runtime) → data-layer → api → web (CloudFront) — while the other stacks deploy alongside it. If a deploy appears stuck, check `aws cloudformation list-stacks` before intervening: it is usually waiting on the Neptune instance, the AgentCore Runtime or the CloudFront distribution.
+
+**Why `<prefix>-<env>-eni-warm` exists.** A Lambda function in a VPC reaches it through a [Hyperplane ENI](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html#configuration-vpc-enis), which Lambda shares between all functions with the same subnets and security groups. The first function to use a new combination waits about four minutes for that interface to be created; later ones take seconds. The platform's VPC Lambdas therefore share a small set of security groups, and `<prefix>-<env>-eni-warm` creates one never-invoked function per combination early in the deploy. That only saves time because the warm-up runs while the storage stack is still creating Neptune, which the service stacks wait for anyway. CDK resolves the deploy order automatically from the dependency graph declared in `bin/app.ts` — you don't need to deploy stacks individually or in this order by hand.
 
 !!! warning "First-time setup adds significant time"
-    The ~1.5 hour figure above is CDK/CloudFormation provisioning time only. On a fresh machine or first-time deploy, budget additional time on top of that for: installing `mise`-managed toolchains, `uv sync`/`pnpm install`, Smithy/Gradle codegen (`make generate` — first run downloads Gradle wrappers, openapi-generator, and builds TypeScript clients from scratch), Docker image builds, and CDK bootstrap. Subsequent deploys after initial setup are faster since dependencies and generated artifacts are cached, though CloudFormation provisioning time for a fresh set of stacks remains similar.
+    The deploy time above is CDK/CloudFormation provisioning time only. On a fresh machine or first-time deploy, budget additional time on top of that for: installing `mise`-managed toolchains, `uv sync`/`pnpm install`, Smithy/Gradle codegen (`make generate` — first run downloads Gradle wrappers, openapi-generator, and builds TypeScript clients from scratch), Docker image builds, and CDK bootstrap. Subsequent deploys after initial setup are faster since dependencies and generated artifacts are cached, though CloudFormation provisioning time for a fresh set of stacks remains similar.
 
 ### The Databricks SQL Warehouse connector
 
-`DATABRICKS_SQL_WAREHOUSE` sources are served by **one connector Lambda that Context Ontology Accelerator operates**, deployed from its own CDK app rather than as one of the 16 stacks above. It is not optional and it is not per source: **a `DATABRICKS_SQL_WAREHOUSE` source cannot be registered at all until it exists.** Source creation resolves the connector's function ARN from an SSM parameter the connector's own stack publishes, and fails the create with a `400` naming the missing connector if that parameter is absent — so a deployment that skips this step advertises a source sub-type nothing can serve, and the first person to hit it is whoever tries to onboard a warehouse.
+`DATABRICKS_SQL_WAREHOUSE` sources are served by **one connector Lambda that Context Ontology Accelerator operates**, deployed from its own CDK app rather than as one of the 17 stacks above. It is not optional and it is not per source: **a `DATABRICKS_SQL_WAREHOUSE` source cannot be registered at all until it exists.** Source creation resolves the connector's function ARN from an SSM parameter the connector's own stack publishes, and fails the create with a `400` naming the missing connector if that parameter is absent — so a deployment that skips this step advertises a source sub-type nothing can serve, and the first person to hit it is whoever tries to onboard a warehouse.
 
-`make deploy-dev` deploys it for you, as a second step after the platform stacks:
+`make deploy-dev` deploys it for you. On a first deploy it starts once the platform stacks it reads from (network, serve and sources) are complete, and runs alongside the rest of the platform deploy. When the platform is already deployed, it runs after the platform update, as a second step:
 
 ```bash
-make deploy-dev          # platform stacks, then the connector
+make deploy-dev          # platform stacks and the connector
 ```
 
 To deploy or redeploy just the connector against an already-deployed environment:
@@ -375,9 +429,9 @@ To deploy or redeploy just the connector against an already-deployed environment
 make deploy-databricks-connector
 ```
 
-Both run `scripts/deploy-managed-databricks-connector.sh`, which installs the `connectors/` workspace, builds the connector's fat JAR with Maven, and deploys its stack.
+Both run `scripts/deploy-managed-databricks-connector.sh`, which checks Maven, installs the `connectors/` workspace, builds the connector's fat JAR with Maven, and deploys its stack.
 
-!!! important "The order is platform first, then connector — and it cannot be reversed"
+!!! important "The connector needs the platform's network, serve and sources stacks first — and the order cannot be reversed"
     The two deployments each read something the other publishes, in one direction only:
 
     - The connector's stack **reads Context Ontology Accelerator's serve and discovery role ARNs from SSM** (`/<prefix>/<env>/serve/runtime-role-arn` and `/<prefix>/<env>/sources/db-connector-role-arn`) to grant them `lambda:InvokeFunction`, spill-bucket reads and `kms:Decrypt` on its spill key. Those parameters are written by the platform stacks, so the connector cannot synthesize before they exist.
@@ -413,8 +467,27 @@ Override defaults via environment variables:
 # Custom resource prefix (default: coa)
 SCL_PREFIX=myproject make deploy-dev
 
-# Use an existing VPC
-SCL_VPC_ID=vpc-abc123 make deploy-dev
+# Use an existing VPC and its OpenSearch Serverless aoss-data endpoint (see below)
+SCL_VPC_ID=vpc-abc123 SCL_AOSS_VPC_ENDPOINT_ID=vpce-0123456789abcdef0 make deploy-dev
+
+# Stacks CloudFormation deploys in parallel (default: 3); 1 deploys one stack at a time
+SCL_CDK_CONCURRENCY=1 make deploy-dev
+# Create the VPC on a different CIDR (default 10.0.0.0/16) — e.g. to avoid
+# overlapping a network you peer with. Must be /16–/22 (two /24 subnets per AZ)
+# and must not overlap jdbc_peer_cidrs / jdbc_tgw_cidrs. Not combinable with
+# SCL_VPC_ID.
+SCL_VPC_CIDR=10.40.0.0/16 make deploy-dev
+
+# Container images built in parallel (default: 1). Each parallel build needs its
+# own memory; raise it only if the container engine has memory to spare (on
+# macOS that is the Docker Desktop or Finch VM limit, not the Mac's own memory)
+# With Finch on macOS, parallel builds can race on docker login in the keychain
+# credential helper (error -25299); if they do, set this back to 1
+SCL_ASSET_BUILD_CONCURRENCY=2 make deploy-dev
+
+# Turn on graph (RDF_SPARQL) sources (off by default). Pass it on every deploy —
+# a deploy without it turns graph sources off again. See "Graph sources" below.
+SCL_GRAPH_SOURCES=on make deploy-dev
 
 # SMUS admin principal(s) — override the account's `Admin` role fallback.
 # Comma-separated IAM role/user ARN(s) that human admins federate into to
@@ -434,13 +507,53 @@ SCL_API_DOMAIN=api.ontology.example.com \
 SCL_API_CERT_ARN=arn:aws:acm:us-west-2:123456789012:certificate/api-cert-id \
 SCL_HOSTED_ZONE_ID=Z0123456789ABCDEFGHIJ \
 make deploy-dev
+
+# OpenSearch Serverless capacity floor and ceiling in OCU (default 2 / 96; 0 scales
+# to zero when idle). Not stored: set it on every deploy. See
+# "OpenSearch Serverless (OCU) capacity configuration" below
+SCL_AOSS_MIN_OCU=0 make deploy-dev
+SCL_AOSS_MAX_OCU=32 make deploy-dev
+
+# Optional OoPS! ontology pitfall scan (off by default) — see the note below
+SCL_OOPS_ENDPOINT=https://oops.example.internal/rest make deploy-dev
 ```
+
+!!! warning "The OoPS! pitfall scan sends your ontology to the endpoint you configure"
+    Tier-3 ontology validation can run the OoPS! (OntOlogy Pitfall Scanner)
+    pitfall scanner. To do so it POSTs the whole serialised ontology to the configured endpoint:
+    class and property names, labels, comments, and other literal values such as
+    sampled distinct values. It is therefore **off by default** — with no endpoint
+    configured, validation makes no outbound request and reports one `info` finding,
+    `OOPS_NOT_CONFIGURED`, while the rest of Tier 3 runs as usual.
+
+    To enable it, set `SCL_OOPS_ENDPOINT` (or pass `-c oops_endpoint=<url>` to
+    `cdk deploy`); the deploy sets `OOPS_ENDPOINT` on the ontology-engine container.
+    The value must be an `https://` URL (synth fails otherwise). Point it at a
+    self-hosted OoPS! instance unless you are content for your schema to leave your
+    network. Releases before this one defaulted to the public OoPS! service;
+    deployments that relied on that must now set the endpoint explicitly.
 
 !!! note "Custom domain certificate regions"
     `SCL_UI_CERT_ARN` must be an ACM certificate in `us-east-1` (CloudFront requirement) regardless of your deploy region. `SCL_API_CERT_ARN` must be in the same region you're deploying to (API Gateway requirement). CDK validates both at synth time and fails fast with a clear error if either is in the wrong region.
 
+!!! warning "Set `SCL_VPC_CIDR` only on a new deployment"
+    Changing (or adding) it on an existing deployment makes CloudFormation **replace the VPC** and everything in it — Neptune, the OpenSearch endpoints, Lambdas and the AgentCore runtime — which is a full rebuild with data loss. Leave it unset to keep the default `10.0.0.0/16`. The integration-test and demo database stacks (`tests/cdk`) admit `10.0.0.0/16` by default; deploy them with `peer_cidrs=<your CIDR>` to match.
+
 !!! warning "Multi-region deployments"
     S3 buckets and IAM roles are globally scoped, not region-isolated. Deploying the same `SCL_PREFIX` + `env` to a second region **will collide** with an existing deployment. Use a distinct `SCL_PREFIX` per region (e.g., `coa-w2` for `us-west-2`) — do not rely on region alone to disambiguate.
+
+#### Deploying into an existing VPC
+
+With `SCL_VPC_ID`, COA looks up your VPC and creates no VPC endpoints, NAT gateway or routes in it. The VPC must already provide them.
+
+- **OpenSearch Serverless endpoint (required).** Pass the ID of the VPC's `com.amazonaws.<region>.aoss-data` interface endpoint as `SCL_AOSS_VPC_ENDPOINT_ID` (CDK context `aoss_vpc_endpoint_id`). The collection's network policy allows only this endpoint, so the deploy stops at synth if it is missing, and the preflight stops the deploy unless the endpoint is an available `aoss-data` endpoint in `SCL_VPC_ID` with private DNS enabled. The endpoint needs:
+    - private DNS enabled;
+    - a security group that allows HTTPS (TCP 443) from the CIDRs of the private subnets COA uses. If those subnets are on a secondary VPC CIDR, allowing only the primary CIDR is not enough. COA's own security groups don't exist until the first deploy, so they can't be referenced beforehand.
+- **Other AWS services.** ECS tasks, Lambda functions and the AgentCore Runtimes call S3, DynamoDB, Bedrock, Bedrock AgentCore, ECR, CloudWatch Logs, STS, SSM, Secrets Manager, SQS, Step Functions, EventBridge, Glue, Athena, Lambda, ECS, DataZone, Neptune Analytics and the OpenSearch Serverless control plane (`aoss`). Provide a NAT route from the private subnets, or a VPC endpoint for each of them.
+- **Availability Zones.** In a VPC COA creates, it pins subnets to Availability Zones that AgentCore Runtime supports. An imported VPC is not checked: put its private subnets in supported zones, or the AgentCore Runtime deploy fails with "subnets in unsupported availability zones".
+- **Database connectivity.** COA provisions no peering, Transit Gateway or PrivateLink in an imported VPC; see [Cross-network connectivity](cross-network-connectivity.md).
+
+Pass the same two variables to `make destroy-dev`.
 
 #### Tier-1 metric execution timeout
 
@@ -481,7 +594,7 @@ The value is minutes and must be a positive number; CDK fails synth otherwise. O
 
 #### Neptune instance class
 
-The knowledge-graph store is a single provisioned Neptune instance. It defaults to **`db.r8g.large`** (2 vCPU / 16 GiB) — the smaller Graviton class that keeps a first-time or single-tenant deploy's cost down. Neptune sizing is driven by **query concurrency × per-query cost, not graph size**: it allocates two query threads per vCPU, so `large` serves four concurrent SPARQL queries. A `db.r8g.large` runs about **$174/month** on-demand; each step up (`xlarge`, `2xlarge`) doubles both the instance and the price.
+The knowledge-graph store is a single provisioned Neptune instance. It defaults to **`db.r8g.large`** (2 vCPU / 16 GiB) — the smaller Graviton class that keeps a first-time or single-tenant deploy's cost down. Neptune sizing is driven by **query concurrency × per-query cost, not graph size**: it allocates two query threads per vCPU, so `large` serves four concurrent SPARQL queries. A `db.r8g.large` runs about **$200/month** on-demand in us-east-1; each step up (`xlarge`, `2xlarge`) doubles both the instance and the price.
 
 ```bash
 # Deploy dev Neptune on the larger class (default is db.r8g.large)
@@ -536,7 +649,67 @@ The gather loop is also bounded by **step** caps, not just the time budget, and 
 - `DEEP_REASONING_MAX_NO_PROGRESS_STEPS` (default **2**) — consecutive no-progress steps tolerated before the loop stops with `no_new_information`. Lowered from 3 so a wandering loop stops quickly. `1` restores stop-on-first-miss.
 - `DEEP_REASONING_ONTOLOGY_TIMEOUT_S` (default **6**, floored at 1) — a fast-fail cap on a single graph-backed ontology lookup. The lookup is one preparatory step, so it must not swallow a large slice of the gather budget when Neptune is slow: the underlying graph client's own read-timeout × retry can otherwise stack to ~16 s per lookup. On timeout the ontology degrades to empty (the soft-prior traversal still runs) rather than starving the step budget. Raise it only if ontology lookups legitimately need longer on a very large namespace; it cannot be disabled.
 
+`MAX_NO_PROGRESS_STEPS` counts only steps that gather nothing new. It is separate from the answer-stability signal described in [Deep-reasoning stop signals](#deep-reasoning-stop-signals) below.
+
 Raise `MAX_STEPS` back toward 10 only if deep-reasoning accuracy demonstrably climbs with more steps on your workload — otherwise fewer steps is both faster and no less accurate.
+
+#### Deep-reasoning stop signals
+
+Four optional settings let the gather loop stop on two extra signals: how sure
+the model is that it has enough, and whether its working answer has stopped
+changing. All four are off by default, so a deploy that leaves them unset
+behaves as before. [Deep-reasoning stop signals](serve.md#deep-reasoning-stop-signals)
+in the Serve guide describes what each one does to the loop.
+
+| Runtime variable | CDK context key | `make deploy-dev` variable | Default | Range |
+| --- | --- | --- | --- | --- |
+| `DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE` | `deep_reasoning_sufficiency_min_confidence` | `SCL_DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE` | `0.0` (off) | float 0.0–1.0 |
+| `DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD` | `deep_reasoning_progress_similarity_threshold` | `SCL_DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD` | `0.0` (off) | float 0.0–1.0 |
+| `DEEP_REASONING_STABILITY_STEPS` | `deep_reasoning_stability_steps` | `SCL_DEEP_REASONING_STABILITY_STEPS` | `2` | int 1–20 |
+| `DEEP_REASONING_STOP_TELEMETRY` | `deep_reasoning_stop_telemetry` | `SCL_DEEP_REASONING_STOP_TELEMETRY` | `false` | `true/1/yes/on` or `false/0/no/off` |
+
+- **Minimum confidence.** The loop accepts a "sufficient" verdict only when the
+  model's confidence (0.0–1.0) is at least this value. A missing or malformed
+  confidence counts as below the threshold, so the fail-safe is more retrieval,
+  never an early stop. At `0.0` the verdict alone decides.
+- **Similarity threshold and stability steps.** When the threshold is above
+  `0.0`, each working answer is embedded with the request's existing embedding
+  backend and compared by cosine to the previous compared one. The loop stops
+  once `STABILITY_STEPS` compared answers in a row reach the threshold. With
+  `singleCallSteps`, an answer is compared only when the gathered context has
+  grown since the last comparison. Typical thresholds are 0.9–0.97.
+- **Telemetry.** Records a `stop_signals` trace step (and a
+  `deep_reasoning_stop_signals` log line) for each model reply that carries the
+  signals and for the prefetch decision, so you can pick thresholds from real
+  traffic before turning them on. It is also recorded whenever either threshold
+  is above `0.0`. Telemetry never stops or holds back the loop, but it does
+  embed working answers so it can record their cosine: one extra Bedrock embed
+  call per compared reply, whose time counts against the loop's time budget.
+
+Setting either threshold above `0.0`, or turning telemetry on, also asks the
+model for a confidence with each reply, which changes the prompt. Compare
+accuracy and latency before and after.
+
+Set them with `make deploy-dev`:
+
+```bash
+# Require >=0.7 confidence before the loop may stop early
+SCL_DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE=0.7 make deploy-dev
+
+# Record stop-signal telemetry only, with both thresholds still off
+SCL_DEEP_REASONING_STOP_TELEMETRY=true make deploy-dev
+```
+
+For a direct CDK deployment, pass the context key, for example
+`--context deep_reasoning_sufficiency_min_confidence=0.7`, or set it in
+`infra/cdk.json`. The serve stack passes each key to the runtime as the
+variable in the table. These four are read only under their `DEEP_REASONING_*`
+names; there is no `AGENTIC_*` alias for them.
+
+Serve reads the values once, when the runtime starts. A malformed or
+out-of-range value logs a warning and falls back to the default. Changing a
+value is an AgentCore runtime update: redeploy the serve stack, after which new
+sessions start with the new values.
 
 #### NL→SPARQL translation budget
 
@@ -558,7 +731,7 @@ Three further ceilings sit above this knob and it cannot raise any of them: `res
 
 #### Lambda reserved concurrency
 
-Two Lambdas — the VKG reloader and the document preprocessor — reserve concurrent executions (default **5** each) to bound their blast radius. On an account whose **Lambda concurrent-executions quota** (`L-B99A9384`) is at the reduced default of **10** — which AWS applies to some new accounts — reserving *any* concurrency is rejected, because it would drop unreserved capacity below Lambda's account-wide minimum of 10. The deploy runs for ~30 minutes and then fails and rolls back on `coa-dev-vkg` (and `coa-dev-sources` after it) with:
+Two Lambdas — the VKG reloader and the document preprocessor — reserve concurrent executions (default **5** each) to bound their blast radius. On an account whose **Lambda concurrent-executions quota** (`L-B99A9384`) is at the reduced default of **10** — which AWS applies to some new accounts — reserving *any* concurrency is rejected, because it would drop unreserved capacity below Lambda's account-wide minimum of 10. The deploy runs for ~30 minutes and then fails and rolls back on `<prefix>-<env>-vkg` (and `<prefix>-<env>-sources` after it) with:
 
 ```
 Specified ReservedConcurrentExecutions for function decreases account's
@@ -573,6 +746,33 @@ SCL_LAMBDA_RESERVED_CONCURRENCY=0 make deploy-dev
 ```
 
 The value must be a non-negative integer; CDK fails synth otherwise. `0` (or unset via context) omits the reservation entirely — the functions then draw from the shared unreserved pool with no dedicated guarantee or cap, which is fine for a single-tenant evaluation. On a direct `cdk deploy`, pass it as context instead — `--context lambda_reserved_concurrency=0`, or set it in the `context` block of `infra/cdk.json`.
+
+#### Guardrail safeguard tier
+
+Both Bedrock guardrails (`<prefix>-<env>-guardrail` for user queries and `<prefix>-<env>-retrieval-guardrail` for ingested documents and retrieved chunks) run on the **Classic** tier by default. Classic content filters support English, French and Spanish only, so prompt injection written in another language, Japanese for example, is not detected. The same limit applies to the denied topics. The "System internals disclosure" topic, which blocks requests for the assistant's system prompt, screens requests only, and on Classic neither it nor the prompt-attack filter supports Japanese, so a request for the prompt written in Japanese is not reliably blocked. If your users or documents are in another language, switch both guardrails to the **Standard** tier, which has [broader language support](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-tiers.html). For a deployment whose namespaces are in Japanese, we recommend Standard.
+
+The Standard tier requires cross-Region inference through a system-defined guardrail profile, so the text a guardrail screens can be processed in any destination Region of that profile, not only the deployment Region. Pick the profile for your geography (for example `us.guardrail.v1:0`, `eu.guardrail.v1:0`, `apac.guardrail.v1:0`) and check its [destination Regions](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-cross-region-support.html) against your data-residency requirements before you enable it. From `ap-northeast-1`, for example, `apac.guardrail.v1:0` can route to `ap-northeast-2`, `ap-northeast-3`, `ap-south-1`, `ap-southeast-1` and `ap-southeast-2`.
+
+On an existing deployment, switch in two deploys. The guardrail stack deploys before the stacks whose roles call it, so going straight to Standard leaves those roles without permission on the profile until their stacks update, and every guarded call in between fails with `AccessDeniedException`:
+
+```bash
+# 1. Grant the callers' IAM on the profile; the guardrails stay Classic
+SCL_GUARDRAIL_PROFILE=apac.guardrail.v1:0 make deploy-dev
+# 2. Switch both guardrails to Standard
+SCL_GUARDRAIL_TIER=standard SCL_GUARDRAIL_PROFILE=apac.guardrail.v1:0 make deploy-dev
+```
+
+A new deployment can go straight to step 2. CDK fails synth on `guardrail_tier=standard` without a profile and on a value that is not a profile id. On a direct `cdk deploy`, pass `--context guardrail_tier=standard --context guardrail_profile=<profile id>`. To go back to Classic, deploy without `SCL_GUARDRAIL_TIER`; keep `SCL_GUARDRAIL_PROFILE` for that deploy so the roles keep the permission until the guardrails have changed.
+
+Changing the tier updates the existing guardrails in place, and their IDs stay the same. The filter strengths are the same on both tiers, but they were tuned on Classic; the Standard tier can block text that Classic allowed, so watch the [block rate](#guardrail-observability) after you switch.
+
+#### PII masking in questions
+
+The user-query guardrail (`coa-dev-guardrail`) anonymizes names, email addresses, phone numbers, US Social Security numbers and card numbers on both the question and the answer, so personal data is masked in what the model reads and returns. The retrieval guardrail does not, because named entities are what ingested documents are about.
+
+The trade-off is answer quality: the guardrail cannot tell a person's name from a title, a customer or a product, and in a text-to-SQL question those values are the filter. The NL-to-SQL strategy refuses to run SQL that filters on a masked placeholder (see [Tier 2](serve.md#tier-2--structured-query-nl-to-sql)), so it does not return a confident wrong number for such a question, but the question is not answered from the tables. The VKG (Ontop) strategy and Deep Reasoning do not yet apply this check.
+
+For benchmarking only, a non-production deployment can make serve ignore both guardrails with `npx cdk deploy <prefix>-dev-serve --exclusively -c serve_guardrails_disabled=true`. This also removes the prompt-attack and denied-topic filters from serve, so it is refused in `env=prod`, and serve logs `guardrails_disabled_by_configuration` at ERROR on every cold start. There is no per-request or per-entity switch.
 
 #### Tier-2 NL→SQL ontology foreign-key expansion
 
@@ -594,6 +794,62 @@ SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES=12 make deploy-dev
 Leaving either setting unset leaves the runtime's default in charge; the stack only sets the Serve runtime variable (`SERVE_NL2SQL_GRAPH_EXPAND` / `SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES`) when you pass a value. Changing either one is a stack update, not an image rebuild. A single request can also override the deployment setting with `options.flatGraphExpand` (`true` or `false`). An A/B test that compares the expansion on and off must pass `flatGraphExpand: false` for the "off" arm; leaving the option out now means on.
 
 `scripts/deploy.sh` maps the variables above to the CDK context parameters `serve_nl2sql_graph_expand` and `serve_nl2sql_graph_expand_max_tables`. On a direct `cdk deploy`, pass them as context instead — `--context serve_nl2sql_graph_expand=false` — or set them in the `context` block of `infra/cdk.json`.
+
+#### Deep Reasoning default options
+
+A Deep Reasoning request that leaves an option unset gets the recommended value
+(see [Deep Reasoning request options](serve.md#deep-reasoning-request-options)).
+A request on the streaming endpoint can turn any option off itself; a REST
+`Query` carries no per-request options, so for REST callers the deployment
+setting is the only switch. To put every option back to off for the whole
+deployment, pass the CDK context parameter:
+
+```bash
+cdk deploy <prefix>-dev-serve --context serve_deep_reasoning_default_options=off
+```
+
+The stack then sets `DEEP_REASONING_DEFAULT_OPTIONS` on the Serve runtime; `off`,
+`false`, `0` and `no` all switch the defaults off.
+Left unset, the variable is not set and the recommended options apply. Changing
+it is a stack update, not an image rebuild.
+
+#### Graph sources
+
+Graph sources (`RDF_SPARQL`, an Amazon Neptune cluster registered as a source; see the [Sources Guide](sources.md#registering-an-rdfsparql-graph-source)) are **off by default**. One switch turns on the whole feature:
+
+```bash
+SCL_GRAPH_SOURCES=on make deploy-dev
+```
+
+- **`graph_sources`**: `on`/`true`/`1`/`yes` turns it on. Any other value, or leaving it unset, leaves it off.
+- **What it turns on:**
+  - the graph-verify pipeline (a queue, its dead-letter queue, a Lambda and their alarms);
+  - the SPARQL egress rules;
+  - the Neptune read grants for source clusters;
+  - the native NL→SPARQL Tier-2 strategy;
+  - the "Graph database (SPARQL)" option in Connect Source.
+- **While it is off:**
+  - The Sources API refuses to register or re-verify a graph source with a 400 that names the switch.
+  - An ontology import that binds a class to a graph source (`coa_import:dataSourceName`) is refused with a 422.
+  - An R2RML import first reads Neptune to check that no class it maps is bound to a graph source. If that read fails, the import fails (a 502 on a direct upload, a failed job for `ingest-from-s3`; logged as `ontology_backend_lookup_failed`) instead of risking a class with two backends; retry it.
+  - The console does not offer graph sources.
+  - The REST `/query` API rejects `strategy=nl_to_sparql` with a 400, as it did before graph sources existed; streaming and MCP requests run the default chain.
+  - None of the graph resources above are deployed.
+  - One security group with no ingress and only a disallow-all egress placeholder, and two stack exports, stay deployed so the switch can be turned on and off again in a single deploy. They allow no traffic and cost nothing.
+- **Pass it on every deploy.** A later deploy without it turns graph sources off again.
+- **Turning it off after it was on:**
+  - Existing graph sources stay listed and readable, and can be deleted, including one still waiting for its verify.
+  - Delete such a waiting graph source before you delete its namespace: namespace deletion refuses a namespace while one of its sources is waiting for a verify.
+  - The claim-release alarm is not deployed while the switch is off. If deleting a graph source then fails to release its cluster claim, the failure is only logged (`graph_cluster_claim_release_failed` in the Sources API and delete-worker logs), and the cluster stays claimed by that namespace.
+  - Questions are no longer answered from them.
+  - Classes bound to them stay out of every SQL answer.
+  - An R2RML import that maps a class still bound to a graph source is refused with a 422 (`r2rml_conflicts_graph_source`). Delete the graph-bound ontology first to hand the class to SQL.
+  - Turning the switch on again restores them. A graph source that was still waiting for its verify when the switch went off stays `REGISTERED`; once the switch is on again and the source has been unchanged for more than 15 minutes, it can be re-verified from the console, the API or a scheduled re-verify.
+- **Export `SCL_GRAPH_SOURCES`.** `scripts/deploy.sh` maps it to the CDK context parameter `graph_sources`. On a direct `cdk deploy`, pass `--context graph_sources=on` instead.
+
+Running AgentCore sessions keep the previous runtime version until they go idle (about 15 minutes), so test from a new session after deploying.
+
+The API model always lists the `RDF_SPARQL` sub-type and the `nl_to_sparql` strategy. The switch decides whether a deployment accepts them.
 
 ### VKG Task Sizing
 
@@ -643,7 +899,7 @@ Configure these where you instantiate `VkgStack` in `bin/app.ts` (or your
 equivalent CDK app entry point):
 
 ```typescript
-new VkgStack(app, "coa-dev-vkg", {
+new VkgStack(app, `${stackPrefix}-vkg`, {
   // ...existing props...
   cpu: 2048,
   memoryLimitMiB: 4096,
@@ -663,7 +919,10 @@ when tuning a large or pathological source.
 
 | Variable | Set By | Purpose |
 |----------|--------|---------|
+| `OOPS_ENDPOINT` | `ontology-stack.ts`, from the `oops_endpoint` context | REST endpoint of the OoPS! pitfall scanner used by Tier-3 ontology validation. **Unset by default**, which turns the scan off (no outbound request). When set, the serialised ontology is sent to it — see *Configuration Options*. |
 | `SCL_MCP_MODE` | `mcp-stack.ts` | Switches the container entrypoint between Context Manager (default) and MCP Server. When set to `"true"`, the container starts in MCP mode. |
+| `SERVE_TIER1_LOOKUP_TTL_S` | `metric_resolver.py` default | Seconds (default `300`, accepted range 1–3600) a query-serving instance uses a namespace's cached metrics before reading them again, so a created, updated or deleted metric reaches queries within this time of the instance's last read of that namespace. Besides the hourly full refresh, each instance reads a namespace on its own at most once per interval, including after a failed read (so a metric created during a failed read can take up to two intervals to appear); concurrent questions share one read, and a question waits at most 2 seconds for a namespace read. That limit doesn't cover the first full load on a newly started instance, which a question waits for in full. Each namespace read is scoped to that namespace's metric graph. Not set by the stack; a malformed or out-of-range value logs `tier1_setting_ignored` and falls back to the default. |
+| `SERVE_TIER1_MAX_CONCURRENT_READS` | `metric_resolver.py` default | Namespace metric reads a query-serving instance runs at once (default `2`, a whole number from 1 to 16); further reads wait for a slot, within the same 2-second limit per question, so while slow reads hold every slot a question on another stale namespace waits the full 2 seconds. Not set by the stack; a malformed or out-of-range value logs `tier1_setting_ignored` and falls back to the default. |
 | `BULK_REVIEW_PAGE_BUDGET` | `worker.py` default | Per-invocation table budget for the bulk-review worker (default `1000`); when a source has more tables, the worker processes one page, re-enqueues a continuation, and resumes across chained invocations rather than silently capping. |
 | `BULK_REVIEW_WALL_CLOCK_BUDGET_S` | `worker.py` default | Per-invocation wall-clock budget in seconds (default `240`), a second guard under the 5-minute Lambda timeout that stops the worker after the current search page and continues in a fresh invocation when neared. |
 | `REVIEW_QUEUE_URL` | `sources-stack.ts` | SQS review-queue URL the bulk-review worker re-enqueues page continuations to, wiring its own self-continuation. |
@@ -761,8 +1020,18 @@ environment enables them together.
 | Data stores (S3, DynamoDB) | Removed on stack deletion for easy teardown | **Retained** on stack deletion to prevent accidental data loss |
 | Graph database (Neptune) | Removed on stack deletion | **Deletion protection enabled** — a stack deletion is blocked until protection is manually disabled |
 | Web-app authentication | Development sign-in conveniences enabled | Standard secure remote-password flow only |
-| Search collection network access | Reachable for local/integration testing | **VPC-only** |
 | API request logging | Full request/response tracing | Reduced (no payload tracing) |
+
+The OpenSearch Serverless (search) collection is **VPC-only in every
+environment**, `dev` included: its network policy admits only the deployment's
+own VPC endpoint, so a request from outside the VPC is refused, even with valid
+credentials (HTTP 401 with `x-aoss-response-hint: X01:network-policy-deny`). To query it directly, connect from inside the VPC (for example
+through an SSM port-forward to a host in it), and add your IAM role to a data
+access policy of the collection: COA's policies name only its own service roles,
+so any other role gets HTTP 403 even from inside the VPC. With an existing VPC
+(`SCL_VPC_ID`), the collection admits that VPC's `aoss-data` endpoint, which you
+pass as `SCL_AOSS_VPC_ENDPOINT_ID` (see
+[Deploying into an existing VPC](#deploying-into-an-existing-vpc)).
 
 !!! note "Custom domain is a hard requirement in production"
     A production deployment with no UI custom domain fails at synth
@@ -781,37 +1050,54 @@ environment enables them together.
 ### 1. Create Your First User
 
 By default (`idpType: COGNITO`, no `oidcSettings` configured), the deployment
-creates a Cognito User Pool. Add users via the AWS Console or CLI:
+creates a Cognito User Pool with an `Admin` group whose members are granted the
+`platform-admin` role automatically. It also creates an initial admin user; to
+receive its temporary password, set `initialAdminEmail` before the first deploy
+(see [Authentication Setup](authentication-setup.md#whats-already-set-up)).
+
+To add your own user, create it and add it to the `Admin` group. A new user
+holds no roles, so it cannot use the Permissions page or the API to grant
+itself one; membership of `Admin` is what makes it a platform admin:
 
 ```bash
 aws cognito-idp admin-create-user \
   --user-pool-id <POOL_ID> \
   --username user@example.com \
   --user-attributes Name=email,Value=user@example.com Name=email_verified,Value=true
+
+aws cognito-idp admin-add-user-to-group \
+  --user-pool-id <POOL_ID> \
+  --username user@example.com \
+  --group-name Admin
 ```
 
-The User Pool ID is in the `coa-dev-auth` stack outputs or SSM at `/<prefix>/userpool-id`.
+The User Pool ID is in the `<prefix>-<env>-auth` stack outputs or SSM at `/<prefix>/userpool-id`.
+See [Authentication Setup](authentication-setup.md) for additional users and role-mapped groups.
 
 !!! note "Using your own identity provider instead"
     Context Ontology Accelerator can use an external OIDC-compliant IdP (Okta, Azure AD,
     Auth0, Keycloak, etc.) instead of Cognito — set `idpType: "OIDC"` with
     `oidcSettings` in the SSM config at `/<prefix>/config` **before** running
     `make deploy-dev` (this must be configured pre-deploy; switching IdP types
-    afterward requires a redeploy of the `coa-dev-auth` stack). See the
+    afterward requires a redeploy of the `<prefix>-<env>-auth` stack). See the
     [Authentication Setup Guide](authentication-setup.md) for the full config
     reference and a step-by-step Okta walkthrough. In OIDC mode, the
-    `coa-dev-auth` stack does **not** create a Cognito User Pool at all — the
+    `<prefix>-<env>-auth` stack does **not** create a Cognito User Pool at all — the
     commands above won't apply. Instead, create/manage users directly in your
     IdP; access is controlled entirely by [grants](role-permission-management.md)
     against the user's email or IdP group.
 
 ### 2. Access the Web App
 
-The web app URL is in the `coa-dev-web` stack's CloudFormation output (`WebAppUrl`). Sign in with the Cognito user you created (or your external IdP's credentials, if using OIDC mode).
+The web app URL is in the `<prefix>-<env>-web` stack's CloudFormation output (`WebAppUrl`). Sign in with the Cognito user you created (or your external IdP's credentials, if using OIDC mode).
 
 ### 3. Grant Platform Admin
 
-To give a user full access, grant the `platform-admin` role via the API or web app Permissions page.
+Members of the Cognito `Admin` group already hold `platform-admin` (see step 1). A platform admin can
+grant `platform-admin`, or a narrower role, to other users and groups through the API or the web app's
+Permissions page; see [Role & Permission Management](role-permission-management.md). In OIDC mode, no
+group is pre-wired: map your IdP's admin group to `platform-admin` with a `claimsMappings` entry
+before deploying (see [Authentication Setup](authentication-setup.md#step-5-deploy-context-ontology-accelerator)).
 
 ## Guardrail Observability
 
@@ -833,6 +1119,14 @@ All three metrics live in the **`COA/Guardrails`** namespace:
 
 `Component` is one of `kg-build`, `enrichment`, `ontology-shapes`,
 `nl-to-sparql`, or `serve-retrieval`.
+
+The `enrichment` guardrail screens only source-derived content: table and
+column names, types, comments, existing metadata and external evidence. COA's
+own headings and instructions are sent outside the guardrail's content,
+prompt-attack, denied-topic and PII filters, so COA's wording cannot block a
+small table.
+Word-filter policies are the exception and still check the whole message,
+including COA's instructions.
 
 **Block rate is not a stored metric** — compute it in a CloudWatch math
 expression so there is a single source of truth:
@@ -1035,7 +1329,9 @@ fields @timestamp, detail.userIdentity.sessionContext.sessionIssuer.userName as 
 
 The vector store is a NEXTGEN OpenSearch Serverless collection group whose
 indexing/search capacity floor and ceiling are set from two CDK context values,
-`aoss_min_ocu` and `aoss_max_ocu` (both in OCUs). The storage stack
+`aoss_min_ocu` and `aoss_max_ocu` (both in OCUs). `make deploy-dev` passes
+them from `SCL_AOSS_MIN_OCU` and `SCL_AOSS_MAX_OCU`; unset or empty leaves the
+default. The storage stack
 (`infra/lib/stacks/foundation/storage-stack.ts`) **validates these at synth
 time** rather than passing an arbitrary `-c` value straight through to
 CloudFormation — an out-of-range value would otherwise only be rejected later
@@ -1080,8 +1376,15 @@ Standby replicas are fixed at `ENABLED` and must not be changed — AWS rejects
 Example — opt a dev collection into scale-to-zero:
 
 ```bash
-cdk deploy -c aoss_min_ocu=0
+SCL_AOSS_MIN_OCU=0 make deploy-dev
 ```
+
+On a direct `cdk deploy`, pass `--context aoss_min_ocu=0` along with the rest of
+your deployment's context. The value is not stored: a later deploy without it
+puts the floor back to `2`. `make deploy-serve` always does, since it also
+updates the storage stack and doesn't pass `SCL_AOSS_*` through; run
+`make deploy-dev` with the variables again afterwards. Changing it updates the
+collection group in place; the collection and its data are kept.
 
 For the operator-facing scale-to-zero cost/latency tradeoff (cold-start return
 time and how it interacts with ingest), see the `aoss_min_ocu` section in
@@ -1104,13 +1407,22 @@ CDK performs incremental updates — only changed stacks are redeployed.
 make destroy-dev
 ```
 
-This runs `scripts/destroy.sh dev`, which orchestrates teardown of resources CFN can't cleanly delete on its own before running `cdk destroy --all`:
+This runs `scripts/destroy.sh dev`, which orchestrates teardown of resources CFN can't cleanly delete on its own around `cdk destroy`:
 
 1. **Deletes AgentCore Runtimes** (serve + mcp) directly via the Bedrock AgentCore API.
-2. **Waits for AgentCore-owned ENIs to detach** from their security groups — see the [AgentCore ENI wait](#agentcore-eni-wait-can-take-hours) note below. This step is currently a no-op pending a shorter, reliable detach signal.
+2. **Checks the runtimes' ENIs without waiting for them.** AWS releases them up to 8 hours after the runtimes are deleted, and they hold only the runtime security groups, the private subnets and the VPC — see [AgentCore ENIs outlive the runtimes](#agentcore-enis-outlive-the-runtimes).
 3. **Deletes VKG's per-namespace ECS services** (created outside CloudFormation by the ontology-reload Lambda) and waits for them to reach `INACTIVE`.
-4. **Force-deletes the DataZone domain** via `delete-domain --skip-deletion-check`, which cascades through every project, asset, and asset type under it — CloudFormation's own delete can't do this (see [FAQ](#why-does-namespace-stack-fail-to-delete-with-domain-not-empty)).
-5. **Runs `cdk destroy --all`**, then verifies no stacks remain.
+4. **Deletes the Cloud Map services** the VKG reload Lambda registered in the private DNS namespace, which CloudFormation cannot delete while they exist.
+5. **Force-deletes the DataZone domain** via `delete-domain --skip-deletion-check`, which cascades through every project, asset, and asset type under it — CloudFormation's own delete can't do this (see [FAQ](#why-does-namespace-stack-fail-to-delete-with-domain-not-empty)).
+6. **Starts deleting the connector stacks** (`<PREFIX>-dev-*-coa-connector`), which are separate CDK apps; step 8 waits for them. Then **deletes the federated Glue connections of registered database sources**, with their federated catalogs and Lake Formation registrations, the way deleting a source through the API does: the sources service creates them at runtime, so no stack deletes them, and each keeps an ENI in the network stack's connector security group. Glue deletes no connection its federated catalog still uses, and only a Lake Formation data lake administrator can drop those catalogs: run the teardown as one, or delete your database sources through the API first. See [A database source's Glue connection keeps the network stack](#a-database-sources-glue-connection-keeps-the-network-stack).
+7. **Runs `cdk destroy` on every stack except network**, re-running it past the failures teardown is known to hit: a runtime security group AWS still holds and a runtime AgentCore is still deleting (the stack is deleted again with either kept out), and an access-log bucket that refilled after it was emptied.
+8. **Finishes the network stack**: waits for the connector stacks, deletes any federated Glue connection created meanwhile and waits up to 30 minutes for Glue to release those connections' ENIs, deletes detached Lambda ENIs and the kept runtime security groups once AWS has released their ENIs, then the stack. If GuardDuty Runtime Monitoring added its endpoint and security group to the VPC, it deletes them first, but only with `SCL_DESTROY_DELETE_GUARDDUTY_ENDPOINT=1`; without it the run fails (exit 1) and prints their IDs and how to remove them. See [GuardDuty Runtime Monitoring endpoint blocks the VPC](#guardduty-runtime-monitoring-endpoint-blocks-the-vpc).
+
+One run deletes everything that runs continuously: Neptune, OpenSearch Serverless, the Fargate services, the NAT gateway and the interface endpoints. If AWS still holds the runtimes' ENIs, what remains until the next run is the VPC, its subnets and two security groups, which AWS does not charge for ([Amazon VPC pricing](https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html#pricing)); with an imported VPC (`SCL_VPC_ID`), only the two security groups. The script then **exits 3** and prints what is left, when the runtimes were deleted, and the commands to delete the rest by hand. Run `make destroy-dev` again after that (AWS releases the ENIs up to 8 hours after the runtimes were deleted), or set `SCL_ENI_WAIT_MAX_SECONDS` to wait in one run. It defers only while AgentCore's own ENIs hold what is left: anything else that keeps the network stack or a runtime security group is a failure (exit 1), and the script lists it.
+
+To deploy again before that, use another `SCL_PREFIX`. With a VPC COA created, the same prefix cannot be deployed until the teardown has finished: its network stack is still being deleted or in `DELETE_FAILED`, which CloudFormation cannot deploy over, so `make deploy-dev` stops in preflight and says when AWS releases the ENIs.
+
+Until a deferred teardown finishes, the VPC COA created still counts toward the VPCs-per-Region quota (default 5, see [Service Quotas](#service-quotas)). Each deploy under another prefix needs a VPC of its own, so a few deferred teardowns in a row, or one that is never run again, can make the preflight's network quota check stop the next deploy. The runtime security groups, AgentCore's ENIs (for up to 8 hours) and the `DELETE_FAILED` network stack count toward their quotas too (security groups, network interfaces and CloudFormation stacks per Region). Running the teardown again once AWS has released the ENIs, or the cleanup commands its summary prints, frees all of them. The first run already deletes the Elastic IP, the NAT gateway and the Internet gateway: a deferred teardown does not count toward the Elastic IP or Internet gateway quota.
 
 Same environment-variable overrides as `make deploy-dev` — pass the same `SCL_PREFIX` and region you deployed with:
 
@@ -1123,11 +1435,17 @@ Additional destroy-specific variables:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `SCL_DESTROY_YES` | unset | Set to `1` to skip the interactive confirmation prompt (e.g. in CI). |
-| `SCL_ENI_WAIT_MAX_SECONDS` | `600` | Max wait for AgentCore ENI detach (step 2 — currently disabled). |
+| `SCL_DESTROY_DELETE_GUARDDUTY_ENDPOINT` | unset | Set to `1` to let step 8 delete the endpoint and security group GuardDuty Runtime Monitoring added to the VPC COA created. See [GuardDuty Runtime Monitoring endpoint blocks the VPC](#guardduty-runtime-monitoring-endpoint-blocks-the-vpc). |
+| `SCL_ENI_WAIT_MAX_SECONDS` | `0` | Step 8: how long to wait for AWS to release the runtimes' ENIs before exiting 3. The wait starts once the NAT gateway and endpoints are deleted; `32400` (9 h) finishes in one run. |
+| `SCL_DESTROY_CONCURRENCY` | `4` | Stacks `cdk destroy` deletes in parallel, dependencies permitting. |
 | `SCL_ECS_WAIT_MAX_SECONDS` | `300` | Max wait for VKG ECS services to reach `INACTIVE`. |
+| `SCL_CLOUDMAP_WAIT_MAX_SECONDS` | `180` | Max wait for Cloud Map instances to deregister. |
 | `SCL_DOMAIN_WAIT_MAX_SECONDS` | `300` | Max wait for the DataZone domain to finish deleting. |
+| `SCL_CONNECTOR_DELETE_WAIT_MAX_SECONDS` | `1800` | Max wait for each connector stack to delete. |
 
-Steps 1-4 are idempotent — if the script exits early or a step warns and continues, re-running it later picks up from an already-deleted/in-progress state.
+Exit status of `scripts/destroy.sh`: `0` everything deleted, `3` only the network resources above left for a re-run, anything else a failure to inspect. `make destroy-dev` reports any non-zero status as make's own exit `2` (its message says `Error 3`), so call the script directly to tell a deferred teardown from a failed one.
+
+Every step is idempotent — if the script exits early or a step warns and continues, re-running it later picks up from an already-deleted/in-progress state.
 
 !!! warning
     This deletes all resources including databases and stored data. Neptune and OpenSearch data is not recoverable after deletion.
@@ -1147,7 +1465,7 @@ cd <repo-root>
 AWS_DEFAULT_REGION=<REGION> SCL_PREFIX=<PREFIX> ./scripts/destroy.sh <env>
 ```
 
-Or fall back to a plain `cdk destroy` (skips all the pre-cleanup steps above — expect the known failures documented in Troubleshooting):
+Or fall back to a plain `cdk destroy`. It skips all the steps above, and CDK stops at the first stack that fails to delete — expect the failures documented in Troubleshooting. It also leaves the retained AgentCore Runtime security groups behind: in a VPC COA created, the network stack then fails to delete the VPC; with an imported VPC (`SCL_VPC_ID`), the command succeeds and the groups stay in that VPC. Either way, `make destroy-dev` deletes them once AWS has released their ENIs:
 
 ```bash
 cd infra
@@ -1155,6 +1473,8 @@ AWS_DEFAULT_REGION=<REGION> npx cdk destroy --all \
   --context env=dev \
   --context resource_prefix=<PREFIX>
 ```
+
+With an imported VPC, add `--context vpc_id=<VPC_ID> --context aoss_vpc_endpoint_id=<VPCE_ID>`, the values used at deploy.
 
 ## Troubleshooting
 
@@ -1171,7 +1491,7 @@ SCL_SMUS_ADMIN_ARNS=arn:aws:iam::<account>:role/aws-reserved/sso.amazonaws.com/<
 make deploy-dev
 ```
 
-**If you hit the underlying CloudFormation failure directly** (e.g. running `cdk deploy` by hand, bypassing the preflight): `coa-dev-namespace` reaches `CREATE_FAILED` → `ROLLBACK_COMPLETE` on `DomainLoginRole` with `Invalid principal in policy`. If you retry with `SCL_SMUS_ADMIN_ARNS` now set and the stack fails again — this time on `SMUSDomain` with `Domain name already exists under this account (Service: DataZone, Status Code: 409)` — the first rollback left an orphaned DataZone domain behind (CloudFormation's stack rollback deletes the stack's other resources, but not this one). Force-delete the leftover domain, then retry:
+**If you hit the underlying CloudFormation failure directly** (e.g. running `cdk deploy` by hand, bypassing the preflight): `<prefix>-<env>-namespace` reaches `CREATE_FAILED` → `ROLLBACK_COMPLETE` on `DomainLoginRole` with `Invalid principal in policy`. If you retry with `SCL_SMUS_ADMIN_ARNS` now set and the stack fails again — this time on `SMUSDomain` with `Domain name already exists under this account (Service: DataZone, Status Code: 409)` — the first rollback left an orphaned DataZone domain behind (CloudFormation's stack rollback deletes the stack's other resources, but not this one). Force-delete the leftover domain, then retry:
 
 ```bash
 DOMAIN_ID=$(aws datazone list-domains --query "items[?name=='<PREFIX>-<ENV>-smus-catalog'].id" --output text)
@@ -1191,26 +1511,110 @@ aws sqs start-message-move-task --source-arn <sources-delete-dlq ARN>
 
 A source that reads `DELETE_FAILED` can instead be retried with another `DELETE`.
 
-### AgentCore ENI wait can take hours
+### AgentCore ENIs outlive the runtimes
 
-**Symptom:** the `*-mcp` and `*-serve` stacks fail to delete their security groups with `has a dependent object` (`DependencyViolation`), even after `make destroy-dev` deletes the AgentCore Runtimes.
+**Symptom:** `make destroy-dev` ends with "Teardown deferred: AWS still holds the AgentCore Runtimes' ENIs" and `Error 3` (`scripts/destroy.sh` exits 3, make itself 2). Or, with a plain `cdk destroy`, the network stack fails to delete its subnets and VPC (`has dependencies`); with an imported VPC (`SCL_VPC_ID`), it succeeds and leaves the runtime security groups in that VPC. On a deployment from before the runtime security groups were retained, the `*-mcp` or `*-serve` stack fails on its security group instead (`has a dependent object`) and CDK stops there.
 
-**Cause:** AgentCore Runtime provisions VPC network interfaces (ENIs) directly, outside CloudFormation. Runtime deletion doesn't synchronously release them — in practice this has been observed to take **several hours, and sometimes days**, not the few minutes originally expected. CloudFormation has no visibility into these ENIs and tries to delete the security group immediately, before they're gone.
+**Cause:** AgentCore Runtime provisions VPC network interfaces (ENIs) itself, outside CloudFormation, and shares them across runtimes that use the same subnets and security group. Deleting a runtime doesn't release them: "the associated ENI may persist in your VPC for up to 8 hours before it is automatically removed" (AgentCore VPC documentation); about 8 hours was measured on COA dev deployments. Until then they hold the runtime's security group, the private subnets and the VPC.
 
-**Fix:** there isn't a fast one. `make destroy-dev` already deletes the Runtimes as its first step to start the detach clock as early as possible, but you generally need to **wait and retry later** (a few hours to a day) rather than intervene:
+**Fix:** nothing to do now. `make destroy-dev` keeps the two runtime security groups out of their stacks' delete and deletes everything else, leaving the VPC, its subnets and the two security groups, which AWS does not charge for. Re-run it after the time the summary prints (up to 8 hours after the runtimes were deleted) to delete them, or run the commands it prints:
 
 ```bash
-# Re-run later — steps 1-4 are idempotent and safe to repeat.
-make destroy-dev
+make destroy-dev   # same SCL_PREFIX and region as the first run
 ```
 
-Do not attempt to manually detach or delete the ENIs yourself — they're AWS-managed and manual intervention doesn't speed up the release. If it's still stuck after a day or more, treat it as an AWS-side issue rather than something to fix locally.
+To deploy again in the meantime, use another `SCL_PREFIX`; with a VPC COA created, `make deploy-dev` refuses the same prefix until the teardown has finished.
+
+Do not try to detach or delete the `agentic_ai` ENIs yourself: AWS owns them and releases them on its own schedule. Detached Lambda ENIs (status `available`, description `AWS Lambda VPC ENI-<PREFIX>-dev-*`) are different; `make destroy-dev` deletes those itself.
+
+### A database source's Glue connection keeps the network stack
+
+**Symptom:** `make destroy-dev` exits 1 with "Could not drop federated catalog …, so its connection cannot be deleted either", "Glue is still releasing the ENIs of deleted federated connections on sg-…", or "Could not deregister …" / "Could not delete Glue connection …", and prints the commands that finish the job. Or, with a plain `cdk destroy` or an older `make destroy-dev`, `<PREFIX>-dev-network` ends `DELETE_FAILED` on `ConnectorSG…` (`has a dependent object`) and a private subnet, and the VPC stays. The ENI left in the VPC looks like an orphaned Lambda ENI, but is not: `InterfaceType` `lambda`, an `ela-attach-…` attachment owned by `amazon-aws`, and a description of 12 hex characters and the database engine, such as `d1c612eeec23-POSTGRESQL`.
+
+**Cause:** every registered database (JDBC) source has a federated Glue connection, `<prefix><env>ds_<hash>` (lowercased, dashes dropped, e.g. `coadevds_9b2a…`), with a Lake Formation registration and a federated catalog of the same name. The sources service creates them when it scans the source, in the connector security group and a private subnet; CloudFormation has no record of them. Connections that share the subnet, group and role share one ENI. Three things hold the teardown up:
+
+- Glue refuses to delete a connection while its federated catalog exists (`Failed to delete since there are federated resources associated with connection`), and dropping the catalog takes `DROP` on it (`Insufficient Lake Formation permission(s): Required Drop on Catalog`). Lake Formation gives that only to the catalog's creator, COA's federation provisioner role, which the operator cannot assume. A data lake administrator can grant it to themselves; anyone else cannot. COA makes only its provisioner role an administrator, and only while the sources stack exists.
+- Glue deletes the ENI about 19 minutes after the connection is deleted, and nothing the account does releases it sooner: an `ela-attach` attachment cannot be detached by the account.
+- When the connection's role (`<PREFIX>-dev-federated-catalog-role`, in the sources stack) is deleted before that, Glue detaches the ENI but leaves it `available`.
+
+**Fix:** `make destroy-dev` deletes these itself: in step 6 it drops each catalog (as a data lake administrator, after granting itself `DROP` on it), deregisters the connection from Lake Formation and deletes it, and in step 8 it waits up to 30 minutes for the ENIs and deletes one Glue detached and left (never an attached one). What it cannot do is drop a catalog without Lake Formation permission. So do one of these:
+
+- Run `make destroy-dev` as a Lake Formation data lake administrator.
+- Before the teardown, delete your database sources through the API (`DELETE /namespaces/{namespaceId}/sources/{sourceId}`), which drops the catalogs with COA's own administrator role. Their ENIs then take about 19 minutes to go, which step 8 waits out.
+- After a run that stopped on the catalogs, have a data lake administrator run the commands it printed, then run `make destroy-dev` again with the same `SCL_PREFIX` and region. Per catalog, as that administrator:
+
+```bash
+aws lakeformation grant-permissions --region <REGION> --permissions DROP \
+  --principal DataLakePrincipalIdentifier=<your-principal-arn> \
+  --resource '{"Catalog":{"Id":"<ACCOUNT>:<prefix><env>ds_<hash>"}}'
+aws glue delete-catalog --region <REGION> --catalog-id <prefix><env>ds_<hash>
+```
+
+To check what holds the group:
+
+```bash
+aws ec2 describe-network-interfaces --region <REGION> \
+  --filters "Name=group-id,Values=<connector-security-group-id>" \
+  --query "NetworkInterfaces[].{Id:NetworkInterfaceId,Type:InterfaceType,Status:Status,Description:Description}"
+aws glue get-connections --region <REGION> --query "ConnectionList[?starts_with(Name, '<prefix><env>ds_')].Name"
+```
+
+`make destroy-dev` deletes a connection only when its name, its role and the connector security group are all this deployment's, because prefixes alias once dashes are dropped (`coa`/`dev-1` and `coa`/`dev1` both give `coadev1ds_…`); it reports the others and leaves them. With an `SCL_PREFIX` that starts with a digit it does not look for them, and says so. Besides the catalog drop (`glue:DeleteCatalog`, and `lakeformation:GrantPermissions` and `lakeformation:RevokePermissions` for the administrator's grant), the run needs `sts:GetCallerIdentity`, `cloudformation:ListStackResources`, `glue:GetConnections`, `glue:DeleteConnection`, `lakeformation:ListResources`, `lakeformation:DeregisterResource`, `ec2:DescribeNetworkInterfaces` and `ec2:DeleteNetworkInterface`; any of them denied fails the run, with the commands to run as someone allowed to. It also uses `glue:GetConnection` and `glue:GetCatalogs`, but does without them: denied `glue:GetConnection`, it does not wait for a connection still being created before deleting it, and leaves alone a Lake Formation registration whose connection may be gone; denied `glue:GetCatalogs`, it does not report leftover catalogs. A catalog left after its connection is gone holds nothing up and is reported as a warning ("Federated catalogs left whose connection is gone"), with the commands to drop it: do, since a catalog binds to whichever connection is next created under its name. Catalogs are matched by name alone, though, so one may belong to another deployment whose prefix and env sanitise to the same name: check before running the commands.
+
+### GuardDuty Runtime Monitoring endpoint blocks the VPC
+
+**Symptom:** `make destroy-dev` fails in step 8 (`scripts/destroy.sh` exits 1) with "GuardDuty Runtime Monitoring left endpoint vpce-… and security group sg-… in vpc-…, outside CloudFormation". Everything that runs continuously is already deleted; the network stack is `DELETE_FAILED` on its subnets and VPC. A plain `cdk destroy` fails the same way: `The subnet 'subnet-…' has dependencies and cannot be deleted`.
+
+**Cause:** with Runtime Monitoring's automated agent configuration on (for ECS Fargate, EC2 or EKS), GuardDuty adds an interface VPC endpoint for `com.amazonaws.<region>.guardduty-data` and a security group named `GuardDutyManagedSecurityGroup-<vpc-id>` to each VPC that runs a monitored workload, both tagged `GuardDutyManaged: true`. COA's ontology service and VKG tasks run on Fargate in the VPC COA created. CloudFormation does not know either resource, and the endpoint's network interfaces hold the subnets. GuardDuty deletes them only when Runtime Monitoring itself is disabled; disabling only the automated agent configuration leaves the endpoint ([Disabling, uninstalling, and cleaning up resources in Runtime Monitoring](https://docs.aws.amazon.com/guardduty/latest/ug/runtime-monitoring-agent-resource-clean-up.html)). AWS documents this failure for CDK and Terraform ([Using Infrastructure as Code with GuardDuty automated security agents](https://docs.aws.amazon.com/guardduty/latest/ug/using-iac-with-gdu-automated-agents-runtime-monitoring.html)). AWS does not charge for the endpoint's hours or traffic: "You will not be charged for associated networking bandwidth or hourly costs for event delivery whether GuardDuty manages the VPC endpoints or you choose to manage them yourself" ([Amazon GuardDuty pricing](https://aws.amazon.com/guardduty/pricing/)).
+
+**Fix:** let the teardown delete them:
+
+```bash
+SCL_DESTROY_DELETE_GUARDDUTY_ENDPOINT=1 make destroy-dev   # same SCL_PREFIX and region as the first run
+```
+
+Step 8 then deletes the endpoint, waits until it is gone (about 2 minutes), deletes the security group, and then the network stack. It is opt-in because both belong to GuardDuty, which your security team may run. The script deletes them only when all of these hold, and otherwise says which one failed:
+
+- the VPC is the one the network stack created, and this account owns it;
+- none of its subnets is shared through AWS RAM;
+- no network interfaces are left in it other than this deployment's AgentCore ones (on its runtime security groups) and Lambda ones, the network stack's own and the endpoint's;
+- the endpoint's service is exactly `com.amazonaws.<region>.guardduty-data` and it carries `GuardDutyManaged=true`; the security group is named `GuardDutyManagedSecurityGroup-<vpc-id>` and carries the same tag.
+
+It looks again before every attempt to delete the network stack, so one that appears between runs (a deferred teardown's re-run can come hours later) is deleted too. If AgentCore still holds its ENIs once GuardDuty's resources are gone, the run defers as usual (exit 3); GuardDuty's resources on their own never defer a run.
+
+Or by hand: the script prints these commands with the IDs filled in, in this order. The security group can be deleted only once the endpoint is gone (about 2 minutes), which the loop waits for; EC2 has no waiter for endpoints.
+
+```bash
+aws ec2 delete-vpc-endpoints --region <REGION> --vpc-endpoint-ids <vpce-id>
+while aws ec2 describe-vpc-endpoints --region <REGION> --vpc-endpoint-ids <vpce-id> --query 'VpcEndpoints[].State' --output text 2>/dev/null | grep -qv deleted; do sleep 15; done
+aws ec2 delete-security-group --region <REGION> --group-id <sg-id>
+SCL_PREFIX=<PREFIX> AWS_REGION=<REGION> ./scripts/destroy.sh dev   # or make destroy-dev; no flag needed now
+```
+
+Disabling Runtime Monitoring also removes them, but it is an account-wide setting: leave that call to whoever owns GuardDuty in the account.
+
+**Permissions:** the deletes need `ec2:DeleteVpcEndpoints` and `ec2:DeleteSecurityGroup`; the checks `ec2:DescribeVpcEndpoints`, `ec2:DescribeSecurityGroups`, `ec2:DescribeVpcs`, `ec2:DescribeSubnets`, `ec2:DescribeNetworkInterfaces` and `ram:ListResources`. To let the teardown delete only GuardDuty's resources:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["ec2:DeleteVpcEndpoints", "ec2:DeleteSecurityGroup"],
+  "Resource": "*",
+  "Condition": {"StringEquals": {"aws:ResourceTag/GuardDutyManaged": "true"}}
+}
+```
+
+If an IAM policy or a service control policy denies the delete, the run fails at once and says so; ask for the permissions above, or have someone allowed to delete them run the commands.
+
+With an imported VPC (`SCL_VPC_ID`), the script leaves GuardDuty's resources alone: COA does not delete that VPC, so they cannot block the teardown.
+
+GuardDuty has a second way to connect its agent, link-local (`guardduty-data-v2`), and may set up only that one ([How the security agent connects to GuardDuty](https://docs.aws.amazon.com/guardduty/latest/ug/runtime-monitoring-agent-connectivity.html)). There it adds no endpoint or security group: it associates the VPC with a VPC Lattice service network of its own and adds routes for `169.254.170.248/29` and `fd00:ec2:6d00::/64`, with target `GuardDuty`, to the VPC's route tables. That does not block the teardown (a VPC with both deletes normally), so the script leaves them to GuardDuty.
 
 ### Why does namespace stack fail to delete with "domain not empty"?
 
 **Symptom:** the `*-namespace` stack fails to delete with `Domain cannot be deleted because there are existing projects under this domain`, or the `SystemProject`/`DefaultProjectProfile` resources fail with `failed to stabilize due to internal failure` or `deletion prevented by project ...`.
 
-**Cause:** every namespace creates its own DataZone project, and CloudFormation's native `DeleteDomain`/`DeleteProject` calls can't force past a shared asset type (`CoaRelationalTable`) that's still referenced by other projects' assets — which is always true while more than one namespace exists. `make destroy-dev` handles this automatically (step 4: `delete-domain --skip-deletion-check`, a true force-delete at the domain level). If you're running a bare `cdk destroy` instead of `make destroy-dev`, you'll hit this.
+**Cause:** every namespace creates its own DataZone project, and CloudFormation's native `DeleteDomain`/`DeleteProject` calls can't force past a shared asset type (`CoaRelationalTable`) that's still referenced by other projects' assets — which is always true while more than one namespace exists. `make destroy-dev` handles this automatically (step 5: `delete-domain --skip-deletion-check`, a true force-delete at the domain level). If you're running a bare `cdk destroy` instead of `make destroy-dev`, you'll hit this.
 
 **Fix:** use `make destroy-dev` instead of a raw `cdk destroy`. If you're already stuck on a bare `cdk destroy`, resolve the SMUS domain ID from SSM and force-delete it directly, then retry:
 
@@ -1300,7 +1704,7 @@ specific resource choices. It is scoped to the **single-account, single-region
 evaluation deployment** this guide describes.
 
 It complements rather than repeats the sections above — see
-[Service Quotas](#service-quotas) for the two quotas the preflight check
+[Service Quotas](#service-quotas) for the four quotas the preflight check
 validates, [Region Prerequisites](#region-prerequisites) for regional
 availability, and [API Request Limits](#api-request-limits-and-rate-limiting)
 for inbound throttling.
@@ -1356,11 +1760,12 @@ group most easily missed when scoping IAM permissions or regional availability.
 | **Amazon Redshift Data API** | Querying Redshift-backed sources | `packages/context-manager/.../clients/redshift_data.py` |
 | **AWS Secrets Manager** | Data-source credentials (e.g. JDBC) | `packages/sources`, `packages/context-manager` |
 | **AWS STS** | Role assumption and caller identity across services | Widely used (~10 modules) |
+| **OoPS! (third party, optional)** | Ontology pitfall scan in Tier-3 validation. Off unless `OOPS_ENDPOINT` is configured; when on, receives the serialised ontology | `packages/ontology-engine/.../validation/validators/tier3.py` |
 
 
 ### A.3 Quotas to check before deploying
 
-The preflight check (`scripts/preflight-deploy.sh`) validates only the first two.
+The preflight check (`scripts/preflight-deploy.sh`) validates only the first four.
 The rest are listed because they are plausible blockers on a **new or sandbox
 account**, where reduced default quotas are common. Confirm the ones relevant to
 your usage rather than requesting increases for all of them.
@@ -1372,22 +1777,24 @@ own applied values with the commands that follow.
 
 | Service | Quota (code) | AWS default | Why it matters here |
 |---------|--------------|-------------|---------------------|
-| **VPC** | VPCs per Region (`L-F678F1CE`) | 5 | Deploy creates one VPC unless `SCL_VPC_ID` is set. Preflight-checked — see [Service Quotas](#service-quotas) |
+| **VPC** | VPCs per Region (`L-F678F1CE`) | 5 | A first deploy creates one VPC unless `SCL_VPC_ID` is set; updates reuse it. Preflight-checked — see [Service Quotas](#service-quotas) |
+| **VPC** | Internet gateways per Region (`L-A4707A72`) | 5 | The new VPC gets one for its public subnets; same conditions as the VPC. Preflight-checked |
+| **EC2** | EC2-VPC Elastic IPs (`L-0263D0A3`) | 5 | The NAT gateway takes one. Shared region-wide with EC2 instances, other NAT gateways and internet-facing Network Load Balancers that use Elastic IPs (Application Load Balancers don't), so it can be full while VPCs are not. Preflight-checked |
 | **Lambda** | Concurrent executions (`L-B99A9384`) | 1,000 (10 on some new accounts) | Two functions reserve concurrency (default 5 each). Preflight-checked — see [Lambda reserved concurrency](#lambda-reserved-concurrency) |
 | **ECS / Fargate** | Fargate On-Demand vCPU resource count (`L-3032A538`) | **6** | **The tightest fit here.** Tasks are 2 vCPU / 8 GB and 4 vCPU / 16 GB, and VKG runs one service **per namespace** — so a single enrichment task plus two namespaces' VKG services can exhaust the default |
-| **OpenSearch Serverless** | Indexing max OCU (`L-50FA809B`), search max OCU (`L-4E98D4EB`) | 10 each | The collection runs with standby replicas enabled, which roughly doubles OCU consumption — see [A.4](#a4-considerations) |
+| **OpenSearch Serverless** | Indexing max OCU (`L-50FA809B`), search max OCU (`L-4E98D4EB`) | 10 each | Shared by every deployment in the account, and below the default `aoss_max_ocu` of 96, so they cap the collection group's ceiling — see [OpenSearch Serverless (OCU) capacity configuration](#opensearch-serverless-ocu-capacity-configuration) |
 | **Amazon Bedrock** | Per-model invocation TPM / RPM — one quota per model **per inference profile** (e.g. `L-CCA5DF70`, cross-region RPM for Claude Haiku 4.5) | Varies widely by model (hundreds of thousands to hundreds of millions of tokens/min) | Induction throughput is bounded by model tokens-per-minute far more often than by compute; a large scan can hit it. Look up the four models in [Bedrock model availability](#bedrock-model-availability) for the profile you actually invoke |
 | **Amazon Athena** | Active DML queries (`L-FC5F6546`) | 200 | Concurrent structured queries at serve time share this pool |
 | **Amazon Neptune** | DB instances (`L-368A3E00`) | 40 | Deploy creates one instance. The more likely constraint is not the count but whether the `db.r8g.large` Graviton class is offered in your region and AZ |
 | **Amazon Textract** | `DetectDocumentText` TPS (`L-75788A8B`) | 25 | Only relevant if ingesting scanned documents at volume |
+| **VPC** | NAT gateways per Availability Zone (`L-FE5A380F`) | 5 | The new VPC's single NAT gateway lands in one of its AZs. Per AZ rather than per Region, so only an AZ already holding five blocks it; not preflight-checked |
 
 Quotas that are **not** worth checking, having confirmed the headroom: the deploy
-creates 16 CloudFormation stacks against a default of 2,000 (`L-0485CB21`), about
+creates 17 CloudFormation stacks plus the connector's against a default of 2,000 (`L-0485CB21`), about
 11 S3 buckets against a far higher bucket limit, and consumes ENIs against a
-default of 5,000 per Region (`L-DF5E4CA3`). A single NAT gateway
-(`natGateways: 1`, `maxAzs: 2`) means one Elastic IP. AgentCore's slow ENI
+default of 5,000 per Region (`L-DF5E4CA3`). AgentCore's slow ENI
 release after teardown is a real problem, but it is a *timing* issue rather than a
-quota one — see [AgentCore ENI wait](#agentcore-eni-wait-can-take-hours).
+quota one — see [AgentCore ENIs outlive the runtimes](#agentcore-enis-outlive-the-runtimes).
 
 Check a specific quota's default and your account's applied value with:
 
@@ -1424,11 +1831,12 @@ throttled.
 **OpenSearch Serverless has a cost and OCU floor.** The collection is
 `VECTORSEARCH` type inside a `NEXTGEN` collection group, which requires
 `standbyReplicas: ENABLED` (see `infra/lib/stacks/foundation/storage-stack.ts`).
-Standby replicas roughly double OCU consumption versus a single-AZ
-configuration, and Serverless bills a minimum OCU allocation whether or not you
-are querying — so an idle evaluation deployment still accrues cost here. This is
-a durability/availability requirement of the collection group type, not a tunable
-knob.
+Standby replicas are a requirement of the collection group type, not a tunable
+knob. Serverless bills the collection group's minimum OCU
+(`aoss_min_ocu`, default 2 for indexing plus 2 for search) whether or not you are
+querying, so an idle evaluation deployment still accrues cost here, about
+$700/month in us-east-1. `SCL_AOSS_MIN_OCU=0 make deploy-dev` removes that floor
+(see [OpenSearch Serverless (OCU) capacity configuration](#opensearch-serverless-ocu-capacity-configuration)).
 
 **Neptune runs a single provisioned instance, not Serverless.** One
 `db.r8g.large` primary with no read replica, IAM (SigV4) auth, encryption at
@@ -1437,14 +1845,9 @@ rest, and 7-day backups. Deletion protection is enabled **only** when
 availability guarantee from a second instance, and the cluster is deletable — so
 `make destroy-dev` will remove the graph and its data irreversibly.
 
-**Neptune and OpenSearch dominate deploy time.** They, plus AgentCore Runtime
-setup and cross-stack SSM waits, are why a fresh deploy takes ~1.5 hours. A
-deploy that looks stuck is usually waiting on one of them — check
-`aws cloudformation list-stacks` before intervening.
-
 **Teardown is not symmetric with deploy.** AgentCore Runtime provisions ENIs
-outside CloudFormation and can hold them for hours to days after runtime
-deletion, blocking security-group deletion. VKG creates ECS services outside
+outside CloudFormation and holds them for up to 8 hours after runtime
+deletion, blocking deletion of the VPC that contains them. VKG creates ECS services outside
 CloudFormation (one per namespace), and DataZone domains need a force-delete.
 `make destroy-dev` handles all three; a bare `cdk destroy` does not. Budget for
 teardown taking longer than deploy, and see [Tearing Down](#tearing-down).

@@ -210,6 +210,16 @@ class TestGraphContextBlock:
         # A walk row with no schema text is not worth a bare name in the prompt.
         assert _graph_context_block(["orders"], [{"table": "x", "schema": ""}]) == ("", [])
 
+    def test_walked_table_held_by_several_databases_lists_them_all(self):
+        block, _ = _graph_context_block(
+            ["orders"],
+            [{"table": "ds", "schema": "Table: ds | Columns: usubjid:varchar", "via": "fk"}],
+            {"ds": "s1"},
+            {"ds": ["s1", "s2", "s3"]},
+        )
+        assert "Table: ds | Databases: s1, s2, s3 (several databases hold this table" in block
+        assert "write it as" not in block
+
 
 @pytest.mark.unit
 def test_hit_class_iri_reads_either_metadata_key():
@@ -232,7 +242,6 @@ def mock_llm():
 @pytest.fixture
 def mock_vector():
     vector = AsyncMock()
-    vector.count_documents.return_value = 1
     vector.search.return_value = [
         VectorHit(
             id="1",

@@ -21,6 +21,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from coa_common.label_language import LabelPreference
+
 # ── Vector store ────────────────────────────────────────────────────────
 
 
@@ -78,8 +80,14 @@ class VectorStore(Protocol):
         entity_type: str | None = None,
         embedding_type: str | None = None,
         namespace: str | None = None,
+        limit: int | None = None,
     ) -> list[dict]:
-        """Return all embeddings attached to an ontology."""
+        """Return embeddings attached to an ontology.
+
+        ``limit`` is an explicit caller-side ceiling. Implementations must
+        honor it before transferring result rows so bounded metadata consumers
+        do not accidentally enumerate an entire vector index.
+        """
         ...
 
     def list_searchable_entity_uris(
@@ -149,7 +157,9 @@ class VectorStore(Protocol):
     ) -> int:
         """Drop every embedding whose ``entity_uri`` is in ``entity_uris`` within a single ontology.
 
-        Returns the deleted count.
+        Returns the deleted count. Raises when it cannot remove them all: append
+        ingest relies on that to fail an accept instead of leaving the stale
+        embedding searchable beside the new one.
 
         Used by append-mode ingest right before it re-embeds the subjects of an
         incoming proposal: a class whose description a steward replaced must not
@@ -219,6 +229,8 @@ class GraphStore(Protocol):
         comments: list[str] | None = None,
         super_classes: list[str] | None = None,
         is_mapped: bool = False,
+        query_backend: str | None = None,
+        data_source_id: str | None = None,
     ) -> dict:
         """Persist a class into an ontology's named graph.
 
@@ -228,7 +240,11 @@ class GraphStore(Protocol):
             labels: Human-readable labels for the class.
             comments: Definitions/comments for the class.
             super_classes: Parent class URIs (``rdfs:subClassOf`` targets).
-            is_mapped: Whether the class is R2RML-mapped (SQL-backed, Tier-2).
+            is_mapped: Whether the class is structured-answerable (Tier-2): the
+                ``rr:class`` of an R2RML TriplesMap, or a class bound to a graph source.
+            query_backend: Which structured backend answers it (``"RDF_SPARQL"`` for a
+                graph class). ``None`` for SQL — absence is read as SQL by serve.
+            data_source_id: The source backing a graph class, for serve routing.
 
         Returns:
             The stored class as a dict.
@@ -335,6 +351,8 @@ class GraphStore(Protocol):
         self,
         vertex_uri: str,
         namespace: str | None = None,
+        *,
+        label_preference: LabelPreference | None = None,
     ) -> dict | None:
         """Return ``vertex_uri``'s outgoing triples + neighbor metadata.
 
@@ -376,6 +394,8 @@ class GraphStore(Protocol):
         exclude_ontology_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        *,
+        label_preference: LabelPreference | None = None,
     ) -> list[dict]:
         """Substring search over entity IRIs and labels in a namespace.
 
@@ -408,6 +428,7 @@ class GraphStore(Protocol):
         namespace: str | None = None,
         *,
         sample: bool = False,
+        label_preference: LabelPreference | None = None,
     ) -> dict | None:
         """Return every class and property persisted in one ontology's graph.
 
@@ -444,8 +465,14 @@ class GraphStore(Protocol):
         *,
         max_results: int = 100,
         include_properties: bool = True,
+        label_preference: LabelPreference | None = None,
+        class_prefix: str | None = None,
     ) -> dict:
         """List all classes and properties across all ontologies in a namespace.
+
+        ``class_prefix`` keeps only classes whose IRI equals it or sits under it
+        as an IRI namespace (``#`` / ``/``), applied before ``max_results``
+        truncates the page.
 
         Returns::
             {

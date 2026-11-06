@@ -34,13 +34,15 @@ this module never pulls ``graphrag_toolkit`` (or the concrete Bedrock client) in
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import structlog
+from coa_common.language_tags import LanguageTagError, canonicalize_language_tag, primary_language
 
-from .models import SubQuestion
+from .models import NAMED_TERM_KINDS, SubQuestion
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime/graphrag import
     from ...clients.base import LLMClient
@@ -69,10 +71,76 @@ _SYSTEM_INSTRUCTION = (
     "'subsidiaries', 'partners') rather than named ones, keep it as a SINGLE "
     'sub-question and set "multi_entity": true, so the agent can anchor and branch '
     "on those entities during retrieval rather than guessing them now.\n\n"
+    "Also report the natural language the question is written in, as its BCP 47 "
+    "language tag (for example en, ja, es, pt-BR). If the question has no clear "
+    "natural language (for example it is only a code, a number, an acronym or a "
+    "product name), report und.\n\n"
     "Respond with ONLY a JSON object of this exact shape, and no prose outside it:\n"
-    '{"sub_questions": [{"text": "<question text>", "multi_entity": <true|false>}]}\n'
+    '{"sub_questions": [{"text": "<question text>", "multi_entity": <true|false>}], '
+    '"language": "<BCP 47 tag>"}\n'
     "Always return at least one sub-question."
 )
+
+# Variant used when the request routes named terms to documents
+# (options.entityRouting): the SAME call also lists the question's named terms, so
+# term extraction costs no extra model round trip. Unused otherwise.
+_SYSTEM_INSTRUCTION_WITH_TERMS = (
+    _SYSTEM_INSTRUCTION.rsplit("Respond with ONLY", 1)[0]
+    + f"Also list the question's NAMED TERMS: {NAMED_TERM_KINDS} — "
+    "copied verbatim from the question, at most 8. Do not list generic words, dates "
+    "or periods alone.\n\n"
+    "Respond with ONLY a JSON object of this exact shape, and no prose outside it:\n"
+    '{"sub_questions": [{"text": "<question text>", "multi_entity": <true|false>}], '
+    '"language": "<BCP 47 tag>", "named_terms": ["<term>", ...]}\n'
+    "Always return at least one sub-question."
+)
+# Named terms kept from one question: enough for a multi-entity question, and the
+# same bound find_documents applies (MAX_TERMS), so each extracted term is routed.
+_MAX_NAMED_TERMS = 8
+# Sub-questions run as parallel loops that share the request's step and time
+# budget, so each extra one dilutes the others and adds concurrent tool calls.
+# Questions in practice split into 2-4; past 6 the rest are left out (and traced)
+# rather than started.
+_MAX_SUB_QUESTIONS = 6
+
+# Scripts that settle the language without a model call. Kana is unique to
+# Japanese and Hangul to Korean; Han characters alone are left to the model, since
+# they could be Chinese or Japanese.
+_SCRIPT_LANGUAGES = (
+    (re.compile(r"[\u3040-\u30ff]"), "ja"),
+    (re.compile(r"[\uac00-\ud7af\u1100-\u11ff]"), "ko"),
+)
+
+
+def _script_language(text: str) -> str:
+    """Return the tag a script settles (kana -> ja, Hangul -> ko), or ``""``."""
+    for pattern, tag in _SCRIPT_LANGUAGES:
+        if pattern.search(text):
+            return tag
+    return ""
+
+
+def _parse_language_tag(raw: Any) -> str:
+    """Return the canonical BCP 47 tag the model reported, or ``""``.
+
+    Accepts a bare tag (``en``) or a labelled one (``Language: en``); the part
+    after the last colon is used. Words in free prose are NOT scanned for a tag,
+    because common English words are valid tags (``it`` is Italian, ``is`` is
+    Icelandic). A primary subtag longer than three letters is rejected too: the
+    tag syntax accepts words like ``english``, but no language in use has such a
+    code. Anything that does not validate is dropped and never reaches a prompt.
+    """
+    if not isinstance(raw, str):
+        return ""
+    candidate = raw.rsplit(":", 1)[-1].strip().strip("`'\".")
+    try:
+        tag = canonicalize_language_tag(candidate)
+    except LanguageTagError:
+        tag = ""
+    if tag and len(primary_language(tag)) <= 3:
+        return tag
+    logger.warning("decompose_language_unresolved", raw=raw[:40])
+    return ""
 
 
 class DecompositionPlanner:
@@ -121,6 +189,23 @@ class DecompositionPlanner:
         return self._guardrail_id
 
     async def decompose(self, query: str, trace: TraceCollector | None = None) -> list[SubQuestion]:
+        """Decompose ``query`` into Sub_Questions; see :meth:`decompose_with_language`."""
+        sub_questions, _language = await self.decompose_with_language(query, trace)
+        return sub_questions
+
+    async def decompose_with_terms(
+        self, query: str, trace: TraceCollector | None = None
+    ) -> tuple[list[SubQuestion], str, list[str]]:
+        """:meth:`decompose_with_language` that also returns the question's named terms.
+
+        One planner call (the term list is part of the same JSON answer). Terms
+        are verbatim names/identifiers for document routing; empty on any failure.
+        """
+        return await self._decompose(query, trace, extract_terms=True)
+
+    async def decompose_with_language(
+        self, query: str, trace: TraceCollector | None = None
+    ) -> tuple[list[SubQuestion], str]:
         """Decompose ``query`` into one or more Sub_Questions (Req 13.1-13.3).
 
         Consults the planner LLM for a structured decomposition decision. Returns
@@ -130,21 +215,36 @@ class DecompositionPlanner:
         planner failure it degrades to a single Sub_Question carrying the original
         query. The Query_Decomposition is recorded in the trace (Req 13.10).
 
+        The same planner call also names the question's language, so the session
+        resolves it once without a second model call. A script that settles the
+        language (kana, Hangul) wins over the model's tag. When no tag can be
+        resolved (including every fallback path) the language is ``""`` and
+        callers keep matching the question's language as before.
+
         Args:
             query: The input question to evaluate for decomposition.
             trace: The session :class:`TraceCollector`; when provided, one
                 ``decompose`` step is recorded describing the decision.
 
         Returns:
-            A non-empty list of :class:`SubQuestion` with ``origin="decomposition"``.
+            A non-empty list of :class:`SubQuestion` with ``origin="decomposition"``,
+            and the canonical BCP 47 tag of the question's language or ``""``.
         """
+        sub_questions, language, _terms = await self._decompose(query, trace, extract_terms=False)
+        return sub_questions, language
+
+    async def _decompose(
+        self, query: str, trace: TraceCollector | None, *, extract_terms: bool
+    ) -> tuple[list[SubQuestion], str, list[str]]:
+        """Shared body of the decompose methods; ``extract_terms`` adds the term list."""
         start = time.perf_counter()
         prompt = query[: self._max_query_chars]
+        script_language = _script_language(prompt)
 
         try:
             result = await self._planner.converse(
                 prompt=prompt,
-                system=_SYSTEM_INSTRUCTION,
+                system=_SYSTEM_INSTRUCTION_WITH_TERMS if extract_terms else _SYSTEM_INSTRUCTION,
                 guardrail_id=self._effective_guardrail_id(),
                 guard_content=f"Question: {prompt}",
                 temperature=0.0,
@@ -155,28 +255,50 @@ class DecompositionPlanner:
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
-            return self._fallback(query, trace, start, detail=f"planner error: {type(exc).__name__}")
+            return (
+                self._fallback(query, trace, start, detail=f"planner error: {type(exc).__name__}"),
+                script_language,
+                [],
+            )
 
         if getattr(result, "guardrail_blocked", False):
             logger.warning("decompose_guardrail_blocked")
-            return self._fallback(query, trace, start, detail="planner guardrail blocked")
+            return self._fallback(query, trace, start, detail="planner guardrail blocked"), script_language, []
 
-        sub_questions = self._parse(result.text, query)
+        payload = self._extract_json_object(result.text)
+        sub_questions = self._parse_payload(payload)
         if sub_questions is None:
-            return self._fallback(query, trace, start, detail="unparseable planner response")
+            return self._fallback(query, trace, start, detail="unparseable planner response"), script_language, []
+        left_out = len(sub_questions) - _MAX_SUB_QUESTIONS
+        if left_out > 0:
+            logger.warning("decompose_sub_questions_capped", proposed=len(sub_questions), kept=_MAX_SUB_QUESTIONS)
+            sub_questions = sub_questions[:_MAX_SUB_QUESTIONS]
+        language = script_language or _parse_language_tag(payload.get("language") if payload else None)
 
         ms = int((time.perf_counter() - start) * 1000)
         if len(sub_questions) > 1:
             detail = f"decomposed into {len(sub_questions)} sub-questions: " + " | ".join(
                 sq.text[:60] for sq in sub_questions
             )
+            if left_out > 0:
+                detail += f" ({left_out} more left out, cap {_MAX_SUB_QUESTIONS})"
         else:
             multi = " (multi-entity)" if sub_questions[0].multi_entity else ""
             detail = f"single self-contained sub-question{multi}"
         self._record(trace, "success", ms, detail)
-        return sub_questions
+        terms = self._parse_terms(payload) if extract_terms else []
+        return sub_questions, language, terms
 
     # ── parsing ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_terms(payload: dict[str, Any] | None) -> list[str]:
+        """The ``named_terms`` list of a decomposition answer (strings only, bounded)."""
+        raw = (payload or {}).get("named_terms")
+        if not isinstance(raw, list):
+            return []
+        terms = [t.strip() for t in raw if isinstance(t, str) and t.strip()]
+        return terms[:_MAX_NAMED_TERMS]
 
     def _parse(self, text: str, query: str) -> list[SubQuestion] | None:
         """Parse the planner's JSON decision into Sub_Questions.
@@ -186,7 +308,10 @@ class DecompositionPlanner:
         ``sub_questions`` list can be recovered (caller falls back). An empty or
         all-blank ``sub_questions`` list also yields ``None``.
         """
-        payload = self._extract_json_object(text)
+        return self._parse_payload(self._extract_json_object(text))
+
+    def _parse_payload(self, payload: dict[str, Any] | None) -> list[SubQuestion] | None:
+        """Turn an extracted JSON object into Sub_Questions, or ``None`` if unusable."""
         if payload is None:
             return None
         raw = payload.get("sub_questions")

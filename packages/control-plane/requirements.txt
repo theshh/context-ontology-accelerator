@@ -1,8 +1,10 @@
-cedarpy>=4.12.0
+# The Lambdas install from requirements.lock.txt (hash-pinned), not this file.
+# After editing it, run scripts/relock-python-requirements.sh.
+cedarpy>=4.12.1
 pydantic>=2.13.5
 pydantic-settings>=2.15.0
 structlog>=24.4.0
-cryptography>=50.0.1
+cryptography>=50.0.2
 PyJWT>=2.15.1
 requests>=2.34.2
 # Namespace teardown drops the namespace's AOSS indexes via
@@ -12,3 +14,6 @@ requests>=2.34.2
 # missing entry here is a Runtime.ImportModuleError at invoke time, not a build
 # failure. Keep in step with metric-service/ontology-engine.
 opensearch-py>=2.8.0
+# 2026.10.19 is the first certifi bundle without the roots behind the compromised
+# emSign intermediates. botocore also uses certifi's bundle over its own when installed.
+certifi>=2026.10.19

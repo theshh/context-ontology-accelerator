@@ -5,9 +5,17 @@ import * as fs from "fs";
 import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import { Template, Match } from "aws-cdk-lib/assertions";
+import { expectIdempotencyWiring } from "../utils/idempotency-assertions";
 import { OntologyStack } from "../../lib/stacks/services/ontology-stack";
 import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { DEFAULT_RESOURCE_PREFIX, DEFAULT_ENV } from "../../lib/constants";
+import {
+  LONG_PREFIX_CONTEXT,
+  expectValidAossNames,
+} from "../utils/aoss-name-assertions";
+import { expectAossGrantsCoveredByDataPolicies } from "../utils/aoss-access-assertions";
+import { matchesEventPattern } from "../utils/event-pattern";
+import { expectEveryTaskCanPullGuardDutyAgent } from "../utils/guardduty-agent-assertions";
 
 const TEST_CONTEXT = {
   resource_prefix: DEFAULT_RESOURCE_PREFIX,
@@ -28,10 +36,12 @@ function renderOntology(
     bedrockEmbedDimensions?: number;
     bedrockInductionLlmModelId?: string;
     bedrockChatModelId?: string;
+    bedrockGroundingLlmModelId?: string;
   },
   id: string,
+  extraContext: Record<string, unknown> = {},
 ): Template {
-  const app = new cdk.App({ context: TEST_CONTEXT });
+  const app = new cdk.App({ context: { ...TEST_CONTEXT, ...extraContext } });
   const network = new NetworkStack(app, `${id}Network`);
   return Template.fromStack(
     new OntologyStack(app, id, {
@@ -79,6 +89,7 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
         bedrockEmbedDimensions: 512,
         bedrockInductionLlmModelId: "jp.anthropic.claude-sonnet-4-6",
         bedrockChatModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+        bedrockGroundingLlmModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
       },
       "CfgOntology",
     );
@@ -94,6 +105,10 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
     expect(envValue(t, "BEDROCK_CHAT_MODEL_ID")).toBe(
       "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
     );
+    // Grounding reranker override reaches the container (GH #236).
+    expect(envValue(t, "GROUNDING_LLM_MODEL_ID")).toBe(
+      "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
   });
 
   test("omitting config keeps the previous defaults (backward compatibility)", () => {
@@ -104,25 +119,163 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
     expect(envValue(t, "LLM_MODEL_ID")).toBe("us.anthropic.claude-sonnet-5");
   });
 
+  test("grounding model defaults to the chat model, independently overridable (GH #236)", () => {
+    // Unset: grounding follows the chat (Haiku) model, not the induction model.
+    const def = renderOntology({}, "GroundDefaultOntology");
+    expect(envValue(def, "GROUNDING_LLM_MODEL_ID")).toBe(
+      "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+    expect(envValue(def, "GROUNDING_LLM_MODEL_ID")).toBe(
+      envValue(def, "BEDROCK_CHAT_MODEL_ID"),
+    );
+
+    // A grounding override wins over the chat model and does not disturb it.
+    const ovr = renderOntology(
+      {
+        bedrockChatModelId: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        bedrockGroundingLlmModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+      },
+      "GroundOverrideOntology",
+    );
+    expect(envValue(ovr, "GROUNDING_LLM_MODEL_ID")).toBe(
+      "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+    expect(envValue(ovr, "BEDROCK_CHAT_MODEL_ID")).toBe(
+      "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+  });
+
   test("dashboard ModelId dimensions follow the configured models", () => {
     // The dashboard used to hold independent literal copies, so a configured
-    // model left the Bedrock widgets querying a dimension with no data.
+    // model left the Bedrock widgets querying a dimension with no data. The
+    // Bedrock widgets plot the induction invoker (Sonnet), the enrichment
+    // invoker (chat/Haiku), embeddings, and — when it differs from chat — the
+    // grounding invoker.
     const t = renderOntology(
       {
         bedrockEmbedModelId: "cohere.embed-v4:0",
         bedrockInductionLlmModelId: "jp.anthropic.claude-sonnet-4-6",
         bedrockChatModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+        // Grounding distinct from chat → it gets its own dimension.
+        bedrockGroundingLlmModelId: "global.anthropic.claude-haiku-4-5-20251001-v1:0",
       },
       "DashOntology",
     );
     const dashboards = t.findResources("AWS::CloudWatch::Dashboard");
     const body = JSON.stringify(Object.values(dashboards));
+    // Induction (Sonnet), chat (Haiku), grounding (distinct), and embed all appear.
     expect(body).toContain("jp.anthropic.claude-sonnet-4-6");
     expect(body).toContain("jp.anthropic.claude-haiku-4-5-20251001-v1:0");
+    expect(body).toContain("global.anthropic.claude-haiku-4-5-20251001-v1:0");
     expect(body).toContain("cohere.embed-v4:0");
     // No stale us. literals left behind in the widgets.
-    expect(body).not.toContain("us.anthropic.claude-sonnet-4-6");
     expect(body).not.toContain("us.cohere.embed-v4:0");
+  });
+
+  test("cost estimate never prices one ModelId as two terms (GH #236)", () => {
+    // Default deploy: grounding == chat, so the cost MathExpression must NOT
+    // carry a grounding (gi/go) term — otherwise the chat/Haiku tokens would be
+    // counted twice (once as hi/ho, once as gi/go). Regression guard for the
+    // rerank/haiku double-count Kun flagged.
+    const def = renderOntology({}, "CostDefaultOntology");
+    const defBody = JSON.stringify(
+      Object.values(def.findResources("AWS::CloudWatch::Dashboard")),
+    );
+    const costExpr = (body: string): string => {
+      // The est-cost MathExpression is the only one multiplying by a Sonnet price.
+      const m = body.match(/si\*0\.003[^"]*/);
+      return m ? m[0] : "";
+    };
+    const defExpr = costExpr(defBody);
+    expect(defExpr).not.toBe("");
+    // si/so (induction, Sonnet) and hi/ho (chat, Haiku) present; no gi/go by default.
+    expect(defExpr).toContain("si*0.003");
+    expect(defExpr).toContain("hi*0.001");
+    expect(defExpr).not.toContain("gi*");
+    expect(defExpr).not.toContain("go*");
+
+    // Grounding distinct from chat: a separate Haiku-priced gi/go term appears,
+    // so grounding tokens are priced once at Haiku rates (not folded into si/so
+    // at Sonnet rates, and not double-counted with hi/ho).
+    const ovr = renderOntology(
+      {
+        bedrockChatModelId: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        bedrockGroundingLlmModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+      },
+      "CostGroundingOntology",
+    );
+    const ovrExpr = costExpr(
+      JSON.stringify(
+        Object.values(ovr.findResources("AWS::CloudWatch::Dashboard")),
+      ),
+    );
+    expect(ovrExpr).toContain("gi*0.001"); // grounding priced at Haiku input
+    expect(ovrExpr).toContain("go*0.005"); // grounding priced at Haiku output
+  });
+});
+
+describe("OntologyStack OoPS! endpoint is opt-in (#171)", () => {
+  test("oops_endpoint context reaches the container as OOPS_ENDPOINT", () => {
+    const t = renderOntology({}, "OopsOn", {
+      oops_endpoint: "https://oops.example.test/rest",
+    });
+    expect(envValue(t, "OOPS_ENDPOINT")).toBe("https://oops.example.test/rest");
+  });
+
+  test("a non-https oops_endpoint fails synth", () => {
+    expect(() =>
+      renderOntology({}, "OopsHttp", {
+        oops_endpoint: "http://oops.example.test/rest",
+      }),
+    ).toThrow(/https:\/\//);
+  });
+
+  test("the https scheme check is case-insensitive", () => {
+    const t = renderOntology({}, "OopsUpper", {
+      oops_endpoint: "HTTPS://oops.example.test/rest",
+    });
+    expect(envValue(t, "OOPS_ENDPOINT")).toBe("HTTPS://oops.example.test/rest");
+  });
+
+  test.each([
+    ["object", { url: "https://oops.example.test/rest" }],
+    ["boolean", true],
+    ["number", 443],
+  ])("a non-string (%s) oops_endpoint fails synth", (_label, value) => {
+    expect(() =>
+      renderOntology({}, `OopsBad${_label}`, { oops_endpoint: value }),
+    ).toThrow(/https:\/\//);
+  });
+
+  test.each([
+    ["absent", {}],
+    ["empty", { oops_endpoint: "" }],
+    ["whitespace", { oops_endpoint: "  " }],
+  ])("%s oops_endpoint leaves OOPS_ENDPOINT unset", (_label, ctx) => {
+    const t = renderOntology({}, `OopsOff${_label}`, ctx);
+    expect(containerEnv(t).some((e) => e.Name === "OOPS_ENDPOINT")).toBe(false);
+  });
+});
+
+describe("OntologyStack graph-sources switch", () => {
+  const lambdaEnvs = (t: Template) =>
+    Object.values(t.findResources("AWS::Lambda::Function")).map(
+      (f: any) => f.Properties.Environment?.Variables ?? {},
+    );
+
+  test("off (the default) sets GRAPH_SOURCES_ENABLED nowhere", () => {
+    const t = renderOntology({}, "GraphOff");
+    expect(containerEnv(t).some((e) => e.Name === "GRAPH_SOURCES_ENABLED")).toBe(
+      false,
+    );
+    for (const env of lambdaEnvs(t)) {
+      expect(env).not.toHaveProperty("GRAPH_SOURCES_ENABLED");
+    }
+  });
+
+  test("on reaches the ontology-engine container, which runs ontology import", () => {
+    const t = renderOntology({}, "GraphOn", { graph_sources: "on" });
+    expect(envValue(t, "GRAPH_SOURCES_ENABLED")).toBe("true");
   });
 });
 
@@ -150,6 +303,19 @@ describe("OntologyStack", () => {
         allowedOrigin: "https://test.example.com",
       }),
     );
+  });
+
+  test("lets the task execution role pull the GuardDuty Fargate agent", () => {
+    expectEveryTaskCanPullGuardDutyAgent(template, 1, "${AWS::Region}");
+  });
+
+  test("names every aoss:APIAccessAll role in an AOSS data-access policy", () => {
+    expectAossGrantsCoveredByDataPolicies(template);
+  });
+
+  it("wires only the create-operation Lambda(s) to the idempotency table", () => {
+    // IDEMPOTENCY_TABLE env + Get/Put/Update/DeleteItem on that table only.
+    expectIdempotencyWiring(template, ["-ontology-api-proxy"]);
   });
 
   // ── DynamoDB Table ──────────────────────────────────────────────
@@ -429,7 +595,8 @@ describe("OntologyStack", () => {
   test("EventBridge rule fires on ECS OOM / exit-137 task stops", () => {
     // A SIGKILL/exit-137 runs neither except nor finally, so the custom
     // metrics never emit — this rule makes the OOM visible from the ECS
-    // Task State Change event (stoppedReason ~ OutOfMemory OR exitCode 137).
+    // Task State Change event (an OutOfMemory reason, or exit 137 from an
+    // essential container that died on its own).
     const rules = template.findResources("AWS::Events::Rule");
     const ruleValues = Object.values(rules);
     const oomRule = ruleValues.find((r) => {
@@ -443,11 +610,129 @@ describe("OntologyStack", () => {
     });
     expect(oomRule).toBeDefined();
     const serialized = JSON.stringify(oomRule!.Properties.EventPattern);
-    // Matches OOM stoppedReason (wildcard) and/or the exit-137 container code.
+    // Matches an OutOfMemory reason (wildcard) or the exit-137 container code.
     expect(serialized).toContain("OutOfMemory");
     expect(serialized).toContain("137");
     // Scoped to STOPPED tasks so it doesn't fire on every state transition.
     expect(serialized).toContain("STOPPED");
+  });
+
+  describe("EventBridge OOM rule against ECS Task State Change events", () => {
+    // ECS stops a task it is replacing with SIGTERM and, after the stop
+    // timeout, SIGKILL: exit 137 with no OOM involved. Only an OutOfMemory
+    // reason, or an essential container that died on its own, is an OOM.
+    const matchesOomRule = (detail: Record<string, unknown>): boolean => {
+      const [rule] = Object.values(
+        template.findResources("AWS::Events::Rule", {
+          Properties: { Name: `${PREFIX}-ontology-oom` },
+        }),
+      );
+      const pattern = rule.Properties.EventPattern;
+      return matchesEventPattern(pattern, {
+        source: "aws.ecs",
+        "detail-type": "ECS Task State Change",
+        detail: {
+          clusterArn: pattern.detail.clusterArn[0],
+          lastStatus: "STOPPED",
+          ...detail,
+        },
+      });
+    };
+
+    test.each([
+      [
+        "a deploy SIGKILLing a task past its stop timeout",
+        {
+          stopCode: "ServiceSchedulerInitiated",
+          stoppedReason:
+            "Scaling activity initiated by (deployment ecs-svc/1234567890123456789)",
+          containers: [{ name: "ontology-engine", exitCode: 137 }],
+        },
+      ],
+      [
+        "a StopTask call SIGKILLing a task past its stop timeout",
+        {
+          stopCode: "UserInitiated",
+          stoppedReason: "Task stopped by user",
+          containers: [{ name: "ontology-engine", exitCode: 137 }],
+        },
+      ],
+      [
+        "a task that exited cleanly",
+        {
+          stopCode: "EssentialContainerExited",
+          stoppedReason: "Essential container in task exited",
+          containers: [{ name: "ontology-engine", exitCode: 0 }],
+        },
+      ],
+    ])("does not match %s", (_case, detail) => {
+      expect(matchesOomRule(detail)).toBe(false);
+    });
+
+    test.each([
+      [
+        "a container OOM-killed by the kernel",
+        {
+          stopCode: "EssentialContainerExited",
+          stoppedReason: "Essential container in task exited",
+          containers: [
+            {
+              name: "ontology-engine",
+              exitCode: 137,
+              reason: "OutOfMemoryError: Container killed due to memory usage",
+            },
+          ],
+        },
+      ],
+      [
+        "an OOM while a deploy is stopping the task",
+        {
+          stopCode: "ServiceSchedulerInitiated",
+          stoppedReason:
+            "Scaling activity initiated by (deployment ecs-svc/1234567890123456789)",
+          containers: [
+            {
+              name: "ontology-engine",
+              exitCode: 137,
+              reason: "OutOfMemoryError: Container killed due to memory usage",
+            },
+          ],
+        },
+      ],
+      [
+        "an OutOfMemory task stoppedReason",
+        {
+          stopCode: "ServiceSchedulerInitiated",
+          stoppedReason:
+            "OutOfMemoryError: Container killed due to memory usage",
+          containers: [{ name: "ontology-engine", exitCode: 137 }],
+        },
+      ],
+      [
+        "an essential container SIGKILLed with no reason given",
+        {
+          stopCode: "EssentialContainerExited",
+          stoppedReason: "Essential container in task exited",
+          containers: [{ name: "ontology-engine", exitCode: 137 }],
+        },
+      ],
+    ])("matches %s", (_case, detail) => {
+      expect(matchesOomRule(detail)).toBe(true);
+    });
+
+    test("is scoped to the ontology cluster", () => {
+      const [clusterId] = Object.keys(
+        template.findResources("AWS::ECS::Cluster"),
+      );
+      template.hasResourceProperties("AWS::Events::Rule", {
+        Name: `${PREFIX}-ontology-oom`,
+        EventPattern: Match.objectLike({
+          detail: Match.objectLike({
+            clusterArn: [{ "Fn::GetAtt": [clusterId, "Arn"] }],
+          }),
+        }),
+      });
+    });
   });
 
   test("EventBridge OOM rule surfaces a CloudWatch metric + alarm", () => {
@@ -485,10 +770,11 @@ describe("OntologyStack", () => {
 
 // The running coa-dev-ontology-engine image accreted Critical/High OS CVEs
 // (glibc, perl, sqlite3, libssh2, gzip, pcre2) whenever a build predated the
-// Debian point releases that fix them. Two Dockerfile properties keep the image
-// patchable: a pinned base digest (supply-chain integrity + a cache-busting
-// bump lever) and a post-install `apt-get upgrade` (the only mechanism pulling
-// trixie-security point releases in). These guard both against regression —
+// Debian point releases that fix them; the base is now AL2023. Two
+// Dockerfile properties keep the image patchable: a pinned base digest
+// (supply-chain integrity + a cache-busting bump lever) and a post-install
+// `dnf upgrade --releasever=latest` (the only mechanism pulling AL2023 security
+// updates in past the pinned snapshot). These guard both against regression —
 // removing the upgrade line, or floating the base back onto a mutable tag, is
 // exactly how the CVEs came back.
 describe("ontology-engine Dockerfile CVE hygiene", () => {
@@ -507,20 +793,19 @@ describe("ontology-engine Dockerfile CVE hygiene", () => {
 
   test("pins the base image to a digest, not a mutable tag", () => {
     const from = dockerfile.match(
-      /^FROM .*python:3\.12-slim(@sha256:[a-f0-9]{64})?/m,
+      /^FROM .*amazonlinux:2023-minimal(@sha256:[a-f0-9]{64})?/m,
     );
     expect(from).not.toBeNull();
     // A digest pin (@sha256:...) must be present; a bare/:latest tag would let
     // the base float and silently reintroduce unpatched packages.
     expect(from?.[1]).toMatch(/@sha256:[a-f0-9]{64}/);
-    expect(dockerfile).not.toMatch(/python:3\.12-slim\s*$/m);
+    expect(dockerfile).not.toMatch(/amazonlinux:2023-minimal\s*$/m);
   });
 
-  test("runs apt-get upgrade so OS security point releases are applied", () => {
-    // This is the line that resolves the Debian package CVEs at build time.
-    // Must be `upgrade`, never `dist-upgrade` (which may remove packages).
-    expect(dockerfile).toMatch(/apt-get upgrade -y/);
-    expect(dockerfile).not.toMatch(/apt-get dist-upgrade/);
+  test("runs dnf upgrade against the latest AL2023 release so OS security updates are applied", () => {
+    // AL2023 locks dnf to the base image's repo snapshot; without
+    // --releasever=latest a stale digest pin freezes the OS patch level.
+    expect(dockerfile).toMatch(/dnf upgrade -y --releasever=latest/);
   });
 
   test("strips owlready2's unused Pellet reasoner (vulnerable bundled JARs)", () => {
@@ -541,5 +826,13 @@ describe("ontology-engine Dockerfile CVE hygiene", () => {
 
   test("upgrades pip so its own advisories are picked up", () => {
     expect(dockerfile).toMatch(/pip install[^\n]*--upgrade pip/);
+  });
+});
+
+describe("OntologyStack with a long resource_prefix", () => {
+  it("keeps every OpenSearch Serverless name valid", () => {
+    expectValidAossNames(
+      renderOntology({}, "TestOntologyLongPrefix", LONG_PREFIX_CONTEXT),
+    );
   });
 });

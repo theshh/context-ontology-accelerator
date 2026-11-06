@@ -16,6 +16,8 @@ from typing import Any
 
 import structlog
 from coa_common.dao import DynamoDBDAO
+from coa_common.idempotency import idempotent_create
+from coa_common.language_tags import LanguageTagError
 from coa_common.logging import setup_logging
 from coa_common.metadata_store import MetadataStoreError, SMUSClient
 from coa_common.response import api_response
@@ -46,7 +48,7 @@ def _get_service() -> NamespaceService:
     return _service
 
 
-def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+def _create(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Create a namespace from an API Gateway request.
 
     Rejects non-POST methods, parses and validates the request body, then
@@ -83,6 +85,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     try:
         ns = _get_service().create(request)
         return api_response(201, {"namespace": ns.model_dump(by_alias=True, exclude_none=True)})
+    except LanguageTagError as exc:
+        logger.info("namespace_language_rejected", reason=str(exc))
+        return api_response(400, {"message": f"Invalid language: {exc}"})
     except ConflictError as exc:
         return api_response(409, {"message": str(exc)})
     except MetadataStoreError as exc:
@@ -99,3 +104,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     except Exception as exc:
         logger.exception("unhandled_error", error=str(exc))
         return api_response(500, {"message": "Internal server error"})
+
+
+def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    """CreateNamespace entry point: retry-safe when the body carries a ``clientToken``.
+
+    The token is validated, removed from the body, and used to replay the
+    original response for a retried request (see ``coa_common.idempotency``).
+    """
+    return idempotent_create(event, lambda ev: _create(ev, context), operation="CreateNamespace")

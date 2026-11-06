@@ -8,9 +8,14 @@ $version: "2"
 
 namespace com.amazon.semanticcontext.ontologyinduction
 
+use com.amazon.semanticcontext.common#ClientToken
 use com.amazon.semanticcontext.common#ConflictError
 use com.amazon.semanticcontext.common#NotFoundError
+use com.amazon.semanticcontext.common#OntologyId
 use com.amazon.semanticcontext.common#PaginatedOutput
+use com.amazon.semanticcontext.common#PaginationToken
+use com.amazon.semanticcontext.common#PresignedUrl
+use com.amazon.semanticcontext.common#ServiceUnavailableError
 use com.amazon.semanticcontext.common#Uuid
 use com.amazon.semanticcontext.common#ValidationError
 use com.amazon.semanticcontext.metric#DataSourceId
@@ -27,11 +32,25 @@ enum InductionStrategy {
     /// Structured strategy: induce an ontology directly from relational table schemas.
     TABLE_TO_ONTOLOGY = "table_to_ontology"
 
-    /// The RIGOR ontology induction strategy.
+    /// The RIGOR ontology induction strategy. Available only for namespaces
+    /// whose language has the primary subtag `en`; any other namespace is
+    /// rejected with a validation error before a job starts.
     RIGOR_ONTOLOGY = "rigor_ontology"
 
     /// Unstructured strategy: induce an ontology from a lexical knowledge graph.
     UNSTRUCTURED_LEXICAL_GRAPH = "unstructured_lexical_graph"
+
+    /// Document-to-table bridge, run on its own on the namespace's already
+    /// accepted ontology named by `ontologyUriPrefix`. Links document-induced
+    /// classes to table and column classes and proposes document-derived
+    /// definitions for those tables and columns. Needs an accepted table
+    /// ontology with R2RML mappings into which a document induction was also
+    /// accepted (the same ontology). Writes nothing itself: the completed job
+    /// names a pending proposal (`bridgeReport.proposalId`) holding the touched
+    /// tables with their new definitions, which is reviewed and accepted like
+    /// any other proposal. `datasourceIds` is ignored; send an empty list.
+    /// Returns a `jobId` to poll with GetInductionJob.
+    BRIDGE_TO_TABLES = "bridge_to_tables"
 }
 
 /// Grounding mode — how aggressively induced classes are aligned to existing
@@ -105,6 +124,12 @@ enum InductionJobStatus {
 
     /// Unstructured stage: serializing the induced ontology.
     SERIALIZING = "serializing"
+
+    // ── Document-to-table bridge ─────────────────────────────────────
+    /// Bridge job (`bridge_to_tables` strategy) in progress. The current step
+    /// is in the job's `progress` field. A bridge job goes
+    /// pending → running → completed | failed.
+    RUNNING = "running"
 }
 
 /// Opt-in expansion for `GetInductionJob`. Omitting it returns the slim poll
@@ -133,6 +158,11 @@ enum InductionSourceType {
 
     /// An unstructured (knowledge-graph-to-ontology) induction run.
     UNSTRUCTURED = "UNSTRUCTURED"
+
+    /// A document-to-table bridge run (`bridge_to_tables` strategy) over an
+    /// accepted ontology. Its result is a pending proposal (or none on a dry
+    /// run); `bridgeReport.proposalId` names it.
+    BRIDGE = "BRIDGE"
 }
 
 /// Proposal status.
@@ -216,6 +246,106 @@ float ConfidenceThreshold
 @range(min: 1, max: 8192)
 integer RerankMaxTokens
 
+/// Switches for one document-to-table bridge run. Every member is optional;
+/// an omitted member takes the default named in its description. An unknown
+/// member is rejected. The run makes one LLM call per batch of up to 25
+/// columns of each table that has document evidence, plus grounding and
+/// embedding calls; `maxTables` caps that one-off cost.
+structure BridgeOptions {
+    /// Most table classes considered in one run. Default 60.
+    @range(min: 1, max: 200)
+    maxTables: Integer
+
+    /// Tables processed in parallel. Default 6.
+    @range(min: 1, max: 16)
+    concurrency: Integer
+
+    /// Compute and report the plan without creating a proposal. Default false.
+    dryRun: Boolean
+}
+
+/// Outcome of a document-to-table bridge run, on a completed bridge job.
+/// Name lists are capped; counts are not. Additional diagnostic counters
+/// may appear.
+structure BridgeReport {
+    /// Ontology the bridge ran on.
+    ontologyId: String
+
+    /// Whether this was a dry run (no proposal created).
+    dryRun: Boolean
+
+    /// The pending proposal holding the planned changes (absent on a dry run
+    /// or when nothing would change). Accept it to write them.
+    proposalId: String
+
+    /// Table classes considered.
+    tablesConsidered: Integer
+
+    /// Tables that had any document evidence and were sent to the LLM.
+    tablesWithEvidence: Integer
+
+    /// Tables with no document evidence (left unchanged).
+    tablesWithoutEvidence: StringList
+
+    /// Definitions proposed for tables.
+    tableDefinitions: Integer
+
+    /// Definitions proposed for columns.
+    columnDefinitions: Integer
+
+    /// Definitions that replaced a placeholder description (the old text is
+    /// kept in the description history).
+    replacedBoilerplate: Integer
+
+    /// Replacements decided by the word-based placeholder check.
+    replacedByRule: Integer
+
+    /// Replacements decided only by the model judging the existing description
+    /// a placeholder: the ones to review before accepting.
+    replacedByModel: Integer
+
+    /// Tables and columns whose description the model alone judged a
+    /// placeholder (capped).
+    replacedByModelSubjects: StringList
+
+    /// Definitions appended after an informative existing description.
+    appendedToExisting: Integer
+
+    /// `skos:closeMatch` / `skos:relatedMatch` links from tables to document classes.
+    tableLinks: Integer
+
+    /// `skos:closeMatch` / `skos:relatedMatch` links from columns to document classes.
+    columnLinks: Integer
+
+    /// Names of the tables given a definition (capped).
+    definedTables: StringList
+
+    /// Names of the columns given a definition (capped).
+    definedColumns: StringList
+
+    /// The links proposed, one per entry as "<table or table.column>
+    /// <closeMatch|relatedMatch> <document class label>" (capped).
+    links: StringList
+
+    /// Definition LLM calls made.
+    llmCalls: Integer
+
+    /// Definition LLM calls that failed after retries.
+    llmFailures: Integer
+
+    /// First LLM error seen, if any.
+    firstLlmError: String
+
+    /// Tables whose definition calls all failed.
+    failedTables: StringList
+
+    /// Run notes (missing evidence sources, search failures).
+    notes: StringList
+
+    /// Wall-clock run time in seconds.
+    elapsedSeconds: Integer
+}
+
 // ── Operations ──────────────────────────────────────────────────────
 /// Start an ontology induction job from one or more data sources.
 /// Returns immediately with a job ID; induction runs asynchronously.
@@ -226,15 +356,23 @@ operation StartInduction {
         @httpLabel
         namespaceId: Uuid
 
-        /// Data source IDs to induct from.
+        /// Data source IDs to induct from. The table-based strategies
+        /// (`table_to_ontology`, `rigor_ontology`) need at least one; an empty
+        /// list is rejected with a 400. `unstructured_lexical_graph` reads the
+        /// lexical graph instead and accepts an empty list. `bridge_to_tables`
+        /// runs on an accepted ontology and ignores the list; send an empty one.
         @required
+        @length(max: 1000)
         datasourceIds: DataSourceIdList
 
-        /// URI prefix for generated ontology classes and properties.
+        /// URI prefix for generated ontology classes and properties. For the
+        /// `bridge_to_tables` strategy, the ID of the accepted ontology to
+        /// bridge (404 if the namespace has no such ontology).
         @required
         ontologyUriPrefix: OntologyUriPrefix
 
         /// Human-readable label for this induction run.
+        @length(max: 256)
         label: String
 
         /// Confidence threshold for matching against existing ontologies.
@@ -248,18 +386,32 @@ operation StartInduction {
         /// Induction strategy to use.
         strategy: InductionStrategy
 
+        /// Options for the `bridge_to_tables` strategy. Omitted → every
+        /// option takes its default. Set on another strategy it returns 400.
+        bridgeOptions: BridgeOptions
+
         /// Existing ontology IDs to ground against (reuse existing concepts).
-        groundingOntologyIds: OntologyIdList
+        groundingOntologyIds: GroundingOntologyIdList
 
         /// How aggressively to ground induced classes against existing ontologies.
         /// Defaults to ENHANCED when omitted.
         groundingMode: GroundingMode
 
-        /// Caller-selected lexical sources are not supported. Providing this field
-        /// returns HTTP 422 with ``detail.code`` set to ``UNSUPPORTED_SOURCE``.
-        /// Omit it to use the deployment-configured lexical source.
+        /// Caller-selected lexical sources are not supported. A Neptune Analytics
+        /// graph ARN or graph id returns HTTP 422 with ``detail.code`` set to
+        /// ``UNSUPPORTED_SOURCE``; the ``neptune-db`` sentinel names the
+        /// deployment-configured lexical source, the same as omitting the field.
         @deprecated(message: "Caller-selected lexical sources are not supported; omit this field.", since: "2026-10-01")
+        @length(min: 1, max: 2048)
+        @pattern("^(?:neptune-db|g-[a-z0-9]+|arn:aws[a-z-]*:neptune-graph:[a-z0-9-]+:[0-9]{12}:graph/g-[a-z0-9]+)$")
         graphArn: String
+
+        /// Optional idempotency token. A retry with the same token and the same
+        /// parameters within 24 hours returns the original result instead of creating
+        /// a duplicate; reusing the token with different parameters is rejected with
+        /// ConflictError (409).
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output := {
@@ -270,6 +422,7 @@ operation StartInduction {
 
     errors: [
         ValidationError
+        NotFoundError
         ConflictError
     ]
 }
@@ -310,6 +463,17 @@ operation GetInductionJob {
         /// Induction report (populated when status is COMPLETED).
         report: InductionReport
 
+        /// Origin of this run; `BRIDGE` for a `bridge_to_tables` job. Items
+        /// lacking it are STRUCTURED.
+        sourceType: InductionSourceType
+
+        /// Current step of a running bridge job, as short free text
+        /// (e.g. "writing definitions for 12 tables").
+        progress: String
+
+        /// Bridge outcome (populated when a `bridge_to_tables` job is COMPLETED).
+        bridgeReport: BridgeReport
+
         /// Error message (populated when status is FAILED).
         error: String
     }
@@ -319,8 +483,13 @@ operation GetInductionJob {
     ]
 }
 
-/// List induction jobs for a namespace.
+/// List induction jobs for a namespace, one page at a time.
+///
+/// A page can hold fewer than `maxResults` jobs, or none, while `nextToken` is
+/// present: each request reads a bounded slice of the job table. Keep paging
+/// until `nextToken` is absent. Jobs are newest-first within a page only.
 @readonly
+@paginated(inputToken: "nextToken", outputToken: "nextToken", pageSize: "maxResults", items: "jobs")
 @http(method: "GET", uri: "/namespaces/{namespaceId}/induce/jobs", code: 200)
 operation ListInductionJobs {
     input := {
@@ -328,16 +497,20 @@ operation ListInductionJobs {
         @httpLabel
         namespaceId: Uuid
 
-        /// Filter by job status.
+        /// Filter by job status. Also accepts `ingested` (the job's proposal
+        /// was accepted) and `cancelled`, which the service stores but this
+        /// enum does not list. Any other value returns 400 listing the allowed
+        /// values.
         @httpQuery("status")
         status: InductionJobStatus
 
         /// Pagination token from a previous response.
         @httpQuery("nextToken")
-        nextToken: String
+        nextToken: PaginationToken
 
-        /// Maximum number of jobs to return.
+        /// Maximum number of jobs to return in one page (default 50).
         @httpQuery("maxResults")
+        @range(min: 1, max: 200)
         maxResults: Integer
     }
 
@@ -348,25 +521,41 @@ operation ListInductionJobs {
     }
 }
 
-/// List data sources that have been successfully inducted.
+/// List data sources that have been successfully inducted, one page at a time,
+/// ordered by data source ID.
 @readonly
+@paginated(inputToken: "nextToken", outputToken: "nextToken", pageSize: "maxResults", items: "datasources")
 @http(method: "GET", uri: "/namespaces/{namespaceId}/induce/datasources/induced", code: 200)
 operation ListInducedDatasources {
     input := {
         @required
         @httpLabel
         namespaceId: Uuid
+
+        /// Pagination token from a previous response.
+        @httpQuery("nextToken")
+        nextToken: PaginationToken
+
+        /// Maximum number of data sources to return in one page (default 1000).
+        @httpQuery("maxResults")
+        @range(min: 1, max: 1000)
+        maxResults: Integer
     }
 
-    output := {
+    output := with [PaginatedOutput] {
         /// Data sources that have been successfully inducted.
         @required
         datasources: InducedDatasourceList
     }
 }
 
-/// List ontology proposals for a namespace.
+/// List ontology proposals for a namespace, newest first, one page at a time.
+///
+/// Proposals are ordered by creation time, newest first, so the first page
+/// holds the newest `maxResults` matches and later pages continue with older
+/// ones. Keep paging until `nextToken` is absent.
 @readonly
+@paginated(inputToken: "nextToken", outputToken: "nextToken", pageSize: "maxResults", items: "proposals")
 @http(method: "GET", uri: "/namespaces/{namespaceId}/proposals", code: 200)
 operation ListProposals {
     input := {
@@ -378,16 +567,29 @@ operation ListProposals {
         @httpQuery("status")
         status: ProposalStatus
 
-        /// Filter by target ontology ID.
+        /// Filter by target ontology ID. The server also accepts the legacy
+        /// spelling `ontology_id`; this one wins when both are sent.
         @httpQuery("ontologyId")
-        ontologyId: String
+        ontologyId: OntologyId
+
+        /// Filter by induction origin. `STRUCTURED` also matches proposals
+        /// recorded before the attribute existed.
+        @httpQuery("source_type")
+        sourceType: InductionSourceType
+
+        /// Filter by proposal type (e.g. `induction`), exact match.
+        @httpQuery("type")
+        @length(min: 1, max: 64)
+        proposalType: String
 
         /// Pagination token from a previous response.
         @httpQuery("nextToken")
-        nextToken: String
+        nextToken: PaginationToken
 
-        /// Maximum number of proposals to return.
+        /// Maximum number of proposals to return in one page (default 50). The
+        /// server also accepts the legacy spelling `limit`; this one wins.
         @httpQuery("maxResults")
+        @range(min: 1, max: 200)
         maxResults: Integer
     }
 
@@ -433,21 +635,21 @@ operation GetProposal {
         /// Presigned S3 GET URL for the OWL ontology Turtle when it is served
         /// out-of-band (proposals exceeding the API payload cap). Null when
         /// `ontologyTurtle` is inlined.
-        ontologyUrl: String
+        ontologyUrl: PresignedUrl
 
         /// Presigned S3 GET URL for the R2RML Turtle when served out-of-band.
-        r2rmlUrl: String
+        r2rmlUrl: PresignedUrl
 
         /// Presigned S3 GET URL for the grounding-match list (`matches.json`)
         /// when it is served out-of-band. Null when the match list is small
         /// enough to be returned inline.
-        matchesUrl: String
+        matchesUrl: PresignedUrl
 
         /// Presigned S3 GET URL for the SHACL constraint config
         /// (`constraints.ttl`) when it is served out-of-band. Null when no
         /// constraints artifact exists, in which case any small inline
         /// `constraintConfig` in `metadata` is returned instead.
-        constraintsUrl: String
+        constraintsUrl: PresignedUrl
 
         /// Proposal metadata (tables processed, classes created, etc.).
         metadata: ProposalMetadata
@@ -468,6 +670,10 @@ operation GetProposal {
 /// proposal flipped to ``accepting``. Clients poll ``GetProposal`` until
 /// ``status`` becomes ``accepted`` (success) or ``pending`` (failed —
 /// ``acceptError`` on the proposal record carries the reason).
+///
+/// Naturally idempotent, so there is no `clientToken`: accepting an
+/// already-accepted proposal returns ``accepted`` without starting a new job,
+/// and a repeat while the first accept is in progress is a ConflictError (409).
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/accept", code: 202)
 operation AcceptProposal {
     input := {
@@ -480,7 +686,7 @@ operation AcceptProposal {
         proposalId: Uuid
 
         /// Target ontology ID to merge into. If omitted, uses the proposal's own ontology ID.
-        ontologyId: String
+        ontologyId: OntologyId
     }
 
     output := {
@@ -507,10 +713,12 @@ operation RejectProposals {
 
         /// IDs of the proposals to reject.
         @required
+        @length(max: 1000)
         proposalIds: ProposalIdList
 
         /// Reason for rejecting the proposals.
         @required
+        @length(max: 4096)
         reason: String
     }
 
@@ -569,10 +777,27 @@ operation UpdateProposal {
         proposalId: Uuid
 
         /// Revised OWL ontology in Turtle format.
-        ontologyTurtle: String
+        ontologyTurtle: TurtleDocument
 
         /// Revised R2RML mappings in Turtle format.
-        r2rmlTurtle: String
+        r2rmlTurtle: TurtleDocument
+
+        /// Class-level grounding choices keyed by the match's
+        /// sourceTableIdentity, or by its bare sourceTable when that name is
+        /// unique in the proposal. A bare sourceTable that several class-level
+        /// matches share is rejected with ConflictError and nothing is saved.
+        /// Values must be one of the candidates returned with the proposal.
+        /// Grounding choices cannot be combined with Turtle/R2RML edits in the
+        /// same request.
+        @length(max: 1000)
+        groundingOverrides: GroundingOverrideMap
+
+        /// Source tables whose grounding should be cleared so they remain
+        /// novel, keyed like groundingOverrides. Kept separate from
+        /// groundingOverrides because OpenAPI map values cannot faithfully
+        /// preserve Smithy sparse-map nulls.
+        @length(max: 1000)
+        novelTables: GroundingNovelTableList
 
         /// Set true when the revised OWL ontology was uploaded directly to S3
         /// via a presigned PUT (see GetProposalUploadUrls) instead of being sent
@@ -583,6 +808,11 @@ operation UpdateProposal {
         /// Set true when the revised R2RML was uploaded via presigned PUT
         /// instead of inline `r2rmlTurtle`. Defaults to false (inline).
         r2rmlUploaded: Boolean
+
+        /// Immutable revision returned by GetProposalUploadUrls. Required when
+        /// either uploaded flag is true so an upload cannot overwrite the
+        /// proposal's currently active artifacts before validation succeeds.
+        uploadRevisionId: Uuid
     }
 
     output := {
@@ -597,14 +827,17 @@ operation UpdateProposal {
         NotFoundError
         ConflictError
         ValidationError
+        ServiceUnavailableError
     ]
 }
 
-/// Get presigned S3 PUT URLs for uploading a large revised proposal Turtle
-/// directly to S3, bypassing the API payload cap. After uploading, call
-/// UpdateProposal with `ontologyUploaded` / `r2rmlUploaded` set (instead of
-/// sending the Turtle inline). The write-side mirror of the presigned-GET
-/// read path exposed on GetProposal.
+/// Get create-only presigned S3 PUT URLs for a large revised proposal Turtle.
+/// Each direct PUT must send `If-None-Match: *`, which is a signed S3 header,
+/// and may create its artifact key only once. After every requested upload
+/// succeeds, call UpdateProposal with `ontologyUploaded` / `r2rmlUploaded` set.
+/// A 409, 412, or ambiguous network outcome requires requesting a fresh
+/// revision and re-uploading every changed artifact; callers must not reuse the
+/// prior URLs or assume that an uncertain write succeeded.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/upload-url", code: 200)
 operation GetProposalUploadUrls {
     input := {
@@ -618,11 +851,23 @@ operation GetProposalUploadUrls {
     }
 
     output := {
-        /// Presigned S3 PUT URL for uploading the revised OWL ontology Turtle.
-        ontologyPutUrl: String
+        /// Revision containing both create-only upload targets. Pass this value
+        /// to UpdateProposal as uploadRevisionId only after every requested PUT
+        /// succeeds.
+        @required
+        revisionId: Uuid
 
-        /// Presigned S3 PUT URL for uploading the revised R2RML Turtle.
-        r2rmlPutUrl: String
+        /// Create-only S3 PUT URL for the revised OWL ontology Turtle. Send
+        /// `If-None-Match: *`; after 409, 412, or an ambiguous outcome, request
+        /// a fresh revision rather than reusing this URL.
+        @required
+        ontologyPutUrl: PresignedUrl
+
+        /// Create-only S3 PUT URL for the revised R2RML Turtle. Send
+        /// `If-None-Match: *`; after 409, 412, or an ambiguous outcome, request
+        /// a fresh revision rather than reusing this URL.
+        @required
+        r2rmlPutUrl: PresignedUrl
     }
 
     errors: [
@@ -631,10 +876,10 @@ operation GetProposalUploadUrls {
     ]
 }
 
-/// Trigger validation of a proposal — runs the configured tier validators
 /// Start LLM inference of semantic constraints from the proposal's ontology.
 /// Runs asynchronously (the LLM call can exceed the API-GW 29s timeout);
 /// returns 202 + a job handle. Poll GetInferConstraintsJob for the result.
+/// Each call starts a new job; send a `clientToken` to make a retry safe.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/infer-constraints", code: 202)
 operation InferConstraints {
     input := {
@@ -645,6 +890,13 @@ operation InferConstraints {
         @required
         @httpLabel
         proposalId: Uuid
+
+        /// Optional idempotency token. A retry with the same token and the same
+        /// parameters within 24 hours returns the original job handle instead of
+        /// starting a second job; reusing the token with different parameters is
+        /// rejected with a 409.
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output := {
@@ -708,6 +960,9 @@ operation GetInferConstraintsJob {
 }
 
 /// Compile a reviewed ConstraintConfig into SHACL Turtle.
+///
+/// Pure computation over the request and the stored proposal; nothing is
+/// persisted, so a retry is harmless and there is no `clientToken`.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/compile-constraints", code: 200)
 operation CompileConstraints {
     input := {
@@ -719,12 +974,14 @@ operation CompileConstraints {
         @httpLabel
         proposalId: Uuid
 
-        /// Reviewed ConstraintConfig to compile into SHACL.
+        /// Reviewed ConstraintConfig to compile into SHACL. At most 65536 bytes
+        /// once serialized as JSON; larger configs are rejected with a 400.
         @required
+        @tags(["bounded-at-runtime"])
         constraint_config: Document
 
         /// Optional custom SHACL Turtle to merge with the compiled shapes.
-        custom_turtle: String
+        custom_turtle: TurtleDocument
     }
 
     output := {
@@ -741,8 +998,10 @@ operation CompileConstraints {
     ]
 }
 
+/// Trigger validation of a proposal — runs the configured tier validators
 /// (HermiT reasoning, structural metrics, OoPS!) and returns a job ID for
-/// polling.
+/// polling. Each call starts a new job; send a `clientToken` to make a retry
+/// safe.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/validate", code: 202)
 operation ValidateProposal {
     input := {
@@ -755,13 +1014,21 @@ operation ValidateProposal {
         proposalId: Uuid
 
         /// Validator tiers to run (defaults to all three tiers if omitted).
+        @length(max: 10)
         tiers: ProposalValidationTierList
 
         /// Optional SHACL shapes Turtle for tier-1 SHACL validation.
-        shaclShapesTurtle: String
+        shaclShapesTurtle: TurtleDocument
 
         /// Optional competency-question prompts for tier-3 LLM validators.
-        competencyQuestions: StringList
+        competencyQuestions: CompetencyQuestionList
+
+        /// Optional idempotency token. A retry with the same token and the same
+        /// parameters within 24 hours returns the original job handle instead of
+        /// starting a second validation job; reusing the token with different
+        /// parameters is rejected with a 409.
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output := {
@@ -840,6 +1107,9 @@ operation GetProposalValidationJob {
 /// With `dryRun` true, computes and returns the same change list WITHOUT
 /// persisting — used by the accept-time guard to detect unrepaired datatype
 /// issues before an accept, without mutating the proposal.
+///
+/// Naturally idempotent, so there is no `clientToken`: a repeat finds the
+/// tokens already canonical and rewrites nothing (`repairedCount` 0).
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/repair-datatypes", code: 200)
 operation RepairProposalDatatypes {
     input := {
@@ -947,6 +1217,11 @@ structure ConceptMatch {
     /// Source table the match originates from.
     @required
     sourceTable: String
+
+    /// Stable data-source-qualified identity for the source table. New
+    /// structured inductions populate this so same-named tables remain
+    /// distinguishable; absent on legacy and unstructured matches.
+    sourceTableIdentity: String
 
     /// Source column the match originates from.
     @required
@@ -1064,7 +1339,28 @@ structure EmbeddingResult {
     index: String
 }
 
-// ── Lists ───────────────────────────────────────────────────────────
+// ── Collections ─────────────────────────────────────────────────────
+/// Non-empty absolute grounding target URI. Runtime validation also rejects
+/// whitespace, non-printable characters, and relative references for callers
+/// that bypass generated Smithy clients.
+@length(min: 1, max: 2048)
+string GroundingOverrideTargetUri
+
+/// Source-table grounding choices. Values are candidate ontology class URIs.
+map GroundingOverrideMap {
+    key: GroundingSourceTableKey
+    value: GroundingOverrideTargetUri
+}
+
+/// Source tables whose grounding should be cleared so they remain novel.
+list GroundingNovelTableList {
+    member: GroundingSourceTableKey
+}
+
+/// A match's sourceTableIdentity, or its bare sourceTable name.
+@length(min: 1, max: 1024)
+string GroundingSourceTableKey
+
 list DataSourceIdList {
     member: DataSourceId
 }
@@ -1072,6 +1368,29 @@ list DataSourceIdList {
 list OntologyIdList {
     member: String
 }
+
+/// Existing ontology IDs to ground an induction run against. Input-only; the
+/// induced proposal reports what it actually used in `OntologyIdList`.
+@length(max: 100)
+list GroundingOntologyIdList {
+    member: OntologyId
+}
+
+/// Natural-language competency questions a proposal is checked against.
+@length(max: 100)
+list CompetencyQuestionList {
+    member: CompetencyQuestion
+}
+
+/// A single competency question.
+@length(min: 1, max: 4096)
+string CompetencyQuestion
+
+/// An RDF Turtle document sent inline. Bounded by the 6 MB synchronous
+/// request ceiling of the serving function; larger artifacts go through the
+/// presigned-upload path instead.
+@length(max: 6000000)
+string TurtleDocument
 
 list ConceptMatchList {
     member: ConceptMatch
@@ -1203,6 +1522,9 @@ structure ProposalValidationReport {
 // Foundational Ontologies
 // ──────────────────────────────────────────────
 /// List the curated catalog of foundational ontologies available for grounding.
+///
+/// Not paginated: the catalog is a fixed list compiled into the service (a
+/// handful of entries), not data that grows per namespace.
 @readonly
 @http(method: "GET", uri: "/namespaces/{namespaceId}/ontology/foundational", code: 200)
 operation ListFoundationalOntologies {
@@ -1220,6 +1542,7 @@ operation ListFoundationalOntologies {
 }
 
 /// Trigger loading/embedding of a foundational ontology into the namespace.
+/// Each call starts a new load job; send a `clientToken` to make a retry safe.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/ontology/foundational/{key}/load", code: 202)
 operation LoadFoundationalOntology {
     input := {
@@ -1230,7 +1553,14 @@ operation LoadFoundationalOntology {
         /// Catalog key of the foundational ontology to load.
         @required
         @httpLabel
+        @length(min: 1, max: 128)
         key: String
+
+        /// Optional idempotency token. A retry with the same token within 24
+        /// hours returns the original job handle instead of starting a second
+        /// load; reusing the token for a different key is rejected with a 409.
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output := {

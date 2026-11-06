@@ -13,9 +13,9 @@ import pytest
 MODULE = "coa_control_plane.namespace.update_handler"
 
 _NS_ITEM = {
-    "PK": "NS#ns-123",
+    "PK": "NS#11111111-1111-4111-8111-111111111111",
     "SK": "METADATA",
-    "namespaceId": "ns-123",
+    "namespaceId": "11111111-1111-4111-8111-111111111111",
     "name": "sales",
     "displayName": "Sales Domain",
     "description": "Sales data",
@@ -57,7 +57,7 @@ class TestUpdateNamespace:
             from coa_control_plane.namespace.update_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "httpMethod": "PUT",
                 "resource": "/namespaces/{namespaceId}",
                 "body": json.dumps({"displayName": "New Name"}),
@@ -78,7 +78,7 @@ class TestUpdateNamespace:
             from coa_control_plane.namespace.update_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-999"},
+                "pathParameters": {"namespaceId": "99999999-9999-4999-8999-999999999999"},
                 "body": json.dumps({"displayName": "x"}),
                 "httpMethod": "PUT",
                 "resource": "/namespaces/{namespaceId}",
@@ -96,7 +96,7 @@ class TestUpdateNamespace:
             from coa_control_plane.namespace.update_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "body": json.dumps({"unknownField": "x"}),
                 "httpMethod": "PUT",
                 "resource": "/namespaces/{namespaceId}",
@@ -104,6 +104,57 @@ class TestUpdateNamespace:
             resp = handler(event, None)
 
         assert resp["statusCode"] == 400
+
+
+@pytest.mark.unit
+class TestNamespaceLanguageImmutable:
+    def _put(self, dao, body):
+        from coa_control_plane.namespace.update_handler import handler
+
+        with patch(f"{MODULE}._get_ns_dao", return_value=dao):
+            return handler(
+                {
+                    "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
+                    "httpMethod": "PUT",
+                    "resource": "/namespaces/{namespaceId}",
+                    "body": json.dumps(body),
+                },
+                None,
+            )
+
+    def test_legacy_item_without_language_reads_en(self):
+        dao = MagicMock()
+        dao.get.side_effect = [_NS_ITEM, {**_NS_ITEM, "displayName": "New Name"}]
+
+        resp = self._put(dao, {"displayName": "New Name"})
+
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["namespace"]["language"] == "en"
+
+    def test_language_in_request_is_ignored_and_not_written(self):
+        # UpdateNamespace has no language member; the generated model ignores
+        # unknown members, so the display-name update proceeds and the stored
+        # language is untouched.
+        stored = {**_NS_ITEM, "language": "ja"}
+        dao = MagicMock()
+        dao.get.side_effect = [stored, {**stored, "displayName": "New Name"}]
+
+        resp = self._put(dao, {"displayName": "New Name", "language": "fr"})
+
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["namespace"]["language"] == "ja"
+        dao.update.assert_called_once()
+        assert "language" not in dao.update.call_args.kwargs["update_fields"]
+
+    def test_language_only_request_has_no_updatable_fields(self):
+        dao = MagicMock()
+        dao.get.return_value = {**_NS_ITEM, "language": "ja"}
+
+        resp = self._put(dao, {"language": "fr"})
+
+        assert resp["statusCode"] == 400
+        assert json.loads(resp["body"])["message"] == "No updatable fields provided"
+        dao.update.assert_not_called()
 
 
 @pytest.mark.unit
@@ -117,7 +168,7 @@ class TestUpdateNamespaceInputValidation:
             from coa_control_plane.namespace.update_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "body": json.dumps(body),
                 "httpMethod": "PUT",
                 "resource": "/namespaces/{namespaceId}",

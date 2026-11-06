@@ -68,6 +68,26 @@ class TestStoreEmbedding:
         assert doc["namespace"] == "default"
         assert "context_text" not in doc
         assert "data_source_id" not in doc
+        # Absent == SQL: a SQL or legacy class document carries no backend marker.
+        assert "query_backend" not in doc
+
+    def test_graph_class_document_carries_query_backend(self):
+        client = MagicMock()
+        store = OpenSearchVectorStore(namespace="ns1")
+        store._client = client
+        store._ensure_index = lambda namespace=None: "idx-ns1"
+        doc = store.store_embedding(
+            {
+                "entity_uri": "http://x/SupportTicket",
+                "embedding_type": "class",
+                "model_id": "titan",
+                "vector": [0.0] * 1024,
+                "data_source_id": "src-graph-1",
+                "query_backend": "RDF_SPARQL",
+            }
+        )
+        assert doc["query_backend"] == "RDF_SPARQL"
+        assert doc["data_source_id"] == "src-graph-1"
 
 
 # ── store_embeddings_batch (namespace grouping) ─────────────────────────
@@ -135,6 +155,18 @@ class TestLookups:
         filters = client.filter_search.call_args.args[1]
         assert {"term": {"ontology_id": "ont-1"}} in filters
         assert {"term": {"embedding_type": "lexical"}} in filters
+
+    def test_bounded_listing_projects_metadata_only(self):
+        client = MagicMock()
+        client.filter_search.return_value = []
+        store = _store_with_client(client)
+
+        store.list_embeddings_for_ontology("ont-1", limit=25)
+
+        assert client.filter_search.call_args.kwargs == {
+            "size": 25,
+            "source": ["entity_uri", "ontology_id", "text"],
+        }
 
     def test_list_searchable_entity_uris_projects_via_iter_source_field(self):
         client = MagicMock()

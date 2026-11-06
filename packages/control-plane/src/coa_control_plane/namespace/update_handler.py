@@ -10,7 +10,9 @@ import os
 from typing import Any
 
 import structlog
+from coa_common.constants import validate_namespace_id
 from coa_common.dao import DynamoDBDAO
+from coa_common.language_tags import effective_namespace_language
 from coa_common.response import api_response
 from coa_control_plane_server.models.update_namespace_request_content import (
     UpdateNamespaceRequestContent,
@@ -41,6 +43,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     if not namespace_id:
         return api_response(400, {"message": "namespaceId is required"})
+    try:
+        validate_namespace_id(namespace_id)
+    except ValueError as exc:
+        return api_response(400, {"message": str(exc)})
 
     try:
         body = json.loads(event.get("body") or "{}")
@@ -55,7 +61,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # Verify namespace exists
     item = _get_ns_dao().get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
     if not item:
-        return api_response(404, {"message": f"Namespace not found: {namespace_id}"})
+        return api_response(404, {"message": "Namespace not found"})
 
     # Build update fields from validated request
     update_fields: dict[str, Any] = {}
@@ -82,6 +88,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "description": updated.get("description"),
         "owner": updated.get("owner"),
         "status": updated.get("status"),
+        "language": effective_namespace_language(updated),
         "dataZoneProjectId": updated.get("dataZoneProjectId"),
         "sourceCount": updated.get("sourceCount", 0),
         "createdAt": updated.get("createdAt"),

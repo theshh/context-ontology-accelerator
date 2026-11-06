@@ -3,6 +3,7 @@
 
 import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import Form from "@cloudscape-design/components/form";
 import FormField from "@cloudscape-design/components/form-field";
 import Input from "@cloudscape-design/components/input";
@@ -12,10 +13,21 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import Alert from "@cloudscape-design/components/alert";
+import Box from "@cloudscape-design/components/box";
+import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
+import Modal from "@cloudscape-design/components/modal";
+import RadioGroup from "@cloudscape-design/components/radio-group";
 import { useCreateNamespace } from "@api-hooks";
 import { useUser } from "@auth";
-import { extractErrorMessage } from "@utils";
+import {
+  extractErrorMessage,
+  isNamespaceLanguage,
+  localizeNamespaceLanguage,
+  NAMESPACE_LANGUAGE_OPTIONS,
+} from "@utils";
+import type { NamespaceLanguage } from "@utils";
 import { AccessDeniedError } from "@coa/control-plane-client";
+import { useAppI18n } from "../i18n/LocaleProvider";
 
 /** Convert a display name to a machine-friendly identifier. */
 const toMachineName = (value: string): string =>
@@ -30,24 +42,36 @@ const toMachineName = (value: string): string =>
 export const CreateNamespace: React.FC = () => {
   const navigate = useNavigate();
   const { user } = useUser();
+  const { t } = useAppI18n();
+  useBreadcrumbTrail([
+    { text: t("Administration") },
+    { text: "Context graphs", href: "/namespaces" },
+    { text: t("Create") },
+  ]);
   const [displayName, setDisplayName] = useState("");
   const [description, setDescription] = useState("");
+  const [language, setLanguage] = useState<NamespaceLanguage>("en");
   const [nameError, setNameError] = useState("");
+  const [showConfirm, setShowConfirm] = useState(false);
 
   const { mutate, isPending, error } = useCreateNamespace({
     onSuccess: () => navigate("/namespaces"),
+    // Close the confirmation so the form-level error alert is visible.
+    onError: () => setShowConfirm(false),
   });
 
   const machineName = toMachineName(displayName);
 
   const validate = (): boolean => {
     if (!displayName.trim()) {
-      setNameError("Namespace name is required.");
+      setNameError(t("Namespace name is required."));
       return false;
     }
     if (!machineName || !/^[a-z][a-z0-9-]*$/.test(machineName)) {
       setNameError(
-        "Name must start with a lowercase letter and contain only lowercase letters, numbers, and hyphens.",
+        t(
+          "Name must start with a lowercase letter and contain only lowercase letters, numbers, and hyphens.",
+        ),
       );
       return false;
     }
@@ -55,13 +79,20 @@ export const CreateNamespace: React.FC = () => {
     return true;
   };
 
+  // The language is immutable once the namespace exists, so creation always
+  // goes through a confirmation step that restates the choice.
   const handleSubmit = () => {
     if (!validate()) return;
+    setShowConfirm(true);
+  };
+
+  const handleConfirm = () => {
     mutate({
       name: machineName,
       displayName: displayName.trim(),
       owner: user?.email ?? "",
       description: description || undefined,
+      language,
     });
   };
 
@@ -70,10 +101,10 @@ export const CreateNamespace: React.FC = () => {
       actions={
         <SpaceBetween direction="horizontal" size="xs">
           <Button variant="link" onClick={() => navigate("/namespaces")}>
-            Cancel
+            {t("Cancel")}
           </Button>
           <Button variant="primary" loading={isPending} onClick={handleSubmit}>
-            Create context graph
+            {t("Create context graph")}
           </Button>
         </SpaceBetween>
       }
@@ -82,28 +113,36 @@ export const CreateNamespace: React.FC = () => {
           variant="h1"
           description="Create a new context graph to partition your semantic graph into an isolated scope."
         >
-          Create context graph
+          {t("Create context graph")}
         </Header>
       }
-      errorText={error ? extractErrorMessage(error) : undefined}
+      errorText={
+        error
+          ? extractErrorMessage(error, t("An unexpected error occurred."))
+          : undefined
+      }
     >
       {error && (
         <Alert
           type="error"
           header={
             error instanceof AccessDeniedError
-              ? "Unauthorized"
-              : "Error creating namespace"
+              ? t("Unauthorized")
+              : t("Error creating namespace")
           }
         >
-          {extractErrorMessage(error)}
+          {extractErrorMessage(error, t("An unexpected error occurred."))}
         </Alert>
       )}
-      <Container header={<Header variant="h2">Namespace details</Header>}>
+      <Container
+        header={<Header variant="h2">{t("Namespace details")}</Header>}
+      >
         <SpaceBetween size="l">
           <FormField
-            label="Namespace name"
-            description={`Machine-friendly identifier: ${machineName || "—"}`}
+            label={t("Namespace name")}
+            description={t("Machine-friendly identifier: {name}", {
+              name: machineName || "—",
+            })}
             errorText={nameError}
           >
             <Input
@@ -112,25 +151,94 @@ export const CreateNamespace: React.FC = () => {
                 setDisplayName(detail.value);
                 if (nameError) setNameError("");
               }}
-              placeholder="e.g., Insurance Prod"
+              placeholder={t("e.g., Insurance Prod")}
             />
           </FormField>
           <FormField
-            label={
-              <>
-                Description <i>- optional</i>
-              </>
-            }
-            description="A brief description of the namespace purpose."
+            label={<>{t("Description - optional")}</>}
+            description={t("A brief description of the namespace purpose.")}
           >
             <Textarea
               value={description}
               onChange={({ detail }) => setDescription(detail.value)}
-              placeholder="e.g., Production namespace for insurance domain data"
+              placeholder={t(
+                "e.g., Production namespace for insurance domain data",
+              )}
+            />
+          </FormField>
+          <FormField
+            label={t("Language")}
+            description={t(
+              "Text COA generates (descriptions, synonyms, and labels for document sources) uses this language. Source text and table and column names are kept as-is.",
+            )}
+            constraintText={t(
+              "The language cannot be changed after the namespace is created, and it must match the language of the sources you connect. To use a different language, create a new namespace.",
+            )}
+          >
+            <RadioGroup
+              value={language}
+              onChange={({ detail }) => {
+                if (isNamespaceLanguage(detail.value)) {
+                  setLanguage(detail.value);
+                }
+              }}
+              items={NAMESPACE_LANGUAGE_OPTIONS.map((option) => ({
+                value: option.value,
+                label: t(option.label),
+              }))}
             />
           </FormField>
         </SpaceBetween>
       </Container>
+      {showConfirm && (
+        <Modal
+          visible={showConfirm}
+          onDismiss={() => {
+            // Keep the confirmation open while the create request is in flight.
+            if (!isPending) setShowConfirm(false);
+          }}
+          header={t("Confirm namespace language")}
+          footer={
+            <Box float="right">
+              <SpaceBetween direction="horizontal" size="xs">
+                <Button
+                  variant="link"
+                  disabled={isPending}
+                  onClick={() => setShowConfirm(false)}
+                >
+                  {t("Back")}
+                </Button>
+                <Button
+                  variant="primary"
+                  loading={isPending}
+                  onClick={handleConfirm}
+                >
+                  {t("Confirm and create")}
+                </Button>
+              </SpaceBetween>
+            </Box>
+          }
+        >
+          <SpaceBetween size="m">
+            <KeyValuePairs
+              columns={2}
+              items={[
+                { label: t("Namespace name"), value: machineName },
+                {
+                  label: t("Language"),
+                  value: localizeNamespaceLanguage(language, t),
+                },
+              ]}
+            />
+            <Alert type="warning" header={t("The language cannot be changed")}>
+              <b>{localizeNamespaceLanguage(language, t)}</b>:{" "}
+              {t(
+                "This namespace will be created in this language. The language cannot be changed later, and it must match the language of the sources you connect. To use a different language, you must create a new namespace.",
+              )}
+            </Alert>
+          </SpaceBetween>
+        </Modal>
+      )}
     </Form>
   );
 };

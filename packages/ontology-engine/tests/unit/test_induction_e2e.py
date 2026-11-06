@@ -401,7 +401,7 @@ class TestInductionE2E:
         # Step 6: List proposals
         resp = http.get("/ontology/proposals/")
         assert resp.status_code == 200
-        proposals = resp.json()
+        proposals = resp.json()["proposals"]
         assert len(proposals) >= 1
         assert any(p["proposal_id"] == proposal_id for p in proposals)
 
@@ -431,13 +431,24 @@ class TestInductionE2E:
         resp = http.post(f"/ontology/proposals/{proposal_id}/upload-url")
         assert resp.status_code == 200, resp.text
         urls = resp.json()
-        assert urls["ontology_put_url"] and urls["r2rml_put_url"]
+        revision_id = urls["revisionId"]
+        assert urls["ontologyPutUrl"] and urls["r2rmlPutUrl"]
 
         uploaded_turtle = ontology_turtle.replace("Proposal Ontology", "Uploaded Reviewed Ontology")
-        ds._put_artifact_s3("default", proposal_id, "ontology", uploaded_turtle)
+        ds._put_artifact_s3(
+            "default",
+            proposal_id,
+            "ontology",
+            uploaded_turtle,
+            version=f"revisions/{revision_id}",
+        )
         resp = http.post(
             "/ontology/proposals/update",
-            json={"proposal_id": proposal_id, "ontology_uploaded": True},
+            json={
+                "proposal_id": proposal_id,
+                "ontology_uploaded": True,
+                "upload_revision_id": revision_id,
+            },
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "updated"
@@ -634,7 +645,7 @@ class TestInductionInFlightVisibilityAndLock:
         # before (indeed without) the worker ever writing the real proposal.
         resp = http.get("/ontology/proposals/")
         assert resp.status_code == 200
-        proposals = resp.json()
+        proposals = resp.json()["proposals"]
         stub = next((p for p in proposals if p["proposal_id"] == job_id), None)
         assert stub is not None, "in-flight induction should be visible in the list immediately"
         assert stub["status"] == "inducing"

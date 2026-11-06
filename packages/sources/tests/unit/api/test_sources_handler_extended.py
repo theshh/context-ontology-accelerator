@@ -11,9 +11,13 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError, EndpointConnectionError
+from coa_common.sparql_config import GRAPH_SOURCES_DISABLED_MESSAGE, GRAPH_SOURCES_ENV
 from coa_control_plane_server.models.source_type import SourceType
 
 os.environ.setdefault("SOURCES_TABLE", "test-sources")
@@ -1205,6 +1209,14 @@ class TestHandleDeleteCounter:
 
 @pytest.mark.unit
 class TestHandleRescan:
+    @pytest.fixture(autouse=True)
+    def _namespace_item(self):
+        # Every re-scan resolves the namespace-language snapshot first.
+        ns_dao = MagicMock()
+        ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA"}
+        with patch(f"{_SH}._get_ns_dao", return_value=ns_dao):
+            yield ns_dao
+
     def test_rescan_database_source_happy_path(self):
         mock_dao = MagicMock()
         # SCAN_FAILED with no recorded origin and nothing approved is a first scan
@@ -1230,6 +1242,31 @@ class TestHandleRescan:
         assert body_json["isRescan"] is False
         # SCAN_FAILED is not an open review, so no backup reconstruction.
         assert body_json["hadOpenRescan"] is False
+
+    @pytest.mark.parametrize("entry_status", ["APPROVED", "SCAN_FAILED"])
+    def test_rescan_message_lets_the_trigger_derive_source_id(self, entry_status):
+        # The trigger derives the bare sourceId from datasourceId (DS#<id>) for the
+        # execution input, where the state machine's SCAN_FAILED step and the reaper
+        # key the sources row on it. The message carries only datasourceId, so the
+        # id comes from one place, and has every field the trigger requires.
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item(entry_status)
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=dao_double()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 202
+        body_json = json.loads(mock_sqs.send_message.call_args[1]["MessageBody"])
+        assert body_json["datasourceId"] == f"DS#{_SOURCE_ID}"
+        assert "sourceId" not in body_json
+        for field in ("scanJobId", "namespaceId", "scanType"):
+            assert body_json[field], field
 
     @pytest.mark.parametrize("entry_status", ["APPROVED", "RESCAN_REVIEW"])
     def test_rescan_approved_source_marks_isrescan_true(self, entry_status):
@@ -1568,6 +1605,122 @@ class TestHandleCreate:
         assert status == 400
 
 
+@pytest.mark.unit
+class TestNamespaceLanguageResolution:
+    """Sources resolve the language from the namespace item, never from the request."""
+
+    _GLUE_BODY = {
+        "sourceType": "DATABASE",
+        "databaseSource": {
+            "name": "my-db",
+            "glueConfiguration": {"databaseName": "mydb", "region": "us-east-1", "catalogId": "123456789012"},
+        },
+    }
+
+    def _create(self, body, ns_item):
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = ns_item
+        with (
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_SH}._create_database_source", return_value={"statusCode": 202, "body": "{}"}) as db_create,
+            patch(f"{_SH}._create_document_source", return_value={"statusCode": 201, "body": "{}"}) as doc_create,
+        ):
+            event = _make_event("POST", "/namespaces/{namespaceId}/sources", body=body)
+            status, _ = _parse(_current_sh()._handle_create(event, _NAMESPACE_ID))
+        return status, db_create, doc_create
+
+    def test_database_create_uses_namespace_language(self):
+        _, db_create, _ = self._create(self._GLUE_BODY, {"PK": f"NS#{_NAMESPACE_ID}", "language": "ja"})
+        assert db_create.call_args.kwargs["namespace_language"] == "ja"
+
+    def test_document_create_uses_namespace_language(self):
+        body = {"sourceType": "DOCUMENTS", "documentSource": {"name": "docs", "uploadId": str(uuid.uuid4())}}
+        _, _, doc_create = self._create(body, {"PK": f"NS#{_NAMESPACE_ID}", "language": "ja"})
+        assert doc_create.call_args.kwargs["namespace_language"] == "ja"
+
+    def test_legacy_namespace_without_language_reads_english(self):
+        _, db_create, _ = self._create(self._GLUE_BODY, {"PK": f"NS#{_NAMESPACE_ID}"})
+        assert db_create.call_args.kwargs["namespace_language"] == "en"
+
+    def test_request_cannot_override_the_namespace_language(self):
+        body = {
+            **self._GLUE_BODY,
+            "language": "en",
+            "databaseSource": {**self._GLUE_BODY["databaseSource"], "language": "en", "sourceLanguage": "en"},
+        }
+        _, db_create, _ = self._create(body, {"PK": f"NS#{_NAMESPACE_ID}", "language": "ja"})
+        assert db_create.call_args.kwargs["namespace_language"] == "ja"
+
+    def test_create_namespace_read_error_fails_the_request(self):
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.side_effect = ClientError({"Error": {"Code": "InternalServerError", "Message": "x"}}, "GetItem")
+        with (
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_SH}._create_database_source") as db_create,
+        ):
+            event = _make_event("POST", "/namespaces/{namespaceId}/sources", body=self._GLUE_BODY)
+            status, _ = _parse(_current_sh().handler({**event, "pathParameters": {"namespaceId": _NAMESPACE_ID}}, None))
+        assert status == 500
+        db_create.assert_not_called()
+
+    # ── Re-scan ──────────────────────────────────────────────────────
+
+    def _rescan(self, source_item, *, ns_item=None, ns_error=None):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = source_item
+        mock_ns_dao = MagicMock()
+        if ns_error is not None:
+            mock_ns_dao.get.side_effect = ns_error
+        else:
+            mock_ns_dao.get.return_value = ns_item
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+            patch(f"{_SH}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+        return status, mock_dao, mock_scan_dao, mock_sqs
+
+    def test_database_rescan_snapshots_language_into_job(self):
+        status, _, scan_dao, sqs = self._rescan(
+            _db_source_item("SCAN_FAILED"), ns_item={"PK": f"NS#{_NAMESPACE_ID}", "language": "ja"}
+        )
+        assert status == 202
+        assert scan_dao.put.call_args[0][0]["namespaceLanguage"] == "ja"
+        assert json.loads(sqs.send_message.call_args[1]["MessageBody"])["namespaceLanguage"] == "ja"
+
+    def test_document_rescan_snapshots_language_into_job(self):
+        status, _, _, sqs = self._rescan(
+            _doc_source_item("COMPLETED"), ns_item={"PK": f"NS#{_NAMESPACE_ID}", "language": "ja"}
+        )
+        assert status == 200
+        assert json.loads(sqs.send_message.call_args[1]["MessageBody"])["namespace_language"] == "ja"
+
+    @pytest.mark.parametrize("item", [_db_source_item("SCAN_FAILED"), _doc_source_item("COMPLETED")])
+    def test_rescan_missing_namespace_fails_without_writes(self, item):
+        status, dao, scan_dao, sqs = self._rescan(item, ns_item=None)
+        assert status == 404
+        dao.put.assert_not_called()
+        dao.update.assert_not_called()
+        scan_dao.put.assert_not_called()
+        sqs.send_message.assert_not_called()
+
+    @pytest.mark.parametrize("item", [_db_source_item("SCAN_FAILED"), _doc_source_item("COMPLETED")])
+    def test_rescan_namespace_read_error_fails_without_writes(self, item):
+        error = ClientError({"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "x"}}, "GetItem")
+        status, dao, scan_dao, sqs = self._rescan(item, ns_error=error)
+        assert status == 500
+        dao.put.assert_not_called()
+        dao.update.assert_not_called()
+        scan_dao.put.assert_not_called()
+        sqs.send_message.assert_not_called()
+
+
 # ===================================================================
 # handler (Lambda entry point) routing
 # ===================================================================
@@ -1620,9 +1773,13 @@ class TestHandlerRouting:
         mock_scan_dao = dao_double()
         mock_sqs = MagicMock()
 
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA"}
+
         with (
             patch(f"{_SH}._get_dao", return_value=mock_dao),
             patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
             patch(f"{_SH}._get_sqs", return_value=mock_sqs),
             patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
         ):
@@ -1824,13 +1981,34 @@ class TestPathParameterDecoding:
         handler_mock.assert_called_once_with(_NAMESPACE_ID, _SOURCE_ID, "sales.discount%50")
 
 
+@pytest.fixture
+def _rescan_namespace_item():
+    """The namespace item every re-scan trigger resolves its language snapshot from."""
+    ns_dao = MagicMock()
+    ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA"}
+    with patch(f"{_SH}._get_ns_dao", return_value=ns_dao):
+        yield ns_dao
+
+
+_SCHEDULE_ON = {"enabled": True, "scheduleExpression": "rate(1 day)", "timezone": "UTC"}
+
+
+def _scan_started(mock_dao: MagicMock) -> bool:
+    """Whether the re-scan path took the scan lock (moved the source to SCANNING)."""
+    return any(
+        len(c.args) > 1 and isinstance(c.args[1], dict) and c.args[1].get("status") == "SCANNING"
+        for c in mock_dao.update.call_args_list
+    )
+
+
 @pytest.mark.unit
+@pytest.mark.usefixtures("_rescan_namespace_item")
 class TestScheduledRescan:
     """EventBridge Scheduler invokes the API Lambda to fire a SCHEDULED rescan (#683 R7)."""
 
     def test_scheduled_event_triggers_rescan_with_scheduled_trigger(self):
         mock_dao = MagicMock()
-        mock_dao.get.return_value = _db_source_item("APPROVED")
+        mock_dao.get.return_value = {**_db_source_item("APPROVED"), "rescanSchedule": _SCHEDULE_ON}
         mock_scan_dao = MagicMock()
         mock_sqs = MagicMock()
 
@@ -1864,7 +2042,7 @@ class TestScheduledRescan:
         """A 409 for an open review is the designed outcome, not a broken
         schedule, so it must not make Scheduler retry."""
         mock_dao = MagicMock()
-        mock_dao.get.return_value = _db_source_item("RESCAN_REVIEW")
+        mock_dao.get.return_value = {**_db_source_item("RESCAN_REVIEW"), "rescanSchedule": _SCHEDULE_ON}
         mock_scan_dao = MagicMock()
         mock_sqs = MagicMock()
 
@@ -1883,8 +2061,201 @@ class TestScheduledRescan:
         assert resp["statusCode"] == 409
         mock_sqs.send_message.assert_not_called()
 
+    def _tick(self, item):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            resp = _current_sh().handler(
+                {"scheduledRescan": True, "namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID},
+                None,
+            )
+        return resp, mock_dao, mock_sqs
+
+    @pytest.mark.parametrize(
+        "schedule",
+        [{"enabled": False}, None, {}, "not-a-dict"],
+        ids=["disabled", "absent", "empty", "malformed"],
+    )
+    def test_scheduled_tick_schedule_not_enabled_skips_without_failing(self, schedule):
+        """The record decides, not the delivery: a schedule that survived a
+        failed delete, or a direct invocation, must not re-scan a source whose
+        schedule is OFF. Returned rather than raised so Scheduler does not run
+        its retry policy on every tick."""
+        item = _db_source_item("APPROVED")
+        if schedule is not None:
+            item["rescanSchedule"] = schedule
+
+        resp, mock_dao, mock_sqs = self._tick(item)
+
+        assert resp == {"ok": False, "skipped": "rescanSchedule_disabled"}
+        assert not _scan_started(mock_dao)
+        mock_sqs.send_message.assert_not_called()
+
+    def test_scheduled_tick_documents_source_skips(self):
+        item = {**_doc_source_item("COMPLETED"), "rescanSchedule": _SCHEDULE_ON}
+
+        resp, mock_dao, mock_sqs = self._tick(item)
+
+        assert resp == {"ok": False, "skipped": "not_a_database_source"}
+        mock_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_scheduled_tick_source_gone_skips(self):
+        resp, mock_dao, mock_sqs = self._tick(None)
+
+        assert resp == {"ok": False, "skipped": "source_not_found"}
+        mock_dao.update.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_scheduled_tick_source_read_fails_does_not_scan(self):
+        mock_dao = MagicMock()
+        mock_dao.get.side_effect = ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "slow down"}}, "GetItem"
+        )
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+        ):
+            resp = _current_sh().handler(
+                {"scheduledRescan": True, "namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID},
+                None,
+            )
+
+        assert resp == {"ok": False, "statusCode": 500}
+        mock_dao.update.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
 
 @pytest.mark.unit
+class TestAutomatedRescanSwitchLeavesManualRescanAlone:
+    def test_handle_rescan_manual_with_automation_off_starts_scan(self):
+        """Turning automation off must not take away the steward's own re-scan."""
+        item = {
+            **_db_source_item("APPROVED"),
+            "rescanSchedule": {"enabled": False},
+            "eventRescan": {"enabled": False},
+        }
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        # Every re-scan snapshots the namespace language; a legacy item resolves to ``en``.
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA"}
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            resp = _current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID)
+
+        assert resp["statusCode"] in (200, 202)
+        assert _scan_started(mock_dao)
+        mock_sqs.send_message.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("trigger", "item_extra", "expected"),
+        [
+            ("SCHEDULED", {"rescanSchedule": {"enabled": True}}, None),
+            ("EVENT", {"eventRescan": {"enabled": True}}, None),
+            # Each trigger reads only its own switch.
+            ("SCHEDULED", {"eventRescan": {"enabled": True}}, "rescanSchedule_disabled"),
+            ("EVENT", {"rescanSchedule": {"enabled": True}}, "eventRescan_disabled"),
+            ("MANUAL", {"rescanSchedule": {"enabled": True}}, "not_an_automated_trigger"),
+        ],
+    )
+    def test_automated_rescan_skip_reason_reads_the_triggers_own_switch(self, trigger, item_extra, expected):
+        from coa_control_plane_server.models.scan_trigger import ScanTrigger
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {**_db_source_item("APPROVED"), **item_extra}
+        with patch(f"{_SH}._get_dao", return_value=mock_dao):
+            reason = _current_sh()._automated_rescan_skip_reason(_NAMESPACE_ID, _SOURCE_ID, ScanTrigger(trigger))
+
+        assert reason == expected
+
+
+@pytest.mark.unit
+class TestRescanTriggerNamespaceLanguage:
+    """SCHEDULED and EVENT re-scans snapshot the namespace language like a manual one.
+
+    Both triggers reuse ``_handle_rescan`` with no request body, so the language
+    comes only from the namespace item and reaches the scan job and its input.
+    """
+
+    def _run(self, trigger):
+        from coa_control_plane_server.models.scan_trigger import ScanTrigger
+
+        item = _db_source_item("APPROVED")
+        item.pop("lastScanAt", None)
+        # A SCHEDULED re-scan runs only while the source's schedule switch is on.
+        item["rescanSchedule"] = _SCHEDULE_ON
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA", "language": "ja"}
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            if trigger == ScanTrigger.SCHEDULED:
+                resp = _current_sh().handler(
+                    {"scheduledRescan": True, "namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID}, None
+                )
+                assert resp["statusCode"] == 202
+            else:
+                status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID, trigger=trigger))
+                assert status == 202
+        return mock_scan_dao.put.call_args[0][0], json.loads(mock_sqs.send_message.call_args[1]["MessageBody"])
+
+    @pytest.mark.parametrize("trigger", ["SCHEDULED", "EVENT"])
+    def test_trigger_carries_the_namespace_language(self, trigger):
+        scan_job, message = self._run(trigger)
+        assert scan_job["triggerType"] == trigger
+        assert scan_job["namespaceLanguage"] == "ja"
+        assert message["namespaceLanguage"] == "ja"
+
+    def test_namespace_read_error_fails_an_event_rescan_for_retry(self):
+        """A 5xx is what the Glue-event consumer reports as a batch item failure."""
+        from coa_control_plane_server.models.scan_trigger import ScanTrigger
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.side_effect = ClientError({"Error": {"Code": "InternalServerError", "Message": "x"}}, "GetItem")
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID, trigger=ScanTrigger.EVENT))
+
+        assert status == 500
+        mock_dao.update.assert_not_called()
+        mock_scan_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.usefixtures("_rescan_namespace_item")
 class TestEventRescanCooldown:
     """EVENT rescans coalesce upstream-change bursts via a cooldown (#683 R8)."""
 
@@ -1939,6 +2310,7 @@ class TestEventRescanCooldown:
 
 
 @pytest.mark.unit
+@pytest.mark.usefixtures("_rescan_namespace_item")
 class TestRescanStatusTransition:
     """The SCANNING transition is the lock that serialises concurrent triggers."""
 
@@ -2097,3 +2469,295 @@ class TestRescanStatusTransition:
         from coa_common.response import iso_to_epoch
 
         assert isinstance(iso_to_epoch(sk), int)
+
+
+_GRAPH_VERIFY_QUEUE = "https://sqs.us-east-1.amazonaws.com/123/graph-verify-queue"
+_SCAN_QUEUE = "https://sqs.us-east-1.amazonaws.com/123/scan-queue"
+
+
+def _client_error(code: str, op: str):
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": code}}, op)
+
+
+def _graph_source_item(status="APPROVED", queryable=True, updated_ago_s=None):
+    item = _db_source_item(status)
+    item["sourceSubType"] = "RDF_SPARQL"
+    item["queryable"] = queryable
+    if updated_ago_s is not None:
+        item["updatedAt"] = (datetime.now(UTC) - timedelta(seconds=updated_ago_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return item
+
+
+@pytest.mark.unit
+class TestHandleRescanGraphSource:
+    """Re-scanning an RDF_SPARQL source re-runs its reachability verify, never a scan."""
+
+    @pytest.fixture(autouse=True)
+    def _graph_sources_on(self, monkeypatch):
+        monkeypatch.setenv(GRAPH_SOURCES_ENV, "true")
+
+    @pytest.fixture(autouse=True)
+    def _namespace_item(self):
+        # Every re-scan resolves the namespace-language snapshot first, graph sources included.
+        ns_dao = MagicMock()
+        ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA"}
+        with patch(f"{_SH}._get_ns_dao", return_value=ns_dao):
+            yield ns_dao
+
+    def _rescan(self, item, *, dao=None, sqs=None, scan_dao=None):
+        mock_dao = dao or MagicMock()
+        mock_dao.get.return_value = item
+        mock_scan_dao = scan_dao or MagicMock()
+        mock_sqs = sqs or MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", _SCAN_QUEUE),
+            patch(f"{_SH}._GRAPH_VERIFY_QUEUE_URL", _GRAPH_VERIFY_QUEUE),
+        ):
+            status, body = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+        return status, body, mock_dao, mock_scan_dao, mock_sqs
+
+    @pytest.mark.parametrize("entry_status", ["APPROVED", "SCAN_FAILED"])
+    def test_rescan_graph_source_enqueues_reverify_not_scan(self, entry_status):
+        status, body, _, mock_scan_dao, mock_sqs = self._rescan(_graph_source_item(entry_status))
+        assert status == 202
+        job_row = mock_scan_dao.put.call_args[0][0]
+        assert job_row["scanType"] == "reachability"
+        assert job_row["triggerType"] == "MANUAL"
+        assert body["scanJobId"] == job_row["SK"]
+        mock_sqs.send_message.assert_called_once()
+        kwargs = mock_sqs.send_message.call_args.kwargs
+        assert kwargs["QueueUrl"] == _GRAPH_VERIFY_QUEUE
+        assert json.loads(kwargs["MessageBody"]) == {
+            "sourceId": _SOURCE_ID,
+            "namespaceId": _NAMESPACE_ID,
+            "scanJobSK": job_row["SK"],
+        }
+
+    def test_rescan_graph_source_locks_status_and_keeps_queryable(self):
+        """A serving source keeps serving while it is re-verified."""
+        _, _, mock_dao, _, _ = self._rescan(_graph_source_item("APPROVED"))
+        lock = mock_dao.update.call_args_list[0]
+        assert lock.args[1]["status"] == "REGISTERED"
+        assert "queryable" not in lock.args[1]
+        assert lock.kwargs["condition"] == "#st = :prev"
+        assert lock.kwargs["condition_values"] == {":prev": "APPROVED"}
+
+    def test_rescan_graph_source_lost_race_is_409(self):
+        mock_dao = MagicMock()
+        mock_dao.update.side_effect = _client_error("ConditionalCheckFailedException", "UpdateItem")
+        status, _, _, mock_scan_dao, mock_sqs = self._rescan(_graph_source_item("APPROVED"), dao=mock_dao)
+        assert status == 409
+        mock_scan_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_rescan_graph_source_enqueue_failure_releases_lock_and_fails_job(self):
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = _client_error("InternalError", "SendMessage")
+        status, _, mock_dao, mock_scan_dao, _ = self._rescan(_graph_source_item("APPROVED"), sqs=mock_sqs)
+        assert status == 500
+        release = mock_dao.update.call_args_list[-1]
+        assert release.args[1]["status"] == "APPROVED"
+        assert mock_scan_dao.update.call_args.args[1]["status"] == "FAILED"
+
+    def test_rescan_graph_source_unreachable_queue_releases_lock_and_fails_job(self):
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = EndpointConnectionError(endpoint_url=_GRAPH_VERIFY_QUEUE)
+        status, _, mock_dao, mock_scan_dao, _ = self._rescan(_graph_source_item("APPROVED"), sqs=mock_sqs)
+        assert status == 500
+        release = mock_dao.update.call_args_list[-1]
+        assert release.args[1]["status"] == "APPROVED"
+        assert mock_scan_dao.update.call_args.args[1]["status"] == "FAILED"
+
+    def test_rescan_graph_source_while_verifying_is_409(self):
+        status, _, _, _, mock_sqs = self._rescan(_graph_source_item("REGISTERED", queryable=False, updated_ago_s=60))
+        assert status == 409
+        mock_sqs.send_message.assert_not_called()
+
+    @pytest.mark.parametrize("entry_status", ["APPROVED", "SCAN_FAILED"])
+    def test_rescan_graph_source_with_graph_sources_off_is_400_and_takes_no_lock(self, monkeypatch, entry_status):
+        monkeypatch.delenv(GRAPH_SOURCES_ENV)
+        status, body, mock_dao, mock_scan_dao, mock_sqs = self._rescan(_graph_source_item(entry_status))
+        assert status == 400
+        assert body == {"error": GRAPH_SOURCES_DISABLED_MESSAGE}
+        mock_dao.update.assert_not_called()
+        mock_scan_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_rescan_of_a_stranded_registered_graph_source_with_graph_sources_off_names_the_switch(self, monkeypatch):
+        """No verify is coming for it, so the refusal says why rather than reporting an active scan."""
+        monkeypatch.delenv(GRAPH_SOURCES_ENV)
+        status, body, mock_dao, _, mock_sqs = self._rescan(_graph_source_item("REGISTERED", queryable=False))
+        assert (status, body) == (400, {"error": GRAPH_SOURCES_DISABLED_MESSAGE})
+        mock_dao.update.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_rescan_of_a_registered_graph_source_with_graph_sources_on_is_still_409(self):
+        """Its verify may still be on the queue, so it is not re-verified a second time."""
+        status, body, _, _, mock_sqs = self._rescan(_graph_source_item("REGISTERED", queryable=False, updated_ago_s=60))
+        assert status == 409
+        assert body["status"] == "REGISTERED"
+        mock_sqs.send_message.assert_not_called()
+
+    def test_a_graph_source_waiting_longer_than_any_verify_can_take_is_re_verified(self):
+        """Turning graph sources off drops the verify queue; once they are on again, a source left
+        REGISTERED would otherwise refuse re-verify and delete forever."""
+        status, body, mock_dao, mock_scan_dao, mock_sqs = self._rescan(
+            _graph_source_item("REGISTERED", queryable=False, updated_ago_s=3600)
+        )
+        assert status == 202
+        assert mock_scan_dao.put.call_args[0][0]["scanType"] == "reachability"
+        mock_sqs.send_message.assert_called_once()
+        assert mock_sqs.send_message.call_args.kwargs["QueueUrl"] == _GRAPH_VERIFY_QUEUE
+
+    def test_a_scheduled_tick_re_verifies_a_graph_source_left_waiting(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {
+            **_graph_source_item("REGISTERED", queryable=False, updated_ago_s=3600),
+            "rescanSchedule": _SCHEDULE_ON,
+        }
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._GRAPH_VERIFY_QUEUE_URL", _GRAPH_VERIFY_QUEUE),
+        ):
+            resp = _current_sh()._handle_scheduled_rescan({"namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID})
+        assert resp == {"ok": True, "statusCode": 202}
+        mock_sqs.send_message.assert_called_once()
+
+    def test_a_sql_source_left_registered_is_still_409(self):
+        item = _db_source_item("REGISTERED")
+        item["updatedAt"] = "2020-01-01T00:00:00Z"
+        status, _, _, _, mock_sqs = self._rescan(item)
+        assert status == 409
+        mock_sqs.send_message.assert_not_called()
+
+    def test_two_triggers_that_both_read_a_stale_source_enqueue_one_verify(self):
+        """Both read the same stale row before either writes; only the first may take the lock."""
+        stale = _graph_source_item("REGISTERED", queryable=False, updated_ago_s=3600)
+        dao = _ConditionalDao(stale)
+        mock_sqs = MagicMock()
+        first, _, _, _, _ = self._rescan(dict(stale), dao=dao, sqs=mock_sqs)
+        second, body, _, _, _ = self._rescan(dict(stale), dao=dao, sqs=mock_sqs)
+        assert (first, second) == (202, 409)
+        assert body["status"] == "REGISTERED"
+        mock_sqs.send_message.assert_called_once()
+
+    def test_a_lost_enqueue_on_a_stale_source_keeps_it_re_verifiable(self):
+        """Releasing the lock restores the old updatedAt, so the next try doesn't wait 15 more minutes."""
+        stale = _graph_source_item("REGISTERED", queryable=False, updated_ago_s=3600)
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = _client_error("InternalError", "SendMessage")
+        status, _, mock_dao, _, _ = self._rescan(stale, sqs=mock_sqs)
+        assert status == 500
+        release = mock_dao.update.call_args_list[-1]
+        assert release.args[1] == {"status": "REGISTERED", "updatedAt": stale["updatedAt"]}
+
+    def test_the_lock_on_a_fresh_status_is_unchanged(self):
+        _, _, mock_dao, _, _ = self._rescan(_graph_source_item("APPROVED"))
+        lock = mock_dao.update.call_args_list[0]
+        assert lock.kwargs["condition"] == "#st = :prev"
+        assert lock.kwargs["condition_values"] == {":prev": "APPROVED"}
+
+    def test_scheduled_rescan_of_graph_source_with_graph_sources_off_is_declined(self, monkeypatch):
+        monkeypatch.delenv(GRAPH_SOURCES_ENV)
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {**_graph_source_item("APPROVED"), "rescanSchedule": _SCHEDULE_ON}
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._GRAPH_VERIFY_QUEUE_URL", _GRAPH_VERIFY_QUEUE),
+        ):
+            resp = _current_sh()._handle_scheduled_rescan({"namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID})
+        assert resp == {"ok": False, "statusCode": 400}
+        mock_dao.update.assert_not_called()
+        mock_scan_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_scheduled_rescan_of_graph_source_with_graph_sources_on_reverifies(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {**_graph_source_item("APPROVED"), "rescanSchedule": _SCHEDULE_ON}
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._GRAPH_VERIFY_QUEUE_URL", _GRAPH_VERIFY_QUEUE),
+        ):
+            resp = _current_sh()._handle_scheduled_rescan({"namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID})
+        assert resp == {"ok": True, "statusCode": 202}
+        assert mock_sqs.send_message.call_args.kwargs["QueueUrl"] == _GRAPH_VERIFY_QUEUE
+
+
+class _ConditionalDao:
+    """One source row whose ``update`` evaluates ``a = :b AND …`` conditions like DynamoDB.
+
+    ``get`` keeps returning the snapshot the test sets, as when two triggers read before either writes.
+    """
+
+    def __init__(self, item):
+        self.item = dict(item)
+        self.get = MagicMock(return_value=dict(item))
+
+    def update(self, _key, values, condition=None, condition_names=None, condition_values=None, **_kwargs):
+        names = condition_names or {}
+        for clause in (condition or "").split(" AND "):
+            if "=" not in clause:
+                continue
+            lhs, rhs = (part.strip() for part in clause.split("="))
+            if self.item.get(names.get(lhs, lhs)) != (condition_values or {})[rhs]:
+                raise _client_error("ConditionalCheckFailedException", "UpdateItem")
+        self.item.update(values)
+        return dict(self.item)
+
+
+@pytest.mark.unit
+class TestWaitsForALostVerify:
+    """The 15-minute stale check reads any ISO-8601 updatedAt, not one exact format."""
+
+    @pytest.fixture(autouse=True)
+    def _graph_sources_on(self, monkeypatch):
+        monkeypatch.setenv(GRAPH_SOURCES_ENV, "true")
+
+    @staticmethod
+    def _registered(updated_at):
+        return {**_graph_source_item("REGISTERED", queryable=False), "updatedAt": updated_at}
+
+    @pytest.mark.parametrize(
+        "fmt",
+        [
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%S+00:00",
+            "%Y-%m-%dT%H:%M:%S.%f+00:00",
+        ],
+    )
+    def test_an_hour_old_timestamp_is_stale_in_every_iso_form(self, fmt):
+        an_hour_ago = (datetime.now(UTC) - timedelta(hours=1)).strftime(fmt)
+        assert _current_sh()._waits_for_a_lost_verify(self._registered(an_hour_ago))
+
+    @pytest.mark.parametrize(("minutes_ago", "offset_h", "stale"), [(60, 2, True), (5, -5, False)])
+    def test_a_non_utc_offset_is_converted_before_comparing(self, minutes_ago, offset_h, stale):
+        """Read as UTC, the first would look an hour ahead and the second five hours old."""
+        at = (datetime.now(UTC) - timedelta(minutes=minutes_ago)).astimezone(timezone(timedelta(hours=offset_h)))
+        assert _current_sh()._waits_for_a_lost_verify(self._registered(at.isoformat())) is stale
+
+    def test_a_recent_fractional_timestamp_is_not_stale(self):
+        just_now = datetime.now(UTC).isoformat()
+        assert not _current_sh()._waits_for_a_lost_verify(self._registered(just_now))
+
+    def test_an_unreadable_timestamp_is_not_stale_and_is_logged(self):
+        sh = _current_sh()
+        with patch.object(sh, "logger", MagicMock()) as mock_logger:
+            assert not sh._waits_for_a_lost_verify(self._registered("yesterday"))
+        mock_logger.warning.assert_called_once()
+        assert mock_logger.warning.call_args.args[0] == "graph_verify_stale_check_unreadable_updated_at"

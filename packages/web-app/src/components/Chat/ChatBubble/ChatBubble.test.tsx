@@ -254,6 +254,29 @@ describe("ChatBubble", () => {
       ).toBeInTheDocument();
     });
 
+    it("renders only the SPARQL block (no SQL) for a native graph result", () => {
+      // nl_to_sparql: sparqlGenerated present, queryUsed absent → SPARQL block
+      // shows, no SQL block, and the caption says it ran directly against the graph.
+      const nativeResponse = {
+        ...response,
+        sparqlGenerated: "SELECT ?a WHERE { ?a a :Alliance }",
+      };
+      render(
+        <ChatBubble
+          role="assistant"
+          state="success"
+          {...baseProps}
+          response={nativeResponse}
+        />,
+      );
+      expect(screen.getByText("Compiled artifacts")).toBeInTheDocument();
+      expect(screen.getByText("SPARQL")).toBeInTheDocument();
+      expect(screen.queryByText("SQL")).not.toBeInTheDocument();
+      expect(
+        screen.getByText(/executed directly against the graph/i),
+      ).toBeInTheDocument();
+    });
+
     it("renders 'Compiled artifacts' section when queryUsed is present", () => {
       const artifactsResponse = {
         ...response,
@@ -318,6 +341,40 @@ describe("ChatBubble", () => {
           "The SPARQL the LLM emitted (Tier 2) and the SQL Athena executed.",
         ),
       ).toBeInTheDocument();
+    });
+
+    it("drops the '(Tier 2)' framing in the caption for Deep Reasoning artifacts", () => {
+      // Deep Reasoning also emits SPARQL+SQL but not via the Tier-2 cascade, so
+      // labelling its artifacts "(Tier 2)" is wrong (#1166 Cut #3). Same fixture
+      // as the Tier-2 case, only executionMode flipped.
+      const artifactsResponse = {
+        ...response,
+        sparqlGenerated: "SELECT ?x WHERE { ?x rdf:type :Claim }",
+        queryUsed: "SELECT * FROM claims",
+        executionMode: "deep-reasoning" as const,
+        trace: [
+          {
+            step: "t2.sql.execute",
+            status: "success",
+            durationMs: 5,
+            detail: { engine: "athena" },
+          },
+        ],
+      };
+      render(
+        <ChatBubble
+          role="assistant"
+          state="success"
+          {...baseProps}
+          response={artifactsResponse}
+        />,
+      );
+      expect(
+        screen.getByText(
+          "The SPARQL and SQL Deep Reasoning generated and Athena executed.",
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/\(Tier 2\)/)).not.toBeInTheDocument();
     });
 
     it("shows SQL-only caption naming the ATHENA engine from the trace tag", () => {

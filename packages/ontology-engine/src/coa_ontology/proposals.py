@@ -29,17 +29,21 @@ import os
 import random
 import time as _t
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 from threading import Thread
-from typing import Any
+from typing import TYPE_CHECKING, Annotated, Any, Self
+from urllib.parse import urlsplit
 
 from botocore.exceptions import ClientError
 from coa_common import sql_ident as _sql_ident
 from coa_common.constants import EVENT_SOURCE_PREFIX, VOCAB_URI, split_sql_ident_path
+from coa_control_plane_server.models.induction_source_type import InductionSourceType
 from coa_control_plane_server.models.proposal_status import ProposalStatus
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from rdflib import Graph
 
 from coa_ontology import dynamo_store
@@ -50,7 +54,12 @@ from coa_ontology.catalog.ingest import (
     ingest_ontology,
     wait_for_embeddings_searchable,
 )
+from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
+from coa_ontology.query_params import require_enum_value
 from coa_ontology.stores import build_stores as _build_stores  # noqa: F401 (re-exported for tests)
+
+if TYPE_CHECKING:
+    from coa_ontology.inducer.schemas import ConceptMatch
 
 _log = logging.getLogger("proposals.accept")
 
@@ -121,26 +130,73 @@ class RejectRequest(BaseModel):
     reason: str
 
 
+# UpdateProposal grounding bounds, per ``ontology-induction.smithy``:
+# groundingOverrides / novelTables @length(max: 1000); keys and novel-table
+# entries are GroundingSourceTableKey @length(min: 1, max: 1024); override
+# values are GroundingOverrideTargetUri @length(min: 1, max: 2048).
+MAX_GROUNDING_CHOICES = 1000
+MAX_GROUNDING_SOURCE_TABLE_KEY_LENGTH = 1024
+MAX_GROUNDING_TARGET_URI_LENGTH = 2048
+_GroundingSourceTableKey = Annotated[
+    str, StringConstraints(min_length=1, max_length=MAX_GROUNDING_SOURCE_TABLE_KEY_LENGTH)
+]
+_GroundingTargetUri = Annotated[str, StringConstraints(min_length=1, max_length=MAX_GROUNDING_TARGET_URI_LENGTH)]
+
+
 class UpdateProposalRequest(BaseModel):
     """Request body for editing a proposal's ontology and/or R2RML Turtle."""
 
-    proposal_id: str
-    ontology_turtle: str | None = None
-    r2rml_turtle: str | None = None
+    # The Smithy contract uses camelCase on the wire. populate_by_name keeps
+    # existing internal/tests callers that construct this model with snake_case
+    # working while canonical generated clients bind through explicit aliases.
+    model_config = ConfigDict(populate_by_name=True)
+
+    proposal_id: str = Field(alias="proposalId")
+    ontology_turtle: str | None = Field(default=None, alias="ontologyTurtle")
+    r2rml_turtle: str | None = Field(default=None, alias="r2rmlTurtle")
     # When True, the corresponding artifact was uploaded straight to its S3
     # key via a presigned PUT (see ``/{proposal_id}/upload-url``) instead of
     # being sent inline — used for ontologies too large for the 6 MB request
     # cap. The server reads the uploaded artifact back from S3 to validate it.
-    ontology_uploaded: bool = False
-    r2rml_uploaded: bool = False
-    grounding_overrides: dict[str, str | None] | None = None
+    ontology_uploaded: bool = Field(default=False, alias="ontologyUploaded")
+    r2rml_uploaded: bool = Field(default=False, alias="r2rmlUploaded")
+    grounding_overrides: dict[_GroundingSourceTableKey, _GroundingTargetUri] | None = Field(
+        default=None, alias="groundingOverrides", max_length=MAX_GROUNDING_CHOICES
+    )
+    novel_tables: list[_GroundingSourceTableKey] | None = Field(
+        default=None, alias="novelTables", max_length=MAX_GROUNDING_CHOICES
+    )
+    upload_revision_id: str | None = Field(default=None, alias="uploadRevisionId")
+
+    @model_validator(mode="after")
+    def validate_grounding_choices(self) -> Self:
+        """Reject ambiguous requests before any proposal state is read."""
+        novel_tables = self.novel_tables or []
+        if len(novel_tables) != len(set(novel_tables)):
+            raise ValueError("novelTables must not contain duplicate source tables")
+        overlap = set(self.grounding_overrides or {}).intersection(novel_tables)
+        if overlap:
+            raise ValueError(
+                "A source table cannot appear in both groundingOverrides and novelTables: " + ", ".join(sorted(overlap))
+            )
+        return self
+
+    @property
+    def grounding_choices(self) -> dict[str, str | None]:
+        """Combine the non-null Smithy wire fields into the internal form."""
+        choices: dict[str, str | None] = dict(self.grounding_overrides or {})
+        choices.update(dict.fromkeys(self.novel_tables or []))
+        return choices
 
 
 class ProposalUploadUrlResponse(BaseModel):
     """Presigned S3 PUT URLs for uploading edited proposal Turtle directly."""
 
-    ontology_put_url: str
-    r2rml_put_url: str
+    model_config = ConfigDict(populate_by_name=True)
+
+    revision_id: str = Field(alias="revisionId")
+    ontology_put_url: str = Field(alias="ontologyPutUrl")
+    r2rml_put_url: str = Field(alias="r2rmlPutUrl")
 
 
 class AcceptProposalRequest(BaseModel):
@@ -657,6 +713,21 @@ def _clean_ontology_for_vkg(turtle: str, r2rml_turtle: str | None = None) -> str
             if str(o).startswith(str(XSD)):
                 g.remove((prop, RDFS.range, o))
 
+    # The document-to-table bridge links columns (properties) to the document
+    # classes that describe them, and marks each linked subject with
+    # coa:linkSource. Those property-level links are catalog/serve metadata
+    # only, so they are left out of the VKG copy (Ontop would have to pun the
+    # property as an individual). Only properties carrying the marker are
+    # affected: any other ontology's links reach the VKG copy unchanged.
+    from rdflib.namespace import SKOS as _SKOS
+
+    _bridged_props = {p for p in obj_props | data_props if (p, SCL.linkSource, None) in g}
+    if _bridged_props:
+        for _pred in (_SKOS.closeMatch, _SKOS.relatedMatch):
+            for s, o in list(g.subject_objects(_pred)):
+                if s in _bridged_props:
+                    g.remove((s, _pred, o))
+
     # Temporal ranges are left INTACT. They used to be rewritten to xsd:string
     # to match the R2RML rr:datatype, which itself only said xsd:string because
     # the H2 validation schema declared temporal columns as VARCHAR. All three
@@ -724,6 +795,71 @@ def _remove_rdf_list(g, node) -> None:
         _remove_rdf_list(g, rest_val)
 
 
+def _accumulated_r2rml(ontology_id: str, namespace: str) -> str | None:
+    """Concatenate (and de-duplicate) the R2RML of every accepted proposal for ``ontology_id``.
+
+    The served mapping set for a namespace is the union of its accepted
+    proposals' R2RML; ``None`` when no accepted proposal carries any.
+    """
+    accepted = dynamo_store.list_proposals(
+        namespace=namespace, ontology_id=ontology_id, status=ProposalStatus.ACCEPTED.value
+    )
+    r2rml_parts = []
+    prefixes_seen: set[str] = set()
+    for p in accepted:
+        r2rml = p.get("r2rml_turtle", "")
+        if not r2rml and p.get("r2rml_s3_key"):
+            r2rml = dynamo_store._get_s3_text(p["r2rml_s3_key"]) or ""
+        if not r2rml:
+            continue
+        # Deduplicate @prefix lines across proposals
+        lines = []
+        for line in r2rml.split("\n"):
+            if line.strip().startswith("@prefix"):
+                if line.strip() not in prefixes_seen:
+                    prefixes_seen.add(line.strip())
+                    lines.append(line)
+            else:
+                lines.append(line)
+        r2rml_parts.append("\n".join(lines))
+    r2rml_turtle = "\n\n".join(r2rml_parts) if r2rml_parts else None
+
+    # Deduplicate R2RML TriplesMaps: multiple proposals for the same ontology
+    # can contribute identical TriplesMap definitions. Ontop rejects R2RML with
+    # duplicate logicalTable nodes on the same TriplesMap subject.
+    if r2rml_turtle:
+        try:
+            from rdflib import Graph
+            from rdflib import Namespace as RdfNamespace
+
+            RR = RdfNamespace("http://www.w3.org/ns/r2rml#")
+            r2rml_g = Graph()
+            r2rml_g.parse(data=r2rml_turtle, format="turtle")
+            for tmap in r2rml_g.subjects(predicate=None, object=RR.TriplesMap):
+                lts = list(r2rml_g.objects(tmap, RR.logicalTable))
+                if len(lts) > 1:
+                    for lt in lts[1:]:
+                        r2rml_g.remove((tmap, RR.logicalTable, lt))
+                        for tn in r2rml_g.objects(lt, RR.tableName):
+                            r2rml_g.remove((lt, RR.tableName, tn))
+            r2rml_turtle = r2rml_g.serialize(format="turtle")
+        except Exception:
+            # Best effort — don't break persist if dedup fails.
+            _log.warning("r2rml_triplesmap_dedup_skipped", exc_info=True)
+    return r2rml_turtle
+
+
+def _put_induced_turtle(namespace: str, ontology_id: str, turtle: str, s3=None) -> None:
+    """Write the induced ontology's Turtle to ``induced/<id>.ttl`` (the ``latest/`` VKG copy is not touched)."""
+    import boto3
+
+    if s3 is None:
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    key = f"{_S3_PREFIX}/{namespace}/induced/{_ontology_short_id(ontology_id)}.ttl"
+    s3.put_object(Bucket=_S3_BUCKET, Key=key, Body=turtle.encode("utf-8"), ContentType="text/turtle")
+    _log.info("s3 persist: wrote %s (%d bytes)", key, len(turtle))
+
+
 def _persist_induced_to_s3(
     ontology_id: str, namespace: str, graph_uri: str, current_datasource_ids: list[str] | None = None
 ) -> None:
@@ -752,51 +888,7 @@ def _persist_induced_to_s3(
             return
 
         # 2. Accumulate R2RML from all accepted proposals for this ontology
-        accepted = dynamo_store.list_proposals(
-            namespace=namespace, ontology_id=ontology_id, status=ProposalStatus.ACCEPTED.value
-        )
-        r2rml_parts = []
-        prefixes_seen: set[str] = set()
-        for p in accepted:
-            r2rml = p.get("r2rml_turtle", "")
-            if not r2rml and p.get("r2rml_s3_key"):
-                r2rml = dynamo_store._get_artifact_s3(namespace, p["proposal_id"], "r2rml") or ""
-            if not r2rml:
-                continue
-            # Deduplicate @prefix lines across proposals
-            lines = []
-            for line in r2rml.split("\n"):
-                if line.strip().startswith("@prefix"):
-                    if line.strip() not in prefixes_seen:
-                        prefixes_seen.add(line.strip())
-                        lines.append(line)
-                else:
-                    lines.append(line)
-            r2rml_parts.append("\n".join(lines))
-        r2rml_turtle = "\n\n".join(r2rml_parts) if r2rml_parts else None
-
-        # Deduplicate R2RML TriplesMaps: multiple proposals for the same ontology
-        # can contribute identical TriplesMap definitions. Ontop rejects R2RML with
-        # duplicate logicalTable nodes on the same TriplesMap subject.
-        if r2rml_turtle:
-            try:
-                from rdflib import Graph
-                from rdflib import Namespace as RdfNamespace
-
-                RR = RdfNamespace("http://www.w3.org/ns/r2rml#")
-                r2rml_g = Graph()
-                r2rml_g.parse(data=r2rml_turtle, format="turtle")
-                for tmap in r2rml_g.subjects(predicate=None, object=RR.TriplesMap):
-                    lts = list(r2rml_g.objects(tmap, RR.logicalTable))
-                    if len(lts) > 1:
-                        for lt in lts[1:]:
-                            r2rml_g.remove((tmap, RR.logicalTable, lt))
-                            for tn in r2rml_g.objects(lt, RR.tableName):
-                                r2rml_g.remove((lt, RR.tableName, tn))
-                r2rml_turtle = r2rml_g.serialize(format="turtle")
-            except Exception:
-                # Best effort — don't break persist if dedup fails.
-                _log.warning("r2rml_triplesmap_dedup_skipped", exc_info=True)
+        r2rml_turtle = _accumulated_r2rml(ontology_id, namespace)
 
         # 3. Write to S3
         short_id = _ontology_short_id(ontology_id)
@@ -804,13 +896,7 @@ def _persist_induced_to_s3(
         s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
         base_key = f"{_S3_PREFIX}/{namespace}/induced/{short_id}"
 
-        s3.put_object(
-            Bucket=_S3_BUCKET,
-            Key=f"{base_key}.ttl",
-            Body=ontology_turtle.encode("utf-8"),
-            ContentType="text/turtle",
-        )
-        _log.info("s3 persist: wrote %s.ttl (%d bytes)", base_key, len(ontology_turtle))
+        _put_induced_turtle(namespace, ontology_id, ontology_turtle, s3=s3)
 
         if r2rml_turtle:
             s3.put_object(
@@ -934,38 +1020,75 @@ def _emit_ontology_published(namespace: str, version: str) -> bool:
 # ── Routes ──────────────────────────────────────────────────────────────
 
 
+# ListProposals ``maxResults`` bounds and default. The max equals the Smithy
+# ``ListProposals.maxResults`` @range max (checked by a parity test). Also applied
+# to the legacy ``limit`` spelling so neither can ask for an unbounded page.
+LIST_PROPOSALS_DEFAULT_MAX_RESULTS = 50
+LIST_PROPOSALS_MAX_RESULTS = 200
+
+
+def proposals_list_scope(namespace: str | None) -> str:
+    """``nextToken`` scope of a ListProposals listing (see :mod:`coa_ontology.pagination`)."""
+    return f"proposals:{namespace}" if namespace else "proposals:*"
+
+
 @router.get("/")
 def list_proposals(
     namespace: str | None = None,
-    ontology_id: str | None = None,
+    ontology_id: str | None = Query(None, alias="ontologyId"),
+    legacy_ontology_id: str | None = Query(None, alias="ontology_id"),
     status: str | None = None,
     type: str | None = None,
     source_type: str | None = None,
-    limit: int = 50,
-):
-    """List proposals with optional filters.
+    max_results: int | None = Query(None, alias="maxResults", ge=1, le=LIST_PROPOSALS_MAX_RESULTS),
+    legacy_limit: int | None = Query(None, alias="limit", ge=1, le=LIST_PROPOSALS_MAX_RESULTS),
+    next_token: str | None = Query(None, alias="nextToken"),
+) -> dict[str, Any]:
+    """List one page of proposals, as the Smithy ``ListProposals`` output.
 
-    The ``source_type`` query parameter is forwarded to
+    Returns ``{"proposals": [...], "nextToken": "..."}``; ``nextToken`` is present
+    only when more results may follow, and is passed back unchanged to fetch the
+    next page. A malformed token, or one minted for another namespace, is a 400.
+
+    Query parameters use the contract's camelCase (``maxResults``, ``nextToken``,
+    ``ontologyId``) — the API proxy forwards them verbatim, so a snake_case-only
+    binding would silently drop them. The pre-contract spellings ``limit`` and
+    ``ontology_id`` still bind for existing callers; the contract spelling wins
+    when both are sent.
+
+    ``status`` and ``source_type`` must be a ``ProposalStatus`` /
+    ``InductionSourceType`` value; anything else is a 400, so a typo is not
+    mistaken for "no proposals". ``source_type`` is then forwarded to
     :func:`dynamo_store.list_proposals` unchanged — see that function's
     docstring for the filter semantics, including the backfill rule
-    for pre-schema-delta items that lack the attribute. The route does
-    not validate the value (no ``Literal`` restriction): unknown values
-    simply produce no matches, which lets the route degrade gracefully
-    if a client sends a stale enum member.
+    for pre-schema-delta items that lack the attribute.
+
+    Proposals are returned newest first (by ``created_at``); ``limit`` /
+    ``maxResults`` therefore keep the newest matches, and later pages continue
+    with older ones.
     """
-    items = dynamo_store.list_proposals(
+    require_enum_value("status", status, ProposalStatus)
+    require_enum_value("source_type", source_type, InductionSourceType)
+    scope = proposals_list_scope(namespace)
+    try:
+        start_key = decode_next_token(next_token, scope=scope)
+    except InvalidNextToken as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    items, next_key = dynamo_store.list_proposals_newest_page(
         namespace=namespace,
-        ontology_id=ontology_id,
+        ontology_id=ontology_id or legacy_ontology_id,
         status=status,
         proposal_type=type,
         source_type=source_type,
-        limit=limit,
+        limit=max_results or legacy_limit or LIST_PROPOSALS_DEFAULT_MAX_RESULTS,
+        after=start_key,
     )
-    # Strip large content fields from list view
+    # Defensive: the Turtle artifacts live in S3, but never let an inline copy
+    # bloat the list view.
     for item in items:
         item.pop("ontology_turtle", None)
         item.pop("r2rml_turtle", None)
-    return items
+    return page_body("proposals", items, next_key, scope=scope)
 
 
 @router.get("/{proposal_id}")
@@ -998,13 +1121,27 @@ def get_proposal(proposal_id: str, namespace: str = "default"):
     # Serve Turtle out-of-band via presigned S3 URLs rather than inlining it.
     item.pop("ontology_turtle", None)
     item.pop("r2rml_turtle", None)
-    item["ontology_url"] = dynamo_store.presign_proposal_artifact(namespace, proposal_id, "ontology")
-    item["r2rml_url"] = dynamo_store.presign_proposal_artifact(namespace, proposal_id, "r2rml")
+    item["ontology_url"] = dynamo_store.presign_proposal_artifact(
+        namespace,
+        proposal_id,
+        "ontology",
+        s3_key=item.get("ontology_s3_key"),
+    )
+    item["r2rml_url"] = dynamo_store.presign_proposal_artifact(
+        namespace,
+        proposal_id,
+        "r2rml",
+        s3_key=item.get("r2rml_s3_key"),
+    )
     # Serve grounding matches out-of-band the same way. Only strip an inline copy
     # when an S3 object exists (modern offloaded proposals): the inline copy is
     # already absent there, so this is defensive. Legacy inline-only proposals
     # (no S3 key -> matches_url is None) keep their small inline list.
-    matches_url = dynamo_store.presign_proposal_matches(namespace, proposal_id)
+    matches_url = dynamo_store.presign_proposal_matches(
+        namespace,
+        proposal_id,
+        s3_key=item.get("matches_s3_key"),
+    )
     item["matches_url"] = matches_url
     if matches_url:
         (item.get("metadata") or {}).pop("matches", None)
@@ -1656,11 +1793,17 @@ def accept_proposal(
             )
 
     # Fall back to a source-appropriate default only if the proposal never
-    # stored a label (rare — induction always sets one).
-    _default_label = (
-        "Induced Unstructured Ontology" if item.get("source_type") == "UNSTRUCTURED" else "Induced Structured Ontology"
-    )
-    label = (item.get("metadata") or {}).get("label", _default_label)
+    # stored a label (rare — induction always sets one). The default title
+    # follows the namespace language, read from the namespace only on this path.
+    label = (item.get("metadata") or {}).get("label")
+    if label is None:
+        from coa_ontology.induce_catalog import namespace_language_or_404
+        from coa_ontology.inducer.services.generated_text import render
+
+        title_key = (
+            "unstructured_proposal_title" if item.get("source_type") == "UNSTRUCTURED" else "structured_proposal_title"
+        )
+        label = render(title_key, namespace_language_or_404(namespace, _namespace_language_config()))
 
     # Mark the proposal as accept-in-progress so concurrent UI polls + the
     # in-progress check above see the right state. Clear any stale
@@ -1764,9 +1907,22 @@ def get_proposal_upload_urls(proposal_id: str, namespace: str = "default"):
         raise HTTPException(404, f"Proposal '{proposal_id}' not found")
     if item.get("status") in (ProposalStatus.ACCEPTED.value, ProposalStatus.REJECTED.value):
         raise HTTPException(409, f"Cannot update a {item['status']} proposal")
+    revision_id = str(uuid.uuid4())
+    version = f"revisions/{revision_id}"
     return ProposalUploadUrlResponse(
-        ontology_put_url=dynamo_store.presign_proposal_artifact_put(namespace, proposal_id, "ontology"),
-        r2rml_put_url=dynamo_store.presign_proposal_artifact_put(namespace, proposal_id, "r2rml"),
+        revision_id=revision_id,
+        ontology_put_url=dynamo_store.presign_proposal_artifact_put(
+            namespace,
+            proposal_id,
+            "ontology",
+            version=version,
+        ),
+        r2rml_put_url=dynamo_store.presign_proposal_artifact_put(
+            namespace,
+            proposal_id,
+            "r2rml",
+            version=version,
+        ),
     )
 
 
@@ -1774,9 +1930,9 @@ def get_proposal_upload_urls(proposal_id: str, namespace: str = "default"):
 def update_proposal(body: UpdateProposalRequest, namespace: str = "default"):
     """Upload a modified proposal (user revision) or apply grounding overrides.
 
-    When ``grounding_overrides`` is present, the backend patches the stored
-    matches, re-fetches catalog tables, and rebuilds the Turtle + R2RML.
-    This takes priority over raw ``ontology_turtle`` if both are sent.
+    When grounding choices are present, the backend patches the stored matches,
+    re-fetches catalog tables, and rebuilds the Turtle + R2RML.
+    Grounding overrides and direct Turtle edits must be submitted separately.
     """
     item = dynamo_store.get_proposal_by_id(body.proposal_id, namespace=namespace)
     if not item:
@@ -1784,8 +1940,26 @@ def update_proposal(body: UpdateProposalRequest, namespace: str = "default"):
     if item.get("status") in (ProposalStatus.ACCEPTED.value, ProposalStatus.REJECTED.value):
         raise HTTPException(409, f"Cannot update a {item['status']} proposal")
 
-    if body.grounding_overrides:
-        return _apply_grounding_overrides(body.proposal_id, body.grounding_overrides, item, namespace)
+    has_turtle_update = any(
+        (
+            body.ontology_turtle is not None,
+            body.r2rml_turtle is not None,
+            body.ontology_uploaded,
+            body.r2rml_uploaded,
+        )
+    )
+    grounding_choices = body.grounding_choices
+    if grounding_choices and (has_turtle_update or body.upload_revision_id is not None):
+        raise HTTPException(400, "Grounding overrides and Turtle edits must be saved separately")
+    if grounding_choices:
+        try:
+            return _apply_grounding_overrides(body.proposal_id, grounding_choices, item, namespace)
+        except HTTPException as exc:
+            if exc.status_code != 503:
+                raise
+            # ServiceUnavailableError is modeled as {"message": ...}; avoid
+            # FastAPI's default {"detail": ...} envelope at this route boundary.
+            return JSONResponse(status_code=503, content={"message": str(exc.detail)})
 
     # Turtle bodies are offloaded to S3 (only the S3 key is stored on the
     # DynamoDB item) — a large edited ontology written inline would trip the
@@ -1814,37 +1988,74 @@ def update_proposal(body: UpdateProposalRequest, namespace: str = "default"):
     # consent-gated /repair-datatypes action. (The served VKG copy is still
     # sanitized at accept time in _clean_ontology_for_vkg, so a skipped repair
     # can't break Ontop queries.)
+    has_uploaded_artifact = body.ontology_uploaded or body.r2rml_uploaded
+    if has_uploaded_artifact and body.upload_revision_id is None:
+        raise HTTPException(400, "uploadRevisionId is required when an uploaded flag is true")
+    if not has_uploaded_artifact and body.upload_revision_id is not None:
+        raise HTTPException(400, "uploadRevisionId is only valid with ontologyUploaded or r2rmlUploaded")
+
+    if body.upload_revision_id is not None:
+        try:
+            revision_id = str(uuid.UUID(body.upload_revision_id))
+        except (ValueError, AttributeError) as exc:
+            raise HTTPException(400, "uploadRevisionId must be a UUID returned by the upload-url endpoint") from exc
+    else:
+        revision_id = str(uuid.uuid4())
+    version = f"revisions/{revision_id}"
     updates: dict = {}
 
     if body.ontology_turtle is not None:
         _validate_turtle(body.ontology_turtle, "ontology")
         updates["ontology_s3_key"] = dynamo_store._put_artifact_s3(
-            namespace, body.proposal_id, "ontology", body.ontology_turtle
+            namespace,
+            body.proposal_id,
+            "ontology",
+            body.ontology_turtle,
+            version=version,
         )
     elif body.ontology_uploaded:
-        ttl = dynamo_store._get_artifact_s3(namespace, body.proposal_id, "ontology")
+        ttl = dynamo_store._get_artifact_s3(namespace, body.proposal_id, "ontology", version=version)
         if ttl is None:
             raise HTTPException(400, "ontology_uploaded was set but no uploaded artifact was found in S3")
         _validate_turtle(ttl, "ontology")
         # Already stored at its key by the presigned upload; nothing to re-store.
-        updates["ontology_s3_key"] = dynamo_store._proposal_s3_key(namespace, body.proposal_id, "ontology")
+        updates["ontology_s3_key"] = dynamo_store._proposal_s3_key(
+            namespace,
+            body.proposal_id,
+            "ontology",
+            version,
+        )
 
     if body.r2rml_turtle is not None:
         _validate_turtle(body.r2rml_turtle, "R2RML")
-        updates["r2rml_s3_key"] = dynamo_store._put_artifact_s3(namespace, body.proposal_id, "r2rml", body.r2rml_turtle)
+        updates["r2rml_s3_key"] = dynamo_store._put_artifact_s3(
+            namespace,
+            body.proposal_id,
+            "r2rml",
+            body.r2rml_turtle,
+            version=version,
+        )
     elif body.r2rml_uploaded:
-        ttl = dynamo_store._get_artifact_s3(namespace, body.proposal_id, "r2rml")
+        ttl = dynamo_store._get_artifact_s3(namespace, body.proposal_id, "r2rml", version=version)
         if ttl is None:
             raise HTTPException(400, "r2rml_uploaded was set but no uploaded artifact was found in S3")
         _validate_turtle(ttl, "R2RML")
-        updates["r2rml_s3_key"] = dynamo_store._proposal_s3_key(namespace, body.proposal_id, "r2rml")
+        updates["r2rml_s3_key"] = dynamo_store._proposal_s3_key(
+            namespace,
+            body.proposal_id,
+            "r2rml",
+            version,
+        )
 
     if not updates:
         raise HTTPException(
-            400, "Provide ontology_turtle/r2rml_turtle, ontology_uploaded/r2rml_uploaded, or grounding_overrides"
+            400,
+            "Provide ontology_turtle/r2rml_turtle, ontology_uploaded/r2rml_uploaded, "
+            "grounding_overrides, or novel_tables",
         )
 
     updates["status"] = "updated"
+    updates["revision_id"] = revision_id
     dynamo_store.update_proposal(body.proposal_id, namespace=namespace, **updates)
 
     return {"proposal_id": body.proposal_id, "status": "updated"}
@@ -1905,7 +2116,7 @@ def repair_proposal_datatypes(
         raise HTTPException(409, f"Cannot repair a {status} proposal")
 
     changes: list[tuple[str, str]] = []
-    updates: dict = {}
+    pending_artifacts: dict[str, str] = {}
 
     def _canonicalize_or_422(ttl: str, what: str) -> tuple[str, list[tuple[str, str]]]:
         # canonicalize_turtle is a pure util that lets an rdflib ParserError
@@ -1924,9 +2135,7 @@ def repair_proposal_datatypes(
         canonical, onto_changes = _canonicalize_or_422(ontology_ttl, "ontology")
         if onto_changes:
             if not dry_run:
-                updates["ontology_s3_key"] = dynamo_store._put_artifact_s3(
-                    namespace, proposal_id, "ontology", canonical
-                )
+                pending_artifacts["ontology"] = canonical
             changes.extend(onto_changes)
 
     r2rml_ttl = item.get("r2rml_turtle") or ""
@@ -1934,12 +2143,23 @@ def repair_proposal_datatypes(
         canonical_r2rml, r2rml_changes = _canonicalize_or_422(r2rml_ttl, "R2RML")
         if r2rml_changes:
             if not dry_run:
-                updates["r2rml_s3_key"] = dynamo_store._put_artifact_s3(
-                    namespace, proposal_id, "r2rml", canonical_r2rml
-                )
+                pending_artifacts["r2rml"] = canonical_r2rml
             changes.extend(r2rml_changes)
 
-    if updates:  # only populated on the non-dry-run path
+    if pending_artifacts:  # only populated on the non-dry-run path
+        revision_id = str(uuid.uuid4())
+        version = f"revisions/{revision_id}"
+        updates = {
+            f"{artifact}_s3_key": dynamo_store._put_artifact_s3(
+                namespace,
+                proposal_id,
+                artifact,
+                content,
+                version=version,
+            )
+            for artifact, content in pending_artifacts.items()
+        }
+        updates["revision_id"] = revision_id
         updates["status"] = "updated"
         dynamo_store.update_proposal(proposal_id, namespace=namespace, **updates)
         _log.info("Repaired %d datatype token(s) on proposal %s: %s", len(changes), proposal_id, changes)
@@ -1952,11 +2172,23 @@ def repair_proposal_datatypes(
     )
 
 
+def _grounding_override_key(
+    match: "ConceptMatch",
+    overrides: dict[str, str | None],
+    table_match_counts: Counter[str],
+) -> str | None:
+    """Pick an exact identity key, or a safe unique-table legacy key."""
+    candidate_keys = [match.source_table_identity] if match.source_table_identity else []
+    if table_match_counts[match.source_table] == 1:
+        candidate_keys.append(match.source_table)
+    return next((key for key in candidate_keys if key in overrides), None)
+
+
 def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None], item: dict, namespace: str) -> dict:
     """Patch grounding matches and rebuild Turtle + R2RML."""
     import os
 
-    from coa_ontology.induce_catalog import _catalog_to_tables, _fetch_catalog_from_smus
+    from coa_ontology.induce_catalog import _catalog_to_tables, fetch_datasource_catalog
     from coa_ontology.inducer.schemas import ConceptMatch
     from coa_ontology.inducer.services.data_catalog import CatalogTable
     from coa_ontology.inducer.services.grounding import classify_score_tier
@@ -1969,17 +2201,89 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
         raise HTTPException(409, "Proposal has no grounding matches to update")
 
     matches = [ConceptMatch(**m) if isinstance(m, dict) else m for m in raw_matches]
+    table_match_counts = Counter(m.source_table for m in matches if not m.source_column)
+
+    # Validate every requested key and URI before mutating any match, so a bad
+    # request cannot change metadata for one match while Turtle points at
+    # another class. Keys resolve through _grounding_override_key (stable table
+    # identity first, a bare table name only while it is unique). A key that
+    # names no class-level match fails closed, and so does a bare name that
+    # several class-level matches share: the caller asked for one table and the
+    # key cannot say which, so the whole request is rejected rather than
+    # applying the choice to no table and reporting success.
+    class_matches = [m for m in matches if not m.source_column]
+    identity_keys = {m.source_table_identity for m in class_matches if m.source_table_identity}
+    known_override_keys = {m.source_table for m in class_matches} | identity_keys
+    for override_key, override_uri in overrides.items():
+        if override_key not in known_override_keys:
+            raise HTTPException(
+                409,
+                f"Grounding override key '{override_key}' does not identify a class-level proposal match",
+            )
+        if override_key not in identity_keys and table_match_counts[override_key] > 1:
+            raise HTTPException(
+                409,
+                (
+                    f"Grounding override key '{override_key}' is ambiguous: "
+                    f"{table_match_counts[override_key]} class-level proposal matches share that table name; "
+                    "key the override by the table's source identity instead"
+                ),
+            )
+        if override_uri is None:
+            continue
+        try:
+            scheme = urlsplit(override_uri).scheme.lower()
+        except ValueError:
+            scheme = ""
+        if (
+            not override_uri
+            or len(override_uri) > 2048
+            or not override_uri.isprintable()
+            or any(character.isspace() for character in override_uri)
+            or scheme not in ("http", "https")
+        ):
+            raise HTTPException(
+                409,
+                (
+                    f"Grounding override for '{override_key}' must be an HTTP(S) URI "
+                    "of at most 2048 printable non-whitespace characters"
+                ),
+            )
+    # A chosen URI must be one of the stored candidates of the match its key
+    # actually resolves to (identity first, unique bare name second).
+    for m in class_matches:
+        match_key = _grounding_override_key(m, overrides, table_match_counts)
+        if match_key is None or overrides[match_key] is None:
+            continue
+        candidate_uris = {candidate.entity_uri for candidate in m.candidates or []}
+        if overrides[match_key] not in candidate_uris:
+            raise HTTPException(
+                409,
+                f"Grounding override for '{match_key}' must select one of the proposal's stored candidates",
+            )
 
     for m in matches:
         if m.source_column:
             continue
-        override_uri = overrides.get(m.source_table)
-        if override_uri is None and m.source_table in overrides:
+        match_key = _grounding_override_key(m, overrides, table_match_counts)
+        if match_key is None:
+            continue
+
+        # Relationship and rationale describe the previously selected target.
+        # Candidates retain identity and scores but not their own reranker
+        # relationship/reason, so reusing either field after an override would
+        # attach stale RDF semantics and UI rationale to the new target. Clear
+        # both for every explicit choice and let RDF emission fall back to the
+        # reclassified match_type below.
+        m.relationship = None
+        m.reason = None
+        override_uri = overrides[match_key]
+        if override_uri is None:
             m.matched_class_uri = None
             m.matched_ontology_id = None
             m.match_type = "novel"
             m.similarity = None
-        elif override_uri is not None:
+        else:
             m.matched_class_uri = override_uri
             # Derive the tier from the chosen candidate's own score rather than
             # hardcoding "high_confidence". Hardcoding was lossy and wrong: an
@@ -1994,19 +2298,19 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
                 cand = next((c for c in m.candidates if c.entity_uri == override_uri), None)
             if cand:
                 m.matched_ontology_id = cand.ontology_id
-                score = cand.fused_score if cand.fused_score is not None else cand.lexical_sim
+                # GroundingService stores the LLM confidence only on the one
+                # ENHANCED candidate that was actually reranked. Alternate
+                # candidates (and every STANDARD candidate) retain lexical_sim
+                # only, so their score must use the embedding ladder instead of
+                # being interpreted as an LLM confidence. The parent strategy
+                # check also avoids treating another producer's fused score as a
+                # grounding rerank score.
+                has_rerank = m.scoring_strategy == "grounding_enhanced" and cand.fused_score is not None
+                score = cand.fused_score if has_rerank else cand.lexical_sim
                 m.similarity = score
-                # Candidate scores are rerank/fused scores → classify on the
-                # rerank ladder (≥0.85 exact, ≥0.65 high_confidence, …). That
-                # ladder is margin-independent, so the public score-only tier
-                # helper is the right entry point here.
-                m.match_type = classify_score_tier(score, has_rerank=True)
-            else:
-                # Override URI isn't among the stored candidates (e.g. a class
-                # the user picked manually that wasn't a recall candidate); we
-                # have no score to classify from, so keep the prior conservative
-                # default rather than asserting an unjustified tier.
-                m.match_type = "high_confidence"
+                m.match_type = classify_score_tier(score, has_rerank=has_rerank)
+            else:  # pragma: no cover - validated before mutation
+                raise RuntimeError(f"validated grounding candidate disappeared for {m.source_table!r}")
 
     uri_prefix = item.get("ontology_id") or meta.get("ontology_uri_prefix", "http://example.org/ind#")
 
@@ -2021,19 +2325,52 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
             apply_overrides_to_turtle,
         )
 
-        stored_turtle = dynamo_store._get_artifact_s3(namespace, proposal_id, "ontology") or ""
+        stored_turtle = item.get("ontology_turtle") or ""
+        if not stored_turtle and item.get("ontology_s3_key"):
+            stored_turtle = dynamo_store._get_s3_text(item["ontology_s3_key"]) or ""
+        if not stored_turtle:
+            # Legacy/unit-test fallback for proposal rows that predate pointers.
+            stored_turtle = dynamo_store._get_artifact_s3(namespace, proposal_id, "ontology") or ""
         if not stored_turtle:
             raise HTTPException(409, "Proposal has no stored ontology Turtle to patch")
 
-        new_turtle, grounded_count = apply_overrides_to_turtle(stored_turtle, matches, uri_prefix=uri_prefix)
+        overridden_matches = [
+            match
+            for match in matches
+            if not match.source_column and _grounding_override_key(match, overrides, table_match_counts) is not None
+        ]
+        try:
+            new_turtle, grounded_count = apply_overrides_to_turtle(
+                stored_turtle,
+                overridden_matches,
+                uri_prefix=uri_prefix,
+            )
+        except ValueError as exc:
+            # Matches were patched only in memory. Abort before writing either
+            # metadata or Turtle so an unresolved class cannot create
+            # split-brain proposal state.
+            raise HTTPException(409, f"Grounding override could not be applied: {exc}") from exc
 
         from coa_ontology.induce_catalog import _floats_to_decimal
 
         updated_matches = [m.model_dump() for m in matches if not m.source_column]
-        matches_s3_key = dynamo_store.put_proposal_matches_s3(proposal_id, updated_matches, namespace=namespace)
+        revision_id = str(uuid.uuid4())
+        version = f"revisions/{revision_id}"
+        matches_s3_key = dynamo_store.put_proposal_matches_s3(
+            proposal_id,
+            updated_matches,
+            namespace=namespace,
+            version=version,
+        )
         meta_stripped = {k: v for k, v in meta.items() if k not in ("matches", "constraint_config")}
         meta_stripped["foundational_grounded_count"] = grounded_count
-        onto_key = dynamo_store._put_artifact_s3(namespace, proposal_id, "ontology", new_turtle)
+        onto_key = dynamo_store._put_artifact_s3(
+            namespace,
+            proposal_id,
+            "ontology",
+            new_turtle,
+            version=version,
+        )
         dynamo_store.update_proposal(
             proposal_id,
             namespace=namespace,
@@ -2041,6 +2378,7 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
             matches_s3_key=matches_s3_key,
             status=ProposalStatus.UPDATED.value,
             metadata=_floats_to_decimal(meta_stripped),
+            revision_id=revision_id,
         )
         return {"proposal_id": proposal_id, "status": "updated"}
 
@@ -2060,12 +2398,9 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
     all_tables: list[CatalogTable] = []
     for ds_id in ds_ids:
         try:
-            if catalog_source == "smus":
-                catalog = _fetch_catalog_from_smus(config, ds_id, namespace=namespace)
-            else:
-                from coa_ontology.induce_catalog import _fetch_catalog
-
-                catalog = _fetch_catalog(config["data_catalog_url"], ds_id)
+            # The same resolution as induction, including the bundled fixture for a
+            # ``-mock`` datasource: a proposal induced from one must be editable too.
+            catalog = fetch_datasource_catalog(config, ds_id, namespace=namespace)
             for tbl_dict in _catalog_to_tables(catalog):
                 tbl_dict["datasourceId"] = ds_id
                 # schema_from_fqn, not fqn.split(".")[0]: the schema is the segment
@@ -2079,12 +2414,24 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
                 all_tables.append(CatalogTable(**tbl_dict))
         except Exception as e:
             _log.warning("Failed to fetch catalog for %s: %s", ds_id, e)
+            raise HTTPException(
+                503,
+                f"Could not fetch catalog for datasource '{ds_id}'; no grounding changes were saved",
+            ) from e
 
     if not all_tables:
         raise HTTPException(409, "Could not fetch catalog tables for this proposal's datasources")
 
+    # The rebuild regenerates the whole proposal ontology, so it needs the same
+    # namespace language the induction used. The language is immutable, so the
+    # namespace item is the authority here too.
+    from coa_ontology.induce_catalog import namespace_language_or_404
+
+    namespace_language = namespace_language_or_404(namespace, config)
     strategy = TableToOntologyStrategy()
-    proposal_graph, novel_tables = strategy._build_proposal_ontology(uri_prefix, all_tables, matches)
+    proposal_graph, novel_tables = strategy._build_proposal_ontology(
+        uri_prefix, all_tables, matches, namespace_language=namespace_language
+    )
     r2rml_graph = strategy.build_r2rml(
         ontology_uri_prefix=uri_prefix,
         tables=all_tables,
@@ -2105,7 +2452,14 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
     # candidates + definitions are included) and persist only the S3 key on the
     # item — mirroring create_proposal. Writing them inline into ``metadata``
     # fails with "Item size has exceeded the maximum allowed size for :metadata".
-    matches_s3_key = dynamo_store.put_proposal_matches_s3(proposal_id, updated_matches, namespace=namespace)
+    revision_id = str(uuid.uuid4())
+    version = f"revisions/{revision_id}"
+    matches_s3_key = dynamo_store.put_proposal_matches_s3(
+        proposal_id,
+        updated_matches,
+        namespace=namespace,
+        version=version,
+    )
     # Strip blobs that live in S3 from the inline metadata before the write:
     #   - ``matches``: re-persisted to S3 above (matches_s3_key).
     #   - ``constraint_config``: get_proposal_by_id hydrates it INTO metadata
@@ -2114,8 +2468,20 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
     #     inline copy keeps the flag-driven hydration working.
     meta_stripped = {k: v for k, v in meta.items() if k not in ("matches", "constraint_config")}
     # Turtle is offloaded to S3 too; pass the keys, not the bodies.
-    onto_key = dynamo_store._put_artifact_s3(namespace, proposal_id, "ontology", ontology_ttl)
-    r2rml_key = dynamo_store._put_artifact_s3(namespace, proposal_id, "r2rml", r2rml_ttl)
+    onto_key = dynamo_store._put_artifact_s3(
+        namespace,
+        proposal_id,
+        "ontology",
+        ontology_ttl,
+        version=version,
+    )
+    r2rml_key = dynamo_store._put_artifact_s3(
+        namespace,
+        proposal_id,
+        "r2rml",
+        r2rml_ttl,
+        version=version,
+    )
     dynamo_store.update_proposal(
         proposal_id,
         namespace=namespace,
@@ -2124,6 +2490,7 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
         matches_s3_key=matches_s3_key,
         status=ProposalStatus.UPDATED.value,
         metadata=_floats_to_decimal(meta_stripped),
+        revision_id=revision_id,
     )
 
     return {"proposal_id": proposal_id, "status": "updated"}
@@ -2332,7 +2699,7 @@ def validate_proposal(
         # skips rr:datatype tokens (which reach Ontop via accept-time range
         # alignment), so a masked infra issue would silently defeat the feature.
         try:
-            r2rml_turtle = dynamo_store._get_artifact_s3(namespace, proposal_id, "r2rml") or ""
+            r2rml_turtle = dynamo_store._get_s3_text(item["r2rml_s3_key"]) or ""
         except Exception as e:
             _log.warning(
                 "validate[%s]: failed to fetch R2RML from S3; datatype validator will skip rr:datatype (%s: %s)",
@@ -2508,6 +2875,12 @@ class CompileConstraintsRequest(BaseModel):
     custom_turtle: str | None = None
 
 
+# Upper bound on a CompileConstraints ``constraint_config`` once serialized as
+# JSON. A Smithy Document member cannot carry @length, so the model states the
+# bound in its docs and this enforces it before the config is compiled.
+MAX_CONSTRAINT_CONFIG_BYTES = 64 * 1024
+
+
 @router.post("/{proposal_id}/compile-constraints")
 def compile_constraints(proposal_id: str, body: CompileConstraintsRequest, namespace: str = "default"):
     """Compile a reviewed ConstraintConfig into SHACL Turtle.
@@ -2516,6 +2889,10 @@ def compile_constraints(proposal_id: str, body: CompileConstraintsRequest, names
     and receives compiled SHACL ready for validation.
     """
     from coa_ontology.validation.shapes.config import ConstraintConfig, compile_to_shacl
+
+    serialized = json.dumps(body.constraint_config, separators=(",", ":"), ensure_ascii=False, default=str)
+    if len(serialized.encode("utf-8")) > MAX_CONSTRAINT_CONFIG_BYTES:
+        raise HTTPException(400, f"constraint_config exceeds {MAX_CONSTRAINT_CONFIG_BYTES} bytes")
 
     item = dynamo_store.get_proposal_by_id(proposal_id, namespace=namespace)
     if not item:
@@ -2529,3 +2906,12 @@ def compile_constraints(proposal_id: str, body: CompileConstraintsRequest, names
     shapes_turtle = compile_to_shacl(config, uri_prefix, custom_turtle=body.custom_turtle)
 
     return {"proposal_id": proposal_id, "shapes_turtle": shapes_turtle}
+
+
+def _namespace_language_config() -> dict[str, str]:
+    """App-config subset the namespace-language lookup reads, from the environment."""
+    return {
+        "catalog_source": os.environ.get("CATALOG_SOURCE", "http"),
+        "namespaces_table": os.environ.get("NAMESPACES_TABLE", ""),
+        "smus_region": os.environ.get("AWS_REGION", "us-east-1"),
+    }

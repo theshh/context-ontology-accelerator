@@ -3,10 +3,19 @@
 
 import * as cdk from "aws-cdk-lib";
 import { Template, Match } from "aws-cdk-lib/assertions";
-import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
+import {
+  NetworkStack,
+  validateVpcCidr,
+} from "../../lib/stacks/foundation/network-stack";
 
 // Env required for fromLookup tests
 const TEST_ENV = { account: "123456789012", region: "us-east-1" };
+
+// An imported VPC must come with its OpenSearch Serverless aoss-data endpoint.
+const IMPORTED_VPC = {
+  vpc_id: "vpc-0abc123",
+  aoss_vpc_endpoint_id: "vpce-0abc123def4567890",
+};
 
 function buildStack(context: Record<string, string> = {}): Template {
   const app = new cdk.App({ context });
@@ -68,10 +77,130 @@ describe("NetworkStack", () => {
       template.resourceCountIs("AWS::EC2::NatGateway", 1);
     });
 
+    it("keeps the CDK default CIDR when vpc_cidr is unset", () => {
+      // Existing deployments must see no diff.
+      buildStack().hasResourceProperties("AWS::EC2::VPC", {
+        CidrBlock: "10.0.0.0/16",
+      });
+    });
+
+    it("builds the VPC and its subnets on vpc_cidr when set", () => {
+      const template = buildStack({ vpc_cidr: "10.40.0.0/16" });
+      template.hasResourceProperties("AWS::EC2::VPC", {
+        CidrBlock: "10.40.0.0/16",
+      });
+      const subnets = Object.values(
+        template.findResources("AWS::EC2::Subnet"),
+      ).map((r: any) => r.Properties.CidrBlock);
+      expect(subnets).toHaveLength(4);
+      for (const cidr of subnets) {
+        expect(cidr).toMatch(/^10\.40\.\d+\.0\/24$/);
+      }
+    });
+
+    it("refuses vpc_cidr together with vpc_id", () => {
+      expect(() =>
+        buildStackWithEnv({ vpc_id: "vpc-0abc123", vpc_cidr: "10.40.0.0/16" }),
+      ).toThrow(/mutually exclusive/);
+    });
+
+    it("refuses a vpc_cidr overlapping the peered network", () => {
+      expect(() =>
+        buildStack({
+          vpc_cidr: "10.20.0.0/16",
+          jdbc_peer_vpc_id: "vpc-0peer",
+          jdbc_peer_cidrs: "10.20.0.0/16",
+        }),
+      ).toThrow(/overlaps peer network 10\.20\.0\.0\/16/);
+    });
+
     it("uses fromLookup when vpc_id context is set (no VPC resource created)", () => {
       // fromLookup with a known account/region produces a dummy VPC at synth time
-      const template = buildStackWithEnv({ vpc_id: "vpc-0abc123" });
+      const template = buildStackWithEnv(IMPORTED_VPC);
       template.resourceCountIs("AWS::EC2::VPC", 0);
+    });
+
+    it("uses the supplied aoss-data endpoint when importing a VPC", () => {
+      const app = new cdk.App({ context: IMPORTED_VPC });
+      const stack = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+      expect(stack.aossVpcEndpointId).toBe("vpce-0abc123def4567890");
+    });
+
+    describe("without an explicit stack env", () => {
+      const saved = { ...process.env };
+      afterEach(() => {
+        process.env = { ...saved };
+      });
+
+      it("takes the CLI's account and region when importing a VPC", () => {
+        // What `cdk synth` does with credentials: app.ts passes no env.
+        process.env.CDK_DEFAULT_ACCOUNT = "123456789012";
+        process.env.CDK_DEFAULT_REGION = "us-west-2";
+        const app = new cdk.App({ context: IMPORTED_VPC });
+        const stack = new NetworkStack(app, "TestNetwork");
+        expect(stack.account).toBe("123456789012");
+        expect(stack.region).toBe("us-west-2");
+      });
+
+      it("fails synth with a clear error when importing a VPC without credentials", () => {
+        delete process.env.CDK_DEFAULT_ACCOUNT;
+        delete process.env.CDK_DEFAULT_REGION;
+        const app = new cdk.App({ context: IMPORTED_VPC });
+        expect(() => new NetworkStack(app, "TestNetwork")).toThrow(
+          /vpc_id needs an AWS account and region at synth.*CDK_DEFAULT_ACCOUNT and CDK_DEFAULT_REGION/,
+        );
+      });
+
+      it("fails synth when importing a VPC with an account but no region", () => {
+        process.env.CDK_DEFAULT_ACCOUNT = "123456789012";
+        delete process.env.CDK_DEFAULT_REGION;
+        const app = new cdk.App({ context: IMPORTED_VPC });
+        expect(() => new NetworkStack(app, "TestNetwork")).toThrow(
+          /vpc_id needs an AWS account and region at synth/,
+        );
+      });
+
+      it("stays environment-agnostic without vpc_id", () => {
+        process.env.CDK_DEFAULT_ACCOUNT = "123456789012";
+        const stack = new NetworkStack(new cdk.App(), "TestNetwork");
+        expect(cdk.Token.isUnresolved(stack.account)).toBe(true);
+      });
+    });
+
+    it("fails synth when an imported VPC has no aoss_vpc_endpoint_id", () => {
+      expect(() => buildStackWithEnv({ vpc_id: "vpc-0abc123" })).toThrow(
+        /vpc_id requires aoss_vpc_endpoint_id.*com\.amazonaws\.us-east-1\.aoss-data/,
+      );
+    });
+
+    it.each([
+      ["the wrong prefix", "vpc-0abc123def4567890"],
+      ["7 hex characters", "vpce-1a2b3c4"],
+      ["18 hex characters", "vpce-0abc123def45678901"],
+      ["uppercase hex", "vpce-0ABC123DEF4567890"],
+      ["an inner space", "vpce-0abc123 def4567890"],
+    ])("fails synth when aoss_vpc_endpoint_id has %s", (_case, id) => {
+      expect(() =>
+        buildStackWithEnv({ vpc_id: "vpc-0abc123", aoss_vpc_endpoint_id: id }),
+      ).toThrow(/must be a VPC endpoint ID \(vpce-\.\.\.\)/);
+    });
+
+    it.each([
+      ["8 hex characters (older IDs)", "vpce-1a2b3c4d", "vpce-1a2b3c4d"],
+      ["17 hex characters", "vpce-0abc123def4567890", "vpce-0abc123def4567890"],
+      ["surrounding whitespace, trimmed", " vpce-1a2b3c4d ", "vpce-1a2b3c4d"],
+    ])("accepts an aoss_vpc_endpoint_id with %s", (_case, id, expected) => {
+      const app = new cdk.App({
+        context: { vpc_id: "vpc-0abc123", aoss_vpc_endpoint_id: id },
+      });
+      const stack = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+      expect(stack.aossVpcEndpointId).toBe(expected);
+    });
+
+    it("fails synth when aoss_vpc_endpoint_id is set without vpc_id", () => {
+      expect(() =>
+        buildStack({ aoss_vpc_endpoint_id: "vpce-0abc123def4567890" }),
+      ).toThrow(/only applies with vpc_id/);
     });
   });
 
@@ -125,7 +254,7 @@ describe("NetworkStack", () => {
     });
 
     it("does not create VPC endpoints when importing an existing VPC", () => {
-      const template = buildStackWithEnv({ vpc_id: "vpc-0abc123" });
+      const template = buildStackWithEnv(IMPORTED_VPC);
       template.resourceCountIs("AWS::EC2::VPCEndpoint", 0);
     });
   });
@@ -188,6 +317,16 @@ describe("NetworkStack", () => {
           ).toBe(true);
         }
       }
+    });
+
+    it("authorizer SG keeps all-outbound egress (external IdP JWKS on any port)", () => {
+      const template = buildStack();
+      template.hasResourceProperties("AWS::EC2::SecurityGroup", {
+        GroupDescription: "API authorizer security group",
+        SecurityGroupEgress: [
+          Match.objectLike({ CidrIp: "0.0.0.0/0", IpProtocol: "-1" }),
+        ],
+      });
     });
 
     it("Lambda SG has egress to source-DB ports (direct JDBC discovery)", () => {
@@ -310,6 +449,93 @@ describe("NetworkStack", () => {
     });
   });
 
+  describe("SPARQL source egress", () => {
+    const GRAPH_ON = { graph_sources: "on" };
+    const sparqlSgs = (template: Template) =>
+      Object.values(template.findResources("AWS::EC2::SecurityGroup")).filter(
+        (r: any) =>
+          r.Properties.GroupDescription ===
+          "Graph source SPARQL endpoint egress security group",
+      );
+
+    it("keeps an inert SPARQL egress SG, with no 8182 peer rule, when graph sources are off", () => {
+      const template = buildStack({
+        jdbc_peer_vpc_id: "vpc-0peer123",
+        jdbc_peer_cidrs: "10.50.0.0/16",
+      });
+      // Kept so turning the switch off never drops an export in use; see
+      // graph-sources-switch-exports.test.ts.
+      expect(sparqlSgs(template)).toHaveLength(1);
+      expect(JSON.stringify(template.toJSON())).not.toContain("RDF_SPARQL");
+    });
+
+    it("creates the SPARQL egress SG when graph sources are on", () => {
+      expect(sparqlSgs(buildStack(GRAPH_ON))).toHaveLength(1);
+    });
+
+    it("opens only 8182 egress, to the VPC CIDR, on a dedicated SG", () => {
+      const template = buildStack(GRAPH_ON);
+      const sg = Object.values(
+        template.findResources("AWS::EC2::SecurityGroup"),
+      ).find(
+        (r: any) =>
+          r.Properties.GroupDescription ===
+          "Graph source SPARQL endpoint egress security group",
+      ) as any;
+      expect(sg).toBeDefined();
+      const [vpcId] = Object.keys(template.findResources("AWS::EC2::VPC"));
+      expect(sg.Properties.SecurityGroupEgress).toEqual([
+        expect.objectContaining({
+          IpProtocol: "tcp",
+          FromPort: 8182,
+          ToPort: 8182,
+          CidrIp: { "Fn::GetAtt": [vpcId, "CidrBlock"] },
+        }),
+      ]);
+    });
+
+    it("adds 8182 egress to each peered and transit-gateway CIDR", () => {
+      const template = buildStack({
+        ...GRAPH_ON,
+        jdbc_peer_vpc_id: "vpc-0peer123",
+        jdbc_peer_cidrs: "10.50.0.0/16,10.51.0.0/16",
+        jdbc_tgw_id: "tgw-0abc",
+        jdbc_tgw_cidrs: "10.60.0.0/16",
+      });
+      const sg = Object.values(
+        template.findResources("AWS::EC2::SecurityGroup"),
+      ).find(
+        (r: any) =>
+          r.Properties.GroupDescription ===
+          "Graph source SPARQL endpoint egress security group",
+      ) as any;
+      const remote = sg.Properties.SecurityGroupEgress.filter(
+        (e: any) => typeof e.CidrIp === "string",
+      );
+      expect(
+        remote.map((e: any) => [e.CidrIp, e.FromPort, e.ToPort]).sort(),
+      ).toEqual([
+        ["10.50.0.0/16", 8182, 8182],
+        ["10.51.0.0/16", 8182, 8182],
+        ["10.60.0.0/16", 8182, 8182],
+      ]);
+    });
+
+    it("leaves the shared Lambda SG without a public 8182 rule", () => {
+      const template = buildStack(GRAPH_ON);
+      const lambdaSg = Object.values(
+        template.findResources("AWS::EC2::SecurityGroup"),
+      ).find(
+        (r: any) =>
+          r.Properties.GroupDescription === "Lambda functions security group",
+      ) as any;
+      const public8182 = (lambdaSg.Properties.SecurityGroupEgress ?? []).filter(
+        (e: any) => e.FromPort === 8182 && e.CidrIp === "0.0.0.0/0",
+      );
+      expect(public8182).toHaveLength(0);
+    });
+  });
+
   describe("Cloud Map Namespace", () => {
     it("creates a shared PrivateDnsNamespace associated with the VPC", () => {
       const template = buildStack();
@@ -411,11 +637,57 @@ describe("NetworkStack", () => {
 
     it("does not provision connectivity when importing an existing VPC", () => {
       const template = buildStackWithEnv({
-        vpc_id: "vpc-0abc123",
+        ...IMPORTED_VPC,
         jdbc_peer_vpc_id: "vpc-0peer123",
         jdbc_peer_cidrs: "10.20.0.0/16",
       });
       template.resourceCountIs("AWS::EC2::VPCPeeringConnection", 0);
     });
+  });
+});
+
+describe("validateVpcCidr", () => {
+  const ok = { azCount: 2, peerCidrs: [] as string[] };
+
+  it.each(["10.40.0.0/16", "172.20.0.0/20", "192.168.4.0/22"])(
+    "accepts %s",
+    (cidr) => {
+      expect(() => validateVpcCidr(cidr, ok)).not.toThrow();
+    },
+  );
+
+  it.each([
+    ["10.40.0.0", /not an IPv4 CIDR/],
+    ["10.40.0.300/16", /not an IPv4 CIDR/],
+    ["10.40.1.0/16", /host bits set/],
+    ["10.0.0.0/8", /between \/16 and \/28/],
+    ["10.40.0.0/23", /too small/],
+  ])("rejects %s", (cidr, error) => {
+    expect(() => validateVpcCidr(cidr, ok)).toThrow(error);
+  });
+
+  it("sizes the minimum by AZ count", () => {
+    // 3 AZs need 6 /24s, so a /22 (4) is too small and a /21 (8) fits.
+    expect(() =>
+      validateVpcCidr("10.40.0.0/22", { azCount: 3, peerCidrs: [] }),
+    ).toThrow(/use \/21 or larger/);
+    expect(() =>
+      validateVpcCidr("10.40.0.0/21", { azCount: 3, peerCidrs: [] }),
+    ).not.toThrow();
+  });
+
+  it("rejects partial overlap with a peer and accepts an adjacent range", () => {
+    expect(() =>
+      validateVpcCidr("10.40.0.0/16", {
+        azCount: 2,
+        peerCidrs: ["10.40.128.0/20"],
+      }),
+    ).toThrow(/overlaps/);
+    expect(() =>
+      validateVpcCidr("10.40.0.0/16", {
+        azCount: 2,
+        peerCidrs: ["10.41.0.0/16"],
+      }),
+    ).not.toThrow();
   });
 });

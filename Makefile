@@ -1,6 +1,10 @@
-.PHONY: setup generate format lint test test-unit test-integ build load-test load-test-slow load-test-teardown deploy-dev deploy-serve deploy-example-connector deploy-databricks-connector destroy-dev preflight docs web-dev vkg-dev version version-check
+.PHONY: setup generate format lint test test-unit test-integ build load-test load-test-slow load-test-teardown deploy-dev deploy-serve deploy-example-connector deploy-databricks-connector destroy-dev gc-assets preflight docs web-dev vkg-dev version version-check
 
-setup: generate
+# smithy-generate.sh needs pnpm, and setup-dev.sh needs the members it generates,
+# so setup first installs the pnpm version .mise.toml pins when pnpm is missing.
+setup:
+	./scripts/install-pnpm.sh
+	./scripts/smithy-generate.sh
 	./scripts/setup-dev.sh
 
 generate:
@@ -47,7 +51,11 @@ coverage:
 ##   INTEG_NAMESPACE_ID  — reuse an existing namespace (skip create)
 test-integ:
 	@if ls packages/*/tests/integ/ >/dev/null 2>&1; then \
-		uv run pytest packages/*/tests/integ/ -m integ -v --tb=short --import-mode=importlib; \
+		uv run pytest packages/*/tests/integ/ -m integ -v --tb=short --import-mode=importlib && \
+		uv run pytest \
+			benchmarks/coa100-benchmark/tests/integ/test_nightly_history_discovery.py \
+			benchmarks/coa100-benchmark/tests/integ/test_rolling_metric_publish.py \
+			-m integ -v --tb=short --import-mode=importlib; \
 	else echo "⚠ integ tests not available (stripped from public mirror)"; fi
 
 ## Load test: validates the pipeline at scale (50 → 50k tables).
@@ -80,14 +88,14 @@ notice:
 preflight:
 	./scripts/preflight-deploy.sh
 
-## Full dev deploy: the platform stacks, then the COA-operated Databricks connector.
+## Full dev deploy: the platform stacks and the COA-operated Databricks connector.
 ## The connector is chained rather than left to be remembered: a DATABRICKS_SQL_WAREHOUSE
 ## source cannot be registered without it, so a deployment missing it advertises a
-## sub-type nothing can serve. The ordering is the one deploy-databricks-connector
-## requires anyway, and it is the same order ci/mainline.yml models with a blocking job.
+## sub-type nothing can serve. It must follow the network, serve and sources stacks;
+## scripts/deploy-all.sh starts it as soon as those exist on a first deploy, and after
+## the platform deploy on an update (the order ci/mainline.yml models with a blocking job).
 deploy-dev:
-	./scripts/deploy.sh dev
-	$(MAKE) deploy-databricks-connector
+	./scripts/deploy-all.sh dev
 
 deploy-serve:
 	./scripts/deploy-serve.sh dev
@@ -117,28 +125,36 @@ deploy-example-connector:
 deploy-databricks-connector:
 	./scripts/deploy-managed-databricks-connector.sh dev
 
-## Tear down all dev stacks in one command. Deletes AgentCore Runtimes,
-## waits for their ENIs to detach (and stops if they do not),
-## deletes VKG's ECS services, force-deletes the DataZone domain (cascades
-## to RETAINed child resources CFN can't clear on its own), deletes every connector
-## stack (separate CDK apps, so `cdk destroy --all` never sees them), then runs
-## `cdk destroy --all` and verifies no stacks remain (see #660, #661, #707).
-## Optional env vars: SCL_PREFIX (default: coa — matches the CDK app), SCL_DESTROY_YES=1 to skip
-## the confirmation prompt (e.g. in CI), and the wait budgets
-## SCL_ENI_WAIT_MAX_SECONDS (600), SCL_ECS_WAIT_MAX_SECONDS (300),
+## Tear down all dev stacks. Deletes AgentCore Runtimes, deletes VKG's ECS services and
+## Cloud Map services, force-deletes the DataZone domain (cascades to RETAINed child
+## resources CFN can't clear on its own), deletes every connector stack (separate CDK apps),
+## runs `cdk destroy` on every stack but network (re-running it past a runtime security group
+## AgentCore's ENIs still hold and a refilled access-log bucket), then finishes the network
+## stack. AgentCore releases its ENIs up to 8 h after the Runtimes
+## are deleted; until then the VPC, its subnets and two security groups stay,
+## and scripts/destroy.sh exits 3 (make reports it as 2) — re-run it later.
+## Optional env vars: SCL_PREFIX (default: coa — matches the CDK app), SCL_DESTROY_YES=1 to
+## skip the confirmation prompt (e.g. in CI), SCL_DESTROY_CONCURRENCY (4), and the wait
+## budgets SCL_ENI_WAIT_MAX_SECONDS (0), SCL_ECS_WAIT_MAX_SECONDS (300),
 ## SCL_DOMAIN_WAIT_MAX_SECONDS (300), SCL_CLOUDMAP_WAIT_MAX_SECONDS (180),
 ## SCL_CONNECTOR_DELETE_WAIT_MAX_SECONDS (1800).
 destroy-dev:
 	make generate
-	pnpm install
+	pnpm install --frozen-lockfile
 	./scripts/destroy.sh dev
+
+## Prune stale images from the shared CDK bootstrap image repository with `cdk gc`
+## (see infra/README.md). Read-only by default; GC_ACTION=full tags unreferenced
+## images, and deletes those unreferenced for GC_ROLLBACK_BUFFER_DAYS (default 30).
+gc-assets:
+	./scripts/gc-cdk-assets.sh
 
 docs:
 	@if [ -d docs ]; then cd docs && mkdocs serve; \
 	else echo "⚠ docs/ not available (stripped from public mirror); see external-docs/"; fi
 
 web-dev:
-	cd packages/web-app && pnpm install && pnpm dev
+	cd packages/web-app && pnpm install --frozen-lockfile && pnpm dev
 
 vkg-dev:
 	docker build -t vkg-local packages/vkg/

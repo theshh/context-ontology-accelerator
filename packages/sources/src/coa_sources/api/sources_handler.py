@@ -28,14 +28,13 @@ import json
 import os
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import unquote
 
 import boto3
 import structlog
 from boto3.dynamodb.conditions import Attr
-from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from coa_common import resolve_region
 from coa_common.constants import (
@@ -47,8 +46,18 @@ from coa_common.constants import (
 )
 from coa_common.dao import DynamoDBDAO
 from coa_common.dao.base import QueryParams
+from coa_common.idempotency import idempotent_create
+from coa_common.language_tags import LanguageTagError
 from coa_common.logging import setup_logging
+from coa_common.neptune_endpoints import (
+    GRAPH_CLUSTER_CLAIM_ATTR,
+    GRAPH_CLUSTER_CLAIM_SK,
+    graph_cluster_claim_release,
+    is_graph_cluster_claim_pk,
+)
 from coa_common.response import api_response, iso_to_epoch
+from coa_common.s3 import regional_s3_client
+from coa_common.sparql_config import GRAPH_SOURCES_DISABLED_MESSAGE, graph_sources_enabled
 from coa_control_plane_server.models.create_source_input import CreateSourceInput
 from coa_control_plane_server.models.extraction_config import ExtractionConfig
 from coa_control_plane_server.models.get_source_output import GetSourceOutput
@@ -59,6 +68,7 @@ from coa_control_plane_server.models.source_summary import SourceSummary
 from coa_control_plane_server.models.source_type import SourceType
 from pydantic import ValidationError
 
+from coa_sources.client_errors import redact
 from coa_sources.database.connectors.athena_catalog import (
     AthenaCatalogError,
     catalog_source_id,
@@ -74,14 +84,22 @@ from coa_sources.database.databricks import (
     delete_config_parameter,
 )
 from coa_sources.database.glue_ownership import release_platform_catalog
+from coa_sources.database.graph_verify import REACHABILITY_SCAN_TYPE, verify_message
 from coa_sources.database.rescan_backup import BACKUP_SCAN_JOB_FIELD
 from coa_sources.database.sub_types import (
     CONNECTOR_BACKED_SUB_TYPES,
     FEDERATED_TEARDOWN_SUB_TYPES,
+    GRAPH_BACKED_SUB_TYPES,
     PLATFORM_CATALOG_CLAIM_SUB_TYPES,
+)
+from coa_sources.namespace_language import (
+    NamespaceNotFoundError,
+    namespace_language_from_item,
+    resolve_namespace_language,
 )
 from coa_sources.utils import merge_extraction_config
 
+from .contract import LIST_SOURCES_MAX_RESULTS, body_bound_error, label_bound_error, pagination_token_error
 from .namespace_counters import adjust_namespace_source_count
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
@@ -94,6 +112,9 @@ logger = structlog.get_logger(__name__)
 _SOURCES_TABLE: str = os.environ.get("SOURCES_TABLE", "")
 _SOURCE_SCAN_JOBS_TABLE: str = os.environ.get("SOURCE_SCAN_JOBS_TABLE", "")
 _SCAN_QUEUE_URL: str = os.environ.get("SCAN_QUEUE_URL", "")
+# RDF_SPARQL (graph) sources skip the DB-scan pipeline: create and re-scan enqueue a
+# reachability verify here instead (see coa_sources.database.graph_verify).
+_GRAPH_VERIFY_QUEUE_URL: str = os.environ.get("GRAPH_VERIFY_QUEUE_URL", "")
 _INGESTION_QUEUE_URL: str = os.environ.get("INGESTION_QUEUE_URL", "")
 _REVIEW_QUEUE_URL: str = os.environ.get("REVIEW_QUEUE_URL", "")
 _BUCKET_NAME: str = os.environ.get("BUCKET_NAME", "")
@@ -130,7 +151,7 @@ except (ValueError, TypeError):
     _EVENT_RESCAN_COOLDOWN_S = 300
 
 _DEFAULT_MAX_RESULTS = 100
-_MAX_RESULTS_LIMIT = 100
+_MAX_RESULTS_LIMIT = LIST_SOURCES_MAX_RESULTS
 _MAX_UPLOAD_FILES = 100
 _MAX_REVIEW_TABLES = 500
 _UPLOAD_URL_EXPIRY_SECONDS = 900
@@ -155,6 +176,7 @@ _DETAIL_CONFIG_KEYS: dict[str, str] = {
     SourceSubType.JDBC_DATABASE.value: "jdbcConfiguration",
     SourceSubType.CUSTOM_CONNECTOR.value: "customConnectorConfiguration",
     SourceSubType.DATABRICKS_SQL_WAREHOUSE.value: "databricksSqlWarehouseConfiguration",
+    SourceSubType.RDF_SPARQL.value: "sparqlConfiguration",
 }
 
 # How a row this map does not cover is read: as Glue, which is how every
@@ -227,8 +249,8 @@ def _get_s3():
         # falls back to the deprecated SigV2 presigner in pre-2014 regions,
         # and SigV2-only regions can't presign at all. Only ContentType is
         # signed (see document_routes._handle_upload_urls), so browser PUTs
-        # stay valid under SigV4.
-        _s3 = boto3.client("s3", region_name=_AWS_REGION, config=Config(signature_version="s3v4"))
+        # stay valid under SigV4. Regional hostname: see regional_s3_client.
+        _s3 = regional_s3_client(_AWS_REGION)
     return _s3
 
 
@@ -490,9 +512,12 @@ def _build_document_detail(item: dict[str, Any], metrics: dict[str, Any] | None 
     #   1. A plain string (e.g. from sources_handler itself)
     #   2. A Lambda error envelope: {"errorMessage": "...", "errorType": "..."}
     #   3. A raw ECS task JSON blob with "StoppedReason" and "Containers[].Reason"
+    # The Step Functions failure path stores the failing Lambda's raw error
+    # cause here, so redact what is returned: no ARNs, account ids, endpoints or
+    # tracebacks reach the caller (rows written before this change included).
     raw_error = item.get("errorMessage")
     if raw_error:
-        doc["errorMessage"] = _parse_error_message(raw_error)
+        doc["errorMessage"] = redact(_parse_error_message(raw_error))
 
     if item.get("preprocessingIssues"):
         val = item["preprocessingIssues"]
@@ -626,11 +651,18 @@ def _handle_list(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
         return api_response(400, {"error": "maxResults must be a valid integer"})
 
     next_token: str | None = qs.get("nextToken")
+    token_error = pagination_token_error(next_token)
+    if token_error:
+        return api_response(400, {"error": token_error})
     exclusive_start_key: dict[str, Any] | None = None
     if next_token:
         try:
             exclusive_start_key = json.loads(base64.b64decode(next_token).decode())
         except Exception:
+            return api_response(400, {"error": "Invalid nextToken"})
+        # A token minted for another namespace (or hand-edited) would otherwise
+        # reach DynamoDB as an out-of-partition start key and fail as a 500.
+        if not isinstance(exclusive_start_key, dict) or exclusive_start_key.get("namespaceId") != namespace_id:
             return api_response(400, {"error": "Invalid nextToken"})
 
     try:
@@ -658,7 +690,9 @@ def _handle_list(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
                     scan_forward=False,
                 )
             )
-    except ClientError:
+    except ClientError as exc:
+        if exclusive_start_key and exc.response.get("Error", {}).get("Code") == "ValidationException":
+            return api_response(400, {"error": "Invalid nextToken"})
         logger.exception("ddb_query_failed", namespace_id=namespace_id)
         return api_response(500, {"error": "Internal server error"})
 
@@ -699,19 +733,22 @@ def _handle_create(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
     except ValidationError as exc:
         return api_response(400, {"error": _validation_message(exc)})
 
-    # Verify namespace exists
+    # Verify namespace exists and resolve its language. The language is the
+    # namespace's, never the request's: the snapshot taken here travels in the
+    # scan/ingestion job input so the workers need not (and must not) re-read it.
     ns_item = _get_ns_dao().get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
     if not ns_item:
         return api_response(404, {"error": f"Namespace not found: {namespace_id}"})
+    namespace_language = namespace_language_from_item(ns_item, namespace_id)
 
     if req.source_type == SourceType.DATABASE:
         if not req.database_source:
             return api_response(400, {"error": "databaseSource is required when sourceType=DATABASE"})
-        return _create_database_source(req.database_source, namespace_id)
+        return _create_database_source(req.database_source, namespace_id, namespace_language=namespace_language)
     else:
         if not req.document_source:
             return api_response(400, {"error": "documentSource is required when sourceType=DOCUMENTS"})
-        return _create_document_source(req.document_source, namespace_id, event)
+        return _create_document_source(req.document_source, namespace_id, event, namespace_language=namespace_language)
 
 
 # ---------------------------------------------------------------------------
@@ -1099,7 +1136,14 @@ def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> di
         return api_response(202, {"sourceId": source_id, "status": SourceStatus.DELETING})
 
     else:  # DATABASE
-        if current_status in SOURCE_ACTIVE_STATUSES:
+        sub_type = item.get("sourceSubType", "")
+        # With graph sources off no verify will ever move a REGISTERED graph source on, so it is not active.
+        stranded_graph_source = (
+            sub_type in GRAPH_BACKED_SUB_TYPES
+            and current_status == SourceStatus.REGISTERED
+            and not graph_sources_enabled()
+        )
+        if current_status in SOURCE_ACTIVE_STATUSES and not stranded_graph_source:
             return api_response(
                 409,
                 {
@@ -1110,7 +1154,6 @@ def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> di
                     "status": current_status,
                 },
             )
-        sub_type = item.get("sourceSubType", "")
 
         # The one name every teardown below works from, derived from the source id
         # rather than read off the row. `build_catalog_name` is what named the
@@ -1462,6 +1505,10 @@ def finish_database_source_deletion(
     if sub_type in PLATFORM_CATALOG_CLAIM_SUB_TYPES:
         with contextlib.suppress(ClientError):
             release_platform_catalog(_get_dao(), catalog_name=catalog_name)
+    claim_pk = _graph_cluster_claim_of(namespace_id, source_id, sub_type)
+    if claim_pk is None:
+        # Without the note the claim could never be released: keep the row so a retry reads it again.
+        return False
 
     try:
         _get_dao().delete({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
@@ -1469,7 +1516,69 @@ def finish_database_source_deletion(
         logger.exception("ddb_delete_failed", source_id=source_id)
         return False
 
+    _release_graph_cluster_claim(namespace_id, source_id, claim_pk)
     return True
+
+
+def _graph_cluster_claim_of(namespace_id: str, source_id: str, sub_type: str) -> str | None:
+    """The cluster claim a graph source notes, read before its row goes; ``""`` for any other source.
+
+    ``None`` when the note cannot be read: the caller keeps the row, so the claim is not orphaned.
+    """
+    if sub_type not in GRAPH_BACKED_SUB_TYPES:
+        return ""
+    try:
+        item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"}, consistent_read=True) or {}
+    except (ClientError, BotoCoreError):
+        logger.warning("graph_cluster_claim_read_failed", source_id=source_id, namespace_id=namespace_id)
+        return None
+    claim_pk = item.get(GRAPH_CLUSTER_CLAIM_ATTR)
+    # isinstance narrows for mypy, which reads coa_common (no py.typed) as untyped.
+    return claim_pk if isinstance(claim_pk, str) and is_graph_cluster_claim_pk(claim_pk) else ""
+
+
+def _release_graph_cluster_claim(namespace_id: str, source_id: str, claim_pk: str) -> None:
+    """Release the namespace's claim on a Neptune cluster once its last graph source there is gone. Best-effort.
+
+    Runs after the row delete, so two sources deleted at once cannot each keep the claim for the other; both may
+    release, which the delete's condition on the namespace makes harmless. The claim is read before the sources,
+    so a source approved in between (a new approval token) keeps it.
+    """
+    if not claim_pk:
+        return
+    dao = _get_dao()
+    try:
+        claim = dao.get({"PK": claim_pk, "SK": GRAPH_CLUSTER_CLAIM_SK}, consistent_read=True)
+        if _other_source_holds_claim(dao, namespace_id, source_id, claim_pk):
+            return
+        dao.transact_write([graph_cluster_claim_release(_SOURCES_TABLE, claim_pk, namespace_id, claim)])
+    except ClientError as exc:
+        cancelled = exc.response.get("CancellationReasons") or []
+        if any(r.get("Code") == "ConditionalCheckFailed" for r in cancelled):
+            logger.info("graph_cluster_claim_kept", source_id=source_id, namespace_id=namespace_id)
+        else:
+            logger.warning("graph_cluster_claim_release_failed", source_id=source_id, namespace_id=namespace_id)
+    except BotoCoreError:
+        logger.warning("graph_cluster_claim_release_failed", source_id=source_id, namespace_id=namespace_id)
+
+
+def _other_source_holds_claim(dao: DynamoDBDAO, namespace_id: str, source_id: str, claim_pk: str) -> bool:
+    start: dict[str, Any] | None = None
+    while True:
+        page = dao.query(
+            QueryParams(
+                key_condition="PK = :pk AND begins_with(SK, :prefix)",
+                expression_values={":pk": f"NS#{namespace_id}", ":prefix": "SRC#"},
+                exclusive_start_key=start,
+                # A lagging replica could miss a source's claim note and let the release delete a claim in use.
+                consistent_read=True,
+            )
+        )
+        if any(i.get(GRAPH_CLUSTER_CLAIM_ATTR) == claim_pk and i.get("sourceId") != source_id for i in page.items):
+            return True
+        start = page.last_evaluated_key
+        if not start:
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -1510,6 +1619,17 @@ def _handle_rescan(
     if not item:
         return api_response(404, {"error": f"Source '{source_id}' not found"})
 
+    # Snapshot the namespace language for this job before anything is written.
+    # A missing namespace or a failed read fails the re-scan; it never falls
+    # back to English, and nothing in the request can choose the value.
+    try:
+        namespace_language = resolve_namespace_language(_get_ns_dao(), namespace_id)
+    except NamespaceNotFoundError:
+        return api_response(404, {"error": f"Namespace not found: {namespace_id}"})
+    except (ClientError, BotoCoreError, LanguageTagError):
+        logger.exception("namespace_language_resolve_failed", namespace_id=namespace_id, source_id=source_id)
+        return api_response(500, {"error": "Internal server error"})
+
     source_type = item.get("sourceType", "")
     current_status = item.get("status", "")
     now = _now_iso()
@@ -1527,18 +1647,9 @@ def _handle_rescan(
         SourceStatus.APPROVED,
         SourceStatus.RESCAN_REVIEW,
     )
-    if source_type == SourceType.DATABASE and current_status not in _DB_RESCAN_ALLOWED:
-        return api_response(
-            409,
-            {
-                "error": (
-                    f"Re-scan is only allowed when status is one of "
-                    f"{', '.join(_DB_RESCAN_ALLOWED)} (current: '{current_status}')."
-                ),
-                "sourceId": source_id,
-                "status": current_status,
-            },
-        )
+    stale_verify = _waits_for_a_lost_verify(item)
+    if source_type == SourceType.DATABASE and current_status not in _DB_RESCAN_ALLOWED and not stale_verify:
+        return _rescan_status_refusal(item, source_id, current_status, _DB_RESCAN_ALLOWED)
     # Re-scanning a source that already has an OPEN re-scan review is the one
     # transition that destroys steward work, so it needs an explicit
     # acknowledgement. Discovery re-diffs against the last APPROVED state
@@ -1642,6 +1753,7 @@ def _handle_rescan(
             "source_type": item.get("docSourceType", "s3"),
             "s3_prefixes": item.get("s3Prefixes", []),
             "extraction_config": extraction_config,
+            "namespace_language": namespace_language,
         }
         if item.get("sourceBucketArn"):
             sqs_body["source_bucket_arn"] = item["sourceBucketArn"]
@@ -1659,7 +1771,7 @@ def _handle_rescan(
         return api_response(200, _item_to_detail(updated_item))
 
     else:  # DATABASE
-        if current_status in SOURCE_ACTIVE_STATUSES:
+        if current_status in SOURCE_ACTIVE_STATUSES and not stale_verify:
             return api_response(
                 409,
                 {
@@ -1667,6 +1779,18 @@ def _handle_rescan(
                     "sourceId": source_id,
                     "status": current_status,
                 },
+            )
+
+        # A graph source has no schema to scan: its "re-scan" re-runs the reachability
+        # verify. Branched before any SQL-scan write so it never enters discovery.
+        if item.get("sourceSubType") in GRAPH_BACKED_SUB_TYPES:
+            return _reverify_graph_source(
+                namespace_id,
+                source_id,
+                current_status,
+                trigger,
+                now,
+                stale_since=item.get("updatedAt") if stale_verify else None,
             )
 
         # One upstream change emits many Glue events; collapse the burst.
@@ -1726,6 +1850,7 @@ def _handle_rescan(
                     "SK": scan_job_sk,
                     "sourceId": source_id,
                     "namespaceId": namespace_id,
+                    "namespaceLanguage": namespace_language,
                     "status": "IN_PROGRESS",
                     "scanType": "full",
                     "triggerType": trigger,
@@ -1743,11 +1868,15 @@ def _handle_rescan(
                 QueueUrl=_SCAN_QUEUE_URL,
                 MessageBody=json.dumps(
                     {
+                        # The trigger derives the bare sourceId from this for the
+                        # execution input, where the state machine's SCAN_FAILED step
+                        # and the reaper key the sources row on it.
                         "datasourceId": f"DS#{source_id}",
                         "scanJobId": f"SCAN#{str(uuid.uuid4())}",
                         "scanJobPK": f"SRC#{source_id}",
                         "scanJobSK": scan_job_sk,
                         "namespaceId": namespace_id,
+                        "namespaceLanguage": namespace_language,
                         "scanType": "full",
                         # Set when re-scanning an already-approved (or drift-review)
                         # source, including a retry of such a re-scan that failed.
@@ -1786,6 +1915,153 @@ def _handle_rescan(
         return api_response(202, {"sourceId": source_id, "scanJobId": scan_job_sk, "status": "IN_PROGRESS"})
 
 
+# Longer than any verify can take: the queue redrives a message 3 times, 90 s apart,
+# and each attempt is capped by the Lambda's 30 s timeout.
+_GRAPH_VERIFY_STALE_AFTER = timedelta(minutes=15)
+
+
+def _waits_for_a_lost_verify(item: dict[str, Any]) -> bool:
+    """A graph source still REGISTERED long after any verify could have finished.
+
+    Turning graph sources off drops the verify queue with its messages, so a source that
+    was waiting stays REGISTERED once they are on again. It can then be re-verified.
+    """
+    if (
+        item.get("sourceSubType") not in GRAPH_BACKED_SUB_TYPES
+        or item.get("status") != SourceStatus.REGISTERED
+        or not graph_sources_enabled()
+    ):
+        return False
+    raw = str(item.get("updatedAt", ""))
+    try:
+        updated = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("graph_verify_stale_check_unreadable_updated_at", source_id=item.get("sourceId"), updated_at=raw)
+        return False
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    return datetime.now(UTC) - updated > _GRAPH_VERIFY_STALE_AFTER
+
+
+def _rescan_status_refusal(
+    item: dict[str, Any], source_id: str, current_status: str, allowed: tuple[str, ...]
+) -> dict[str, Any]:
+    """The 409 for a database re-scan from a status it is not allowed from.
+
+    A graph source with graph sources off gets the switch's 400 instead: no verify is
+    coming for it, so waiting on its status would not help.
+    """
+    if item.get("sourceSubType") in GRAPH_BACKED_SUB_TYPES and not graph_sources_enabled():
+        return api_response(400, {"error": GRAPH_SOURCES_DISABLED_MESSAGE})
+    return api_response(
+        409,
+        {
+            "error": (
+                f"Re-scan is only allowed when status is one of {', '.join(allowed)} (current: '{current_status}')."
+            ),
+            "sourceId": source_id,
+            "status": current_status,
+        },
+    )
+
+
+def _reverify_graph_source(
+    namespace_id: str,
+    source_id: str,
+    current_status: str,
+    trigger: str,
+    now: str,
+    stale_since: str | None = None,
+) -> dict[str, Any]:
+    """Re-run the reachability verify of an RDF_SPARQL source.
+
+    Takes the same conditional status lock the SQL re-scan takes (the status just
+    read → ``REGISTERED``, an active status), so two triggers cannot both enqueue.
+    A source left ``REGISTERED`` (``stale_since``, its ``updatedAt``) is already in that
+    status, so the lock also requires the ``updatedAt`` just read; releasing it restores
+    that value, so a failed enqueue doesn't restart the 15-minute wait.
+    ``queryable`` is left as it is: a source that was serving keeps serving while it
+    is re-verified, and the verify's result is what moves it. With graph sources off it
+    is refused before the lock is taken.
+    """
+    if not graph_sources_enabled():
+        return api_response(400, {"error": GRAPH_SOURCES_DISABLED_MESSAGE})
+    condition = "#st = :prev"
+    condition_names = {"#st": "status"}
+    condition_values = {":prev": current_status}
+    if stale_since is not None:
+        condition += " AND #ua = :prevUpdatedAt"
+        condition_names["#ua"] = "updatedAt"
+        condition_values[":prevUpdatedAt"] = stale_since
+    try:
+        _get_dao().update(
+            {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+            {"status": SourceStatus.REGISTERED, "updatedAt": now},
+            condition=condition,
+            condition_names=condition_names,
+            condition_values=condition_values,
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            logger.info("graph_reverify_lost_status_race", source_id=source_id, expected=current_status)
+            return api_response(
+                409,
+                {
+                    "error": f"Source '{source_id}' is already being verified.",
+                    "sourceId": source_id,
+                    "status": current_status,
+                },
+            )
+        logger.exception("ddb_update_status_failed", source_id=source_id)
+        return api_response(500, {"error": "Internal server error"})
+
+    def _release_lock() -> None:
+        _get_dao().update(
+            {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+            {"status": current_status, "updatedAt": stale_since or _now_iso()},
+            condition="attribute_exists(PK)",
+            raise_on_error=False,
+        )
+
+    scan_job_sk = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    try:
+        _get_scan_dao().put(
+            {
+                "PK": f"SRC#{source_id}",
+                "SK": scan_job_sk,
+                "sourceId": source_id,
+                "namespaceId": namespace_id,
+                "status": "IN_PROGRESS",
+                "scanType": REACHABILITY_SCAN_TYPE,
+                "triggerType": trigger,
+                "startedAt": now,
+                "createdAt": now,
+            }
+        )
+    except ClientError:
+        logger.exception("ddb_put_scan_job_failed", source_id=source_id)
+        _release_lock()
+        return api_response(500, {"error": "Internal server error"})
+
+    try:
+        _get_sqs().send_message(
+            QueueUrl=_GRAPH_VERIFY_QUEUE_URL,
+            MessageBody=verify_message(source_id, namespace_id, scan_job_sk),
+        )
+    except (ClientError, BotoCoreError):
+        logger.exception("graph_verify_enqueue_failed", source_id=source_id)
+        _release_lock()
+        _get_scan_dao().update(
+            {"PK": f"SRC#{source_id}", "SK": scan_job_sk},
+            {"status": "FAILED", "errorMessage": "Could not enqueue the reachability check"},
+            condition="attribute_exists(PK)",
+            raise_on_error=False,
+        )
+        return api_response(500, {"error": "Internal server error"})
+
+    return api_response(202, {"sourceId": source_id, "scanJobId": scan_job_sk, "status": "IN_PROGRESS"})
+
+
 # ---------------------------------------------------------------------------
 # Lambda entry-point
 # ---------------------------------------------------------------------------
@@ -1821,13 +2097,50 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return api_response(500, {"error": "Internal server error"})
 
 
+# Source-row attribute holding each automated trigger's on/off switch. MANUAL is
+# absent on purpose: a steward can always re-scan through the API.
+_AUTOMATED_RESCAN_SWITCH: dict[str, str] = {
+    ScanTrigger.SCHEDULED: "rescanSchedule",
+    ScanTrigger.EVENT: "eventRescan",
+}
+
+
+def _automated_rescan_skip_reason(namespace_id: str, source_id: str, trigger: str) -> str | None:
+    """Why an automated re-scan must not start, or None when it may.
+
+    Reads the source row and checks the switch for ``trigger``. Turning a
+    trigger off deletes its schedule or rule, but a delivery already in flight,
+    a schedule or rule that survived a failed delete, or a direct invocation
+    still reaches the consumers, so the record is the authority. Kept out of
+    ``_handle_rescan`` so a manual re-scan works with automation off.
+
+    Raises:
+        ClientError: when the source row cannot be read; the caller decides
+            whether that is retried.
+    """
+    switch = _AUTOMATED_RESCAN_SWITCH.get(trigger)
+    if switch is None:
+        return "not_an_automated_trigger"
+    item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
+    if not item:
+        return "source_not_found"
+    if item.get("sourceType") != SourceType.DATABASE:
+        return "not_a_database_source"
+    config = item.get(switch)
+    if not isinstance(config, dict) or not config.get("enabled"):
+        return f"{switch}_disabled"
+    return None
+
+
 def _handle_scheduled_rescan(event: dict[str, Any]) -> dict[str, Any]:
     """Handle an EventBridge Scheduler invocation: fire a SCHEDULED rescan.
 
     The schedule payload carries the namespace and source ids. This reuses the
     same rescan path as the API (bookkeeping, status transition, enqueue) with
     the trigger stamped SCHEDULED. A rejected rescan (e.g. an active scan) is
-    logged and swallowed — the next scheduled tick will retry.
+    logged and swallowed — the next scheduled tick will retry. A tick for a
+    source whose ``rescanSchedule`` is not enabled, or that is not a database
+    source, is skipped the same way without starting a scan.
 
     Raises:
         ValueError: when the payload carries no ids, which means the schedule
@@ -1840,6 +2153,23 @@ def _handle_scheduled_rescan(event: dict[str, Any]) -> dict[str, Any]:
     if not namespace_id or not source_id:
         logger.error("scheduled_rescan_missing_ids", event_keys=sorted(event.keys()))
         raise ValueError("scheduled rescan payload requires namespaceId and sourceId")
+
+    try:
+        skip_reason = _automated_rescan_skip_reason(namespace_id, source_id, ScanTrigger.SCHEDULED)
+    except ClientError:
+        logger.exception("ddb_get_failed", source_id=source_id)
+        return {"ok": False, "statusCode": 500}
+    if skip_reason:
+        # Returned, not raised: a schedule that outlived its OFF switch would
+        # otherwise run Scheduler's full retry policy on every tick. The warning
+        # is what makes such a schedule visible.
+        logger.warning(
+            "scheduled_rescan_skipped",
+            namespace_id=namespace_id,
+            source_id=source_id,
+            reason=skip_reason,
+        )
+        return {"ok": False, "skipped": skip_reason}
 
     logger.info("scheduled_rescan_triggered", namespace_id=namespace_id, source_id=source_id)
     # Empty event so confirmDiscardOpenReview stays false: a scheduled tick must
@@ -1854,6 +2184,28 @@ def _handle_scheduled_rescan(event: dict[str, Any]) -> dict[str, Any]:
             status_code=status_code,
         )
     return {"ok": status_code in (200, 202), "statusCode": status_code}
+
+
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+
+def _body_bound_error(event: dict[str, Any], http_method: str, resource: str) -> str | None:
+    """Shape or upper-bound violation in the JSON body, or None (unparseable bodies are the handler's to report).
+
+    Every request body in the contract is a JSON object. A body that parses to
+    anything else (``null``, a list, a string, a number) is rejected here, once,
+    rather than reaching a handler that calls ``.get`` on it and fails as a 500.
+    """
+    raw = event.get("body")
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        body = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if http_method in _BODY_METHODS and not isinstance(body, dict):
+        return "Request body must be a JSON object"
+    return body_bound_error(http_method, resource, body)
 
 
 def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
@@ -1894,11 +2246,26 @@ def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         except ValueError as exc:
             return api_response(400, {"error": str(exc)})
 
+    # Declared bounds the handlers below do not check themselves: path-label
+    # lengths and the upper bounds of each body's members (see .contract).
+    bound_error = label_bound_error(http_method, resource, path_params) or _body_bound_error(
+        event, http_method, resource
+    )
+    if bound_error:
+        return api_response(400, {"error": bound_error})
+
     if resource == "/namespaces/{namespaceId}/sources":
         if http_method == "GET":
             return _handle_list(event, namespace_id)
         if http_method == "POST":
-            return _handle_create(event, namespace_id)
+            # Retry-safe with a body ``clientToken``: a retried database create
+            # would otherwise register a duplicate source and enqueue a second scan.
+            return idempotent_create(
+                event,
+                lambda ev: _handle_create(ev, namespace_id),
+                operation="CreateSource",
+                error_field="error",
+            )
 
     if resource == "/namespaces/{namespaceId}/sources/upload-urls" and http_method == "POST":
         return _handle_upload_urls(event, namespace_id)
@@ -1916,7 +2283,14 @@ def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         source_id = path_params.get("sourceId", "")
         if not source_id:
             return api_response(400, {"error": "sourceId is required"})
-        return _handle_rescan(event, namespace_id, source_id)
+        # Retry-safe with a body ``clientToken``: a retried rescan would otherwise
+        # get 409 (active scan) instead of its original 202.
+        return idempotent_create(
+            event,
+            lambda ev: _handle_rescan(ev, namespace_id, source_id),
+            operation="RescanSource",
+            error_field="error",
+        )
 
     if resource == "/namespaces/{namespaceId}/sources/{sourceId}/approve" and http_method == "POST":
         source_id = path_params.get("sourceId", "")
@@ -1997,7 +2371,7 @@ def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         source_id = path_params.get("sourceId", "")
         if not source_id:
             return api_response(400, {"error": "sourceId is required"})
-        return _handle_list_scan_jobs(namespace_id, source_id)
+        return _handle_list_scan_jobs(event, namespace_id, source_id)
 
     if resource == "/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}" and http_method == "GET":
         source_id = path_params.get("sourceId", "")

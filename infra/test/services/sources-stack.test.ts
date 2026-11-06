@@ -6,9 +6,12 @@ import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { Annotations, Template, Match } from "aws-cdk-lib/assertions";
+import { expectIdempotencyWiring } from "../utils/idempotency-assertions";
 import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { StorageStack } from "../../lib/stacks/foundation/storage-stack";
 import { SourcesStack } from "../../lib/stacks/services/sources-stack";
+import { expectAossGrantsCoveredByDataPolicies } from "../utils/aoss-access-assertions";
+import { expectEveryTaskCanPullGuardDutyAgent } from "../utils/guardduty-agent-assertions";
 
 // Mock bundlePython to avoid fingerprinting the entire repo root during tests.
 jest.mock("../../lib/utils/python-bundling", () => ({
@@ -33,24 +36,41 @@ const TEST_CONTEXT = {
   "aws:cdk:bundling-stacks": [],
 };
 
+function synthSources(extraContext: Record<string, unknown> = {}): Template {
+  const app = new cdk.App({ context: { ...TEST_CONTEXT, ...extraContext } });
+  const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+  const storage = new StorageStack(app, "TestStorage", {
+    network,
+    env: TEST_ENV,
+  });
+  return Template.fromStack(
+    new SourcesStack(app, "TestSources", {
+      network,
+      storage,
+      allowedOrigin: "https://test.example.com",
+      env: TEST_ENV,
+    }),
+  );
+}
+
 describe("SourcesStack", () => {
   let template: Template;
 
   beforeAll(() => {
-    const app = new cdk.App({ context: TEST_CONTEXT });
-    const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
-    const storage = new StorageStack(app, "TestStorage", {
-      network,
-      env: TEST_ENV,
-    });
-    template = Template.fromStack(
-      new SourcesStack(app, "TestSources", {
-        network,
-        storage,
-        allowedOrigin: "https://test.example.com",
-        env: TEST_ENV,
-      }),
-    );
+    template = synthSources();
+  });
+
+  it("lets every task execution role pull the GuardDuty Fargate agent", () => {
+    expectEveryTaskCanPullGuardDutyAgent(template, 2, TEST_ENV.region);
+  });
+
+  it("names every aoss:APIAccessAll role in an AOSS data-access policy", () => {
+    expectAossGrantsCoveredByDataPolicies(template);
+  });
+
+  it("wires only the create-operation Lambda(s) to the idempotency table", () => {
+    // IDEMPOTENCY_TABLE env + Get/Put/Update/DeleteItem on that table only.
+    expectIdempotencyWiring(template, ["-sources-api"]);
   });
 
   describe("DynamoDB Tables", () => {
@@ -1535,6 +1555,294 @@ describe("SourcesStack", () => {
     });
   });
 
+  describe("graph sources off (the default): main's template", () => {
+    const functionsEnv = () =>
+      Object.values(template.findResources("AWS::Lambda::Function")).map(
+        (f: any) => [
+          f.Properties.FunctionName,
+          f.Properties.Environment?.Variables ?? {},
+        ],
+      ) as [unknown, Record<string, unknown>][];
+
+    it("has no graph-verify function or queues", () => {
+      const names = JSON.stringify([
+        ...Object.values(template.findResources("AWS::Lambda::Function")).map(
+          (f: any) => f.Properties.FunctionName,
+        ),
+        ...Object.values(template.findResources("AWS::SQS::Queue")).map(
+          (q: any) => q.Properties.QueueName,
+        ),
+      ]);
+      expect(names).not.toContain("graph-verify");
+      expect(JSON.stringify(template.toJSON())).not.toContain(
+        "SparqlSourceEgressSG",
+      );
+    });
+
+    it("has no graph-verify IAM statements", () => {
+      const statements = JSON.stringify(
+        Object.values(template.findResources("AWS::IAM::Policy")).map(
+          (p: any) => p.Properties.PolicyDocument.Statement,
+        ),
+      );
+      expect(statements).not.toContain("GraphVerify");
+      expect(statements).not.toContain("neptune-db:GetEngineStatus");
+    });
+
+    it("has no cluster-claim release metric filters or alarm", () => {
+      expect(JSON.stringify(template.toJSON())).not.toContain(
+        "GraphClusterClaimReleaseFailed",
+      );
+      expect(
+        JSON.stringify(template.findResources("AWS::Logs::MetricFilter")),
+      ).not.toContain("graph_cluster_claim_release_failed");
+    });
+
+    it("sets neither GRAPH_VERIFY_QUEUE_URL nor GRAPH_SOURCES_ENABLED on any function", () => {
+      for (const [, env] of functionsEnv()) {
+        expect(env).not.toHaveProperty("GRAPH_VERIFY_QUEUE_URL");
+        expect(env).not.toHaveProperty("GRAPH_SOURCES_ENABLED");
+      }
+    });
+  });
+
+  describe("Graph-verify pipeline (RDF_SPARQL reachability)", () => {
+    // Synthesized with the switch on; the outer template is the default (off).
+    let template: Template;
+    beforeAll(() => {
+      template = synthSources({ graph_sources: "on" });
+    });
+
+    const resourceNamed = (type: string, prop: string, pattern: RegExp) => {
+      const found = Object.entries(template.findResources(type)).find(
+        ([, r]: [string, any]) => pattern.test(r.Properties[prop] ?? ""),
+      );
+      expect(found).toBeDefined();
+      return found! as [string, any];
+    };
+    const verifyFn = () =>
+      resourceNamed(
+        "AWS::Lambda::Function",
+        "FunctionName",
+        /sources-graph-verify$/,
+      );
+    const verifyQueue = () =>
+      resourceNamed(
+        "AWS::SQS::Queue",
+        "QueueName",
+        /sources-graph-verify-queue$/,
+      );
+    const verifyDlq = () =>
+      resourceNamed(
+        "AWS::SQS::Queue",
+        "QueueName",
+        /sources-graph-verify-dlq$/,
+      );
+    const statementsOfRole = (roleId: string) =>
+      Object.values(template.findResources("AWS::IAM::Policy"))
+        .filter((p: any) =>
+          p.Properties.Roles?.some((r: any) => r.Ref === roleId),
+        )
+        .flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+
+    it("has an encrypted queue redriving to a 14-day DLQ after 3 receives", () => {
+      const [, queue] = verifyQueue();
+      const [dlqId, dlq] = verifyDlq();
+      expect(queue.Properties.SqsManagedSseEnabled).toBe(true);
+      expect(queue.Properties.RedrivePolicy.maxReceiveCount).toBe(3);
+      expect(JSON.stringify(queue.Properties.RedrivePolicy)).toContain(dlqId);
+      expect(dlq.Properties.MessageRetentionPeriod).toBe(14 * 24 * 60 * 60);
+    });
+
+    it("rejects non-TLS access to both queues", () => {
+      const [queueId] = verifyQueue();
+      const [dlqId] = verifyDlq();
+      const policies = JSON.stringify(
+        template.findResources("AWS::SQS::QueuePolicy"),
+      );
+      for (const id of [queueId, dlqId]) {
+        const policy = Object.values(
+          template.findResources("AWS::SQS::QueuePolicy"),
+        ).find((p: any) =>
+          JSON.stringify(p.Properties.Queues).includes(id),
+        ) as any;
+        expect(policy).toBeDefined();
+        expect(JSON.stringify(policy.Properties.PolicyDocument)).toContain(
+          "aws:SecureTransport",
+        );
+      }
+      expect(policies).toContain("aws:SecureTransport");
+    });
+
+    it("runs the packaged handler in the VPC with the SPARQL egress SG", () => {
+      const [, fn] = verifyFn();
+      expect(fn.Properties.Handler).toBe(
+        "coa_sources.database.graph_verify.handler.handler",
+      );
+      expect(fn.Properties.Architectures).toEqual(["arm64"]);
+      expect(fn.Properties.Timeout).toBe(30);
+      expect(fn.Properties.VpcConfig.SecurityGroupIds).toHaveLength(2);
+      expect(
+        JSON.stringify(fn.Properties.VpcConfig.SecurityGroupIds),
+      ).toContain("SparqlSourceEgressSG");
+      expect(Object.keys(fn.Properties.Environment.Variables)).toEqual(
+        expect.arrayContaining(["SOURCES_TABLE", "SOURCE_SCAN_JOBS_TABLE"]),
+      );
+    });
+
+    it("consumes its own queue one message at a time", () => {
+      const [queueId] = verifyQueue();
+      const [fnId] = verifyFn();
+      const mapping = Object.values(
+        template.findResources("AWS::Lambda::EventSourceMapping"),
+      ).find((m: any) =>
+        JSON.stringify(m.Properties.EventSourceArn).includes(queueId),
+      ) as any;
+      expect(mapping).toBeDefined();
+      expect(mapping.Properties.BatchSize).toBe(1);
+      expect(JSON.stringify(mapping.Properties.FunctionName)).toContain(fnId);
+    });
+
+    it("may only call GetEngineStatus, on this account's clusters in this region", () => {
+      const [, fn] = verifyFn();
+      const neptune = statementsOfRole(
+        fn.Properties.Role["Fn::GetAtt"][0],
+      ).filter((s: any) => JSON.stringify(s.Action).includes("neptune-db:"));
+      expect(neptune).toHaveLength(1);
+      expect(neptune[0].Action).toBe("neptune-db:GetEngineStatus");
+      const resource = JSON.stringify(neptune[0].Resource);
+      expect(resource).not.toBe('"*"');
+      // The verify refuses a source that signs for another region, so the grant does not reach one.
+      expect(resource).not.toContain("neptune-db:*:");
+      expect(resource).toContain("AWS::Region");
+      expect(resource).toContain("AWS::AccountId");
+    });
+
+    it("may list this account's Neptune clusters and their endpoints in its own region, to confine the probe", () => {
+      const [, fn] = verifyFn();
+      const describe = statementsOfRole(
+        fn.Properties.Role["Fn::GetAtt"][0],
+      ).filter((s: any) => JSON.stringify(s.Action).includes("rds:"));
+      expect(describe).toHaveLength(1);
+      expect(describe[0].Action).toEqual([
+        "rds:DescribeDBClusterEndpoints",
+        "rds:DescribeDBClusters",
+      ]);
+      const resource = JSON.stringify(describe[0].Resource);
+      expect(resource).toContain(":rds:");
+      expect(resource).toContain("AWS::Region");
+      expect(resource).toContain("AWS::AccountId");
+      expect(resource).toContain(":cluster:*");
+      // Custom endpoints are listed by DescribeDBClusterEndpoints, whose resource is the endpoint.
+      expect(resource).toContain(":cluster-endpoint:*");
+    });
+
+    it("tells verify the queue's receive limit, so its last attempt records a failure", () => {
+      const [, fn] = verifyFn();
+      const [, queue] = verifyQueue();
+      expect(
+        fn.Properties.Environment.Variables.GRAPH_VERIFY_MAX_RECEIVES,
+      ).toBe(String(queue.Properties.RedrivePolicy.maxReceiveCount));
+    });
+
+    it("names the platform catalog cluster, so verify refuses its endpoints", () => {
+      const [, fn] = verifyFn();
+      const id =
+        fn.Properties.Environment.Variables.PLATFORM_NEPTUNE_CLUSTER_ID;
+      // The storage stack's fixed dbClusterIdentifier, not an import (see
+      // graph-sources-switch-exports.test.ts).
+      expect(id).toBe("coa-dev-neptune");
+    });
+
+    it("turns graph sources on in the Sources API and graph-verify runtimes", () => {
+      const [, fn] = verifyFn();
+      const [, api] = resourceNamed(
+        "AWS::Lambda::Function",
+        "FunctionName",
+        /-sources-api$/,
+      );
+      expect(fn.Properties.Environment.Variables.GRAPH_SOURCES_ENABLED).toBe(
+        "true",
+      );
+      expect(api.Properties.Environment.Variables.GRAPH_SOURCES_ENABLED).toBe(
+        "true",
+      );
+    });
+
+    it("lets the Sources API enqueue verifies (env + SendMessage)", () => {
+      const [queueId] = verifyQueue();
+      const [, api] = resourceNamed(
+        "AWS::Lambda::Function",
+        "FunctionName",
+        /sources-api$/,
+      );
+      expect(
+        api.Properties.Environment.Variables.GRAPH_VERIFY_QUEUE_URL,
+      ).toEqual({ Ref: queueId });
+      const canSend = statementsOfRole(
+        api.Properties.Role["Fn::GetAtt"][0],
+      ).some(
+        (s: any) =>
+          [s.Action].flat().includes("sqs:SendMessage") &&
+          JSON.stringify(s.Resource).includes(queueId),
+      );
+      expect(canSend).toBe(true);
+    });
+
+    it("alarms on the DLQ and on the Lambda", () => {
+      const [dlqId] = verifyDlq();
+      const [fnId] = verifyFn();
+      const alarms = JSON.stringify(
+        template.findResources("AWS::CloudWatch::Alarm"),
+      );
+      expect(alarms).toContain(dlqId);
+      expect(alarms).toContain(fnId);
+    });
+
+    it("alarms on a failed cluster claim release from verify or delete", () => {
+      const filters = Object.values(
+        template.findResources("AWS::Logs::MetricFilter"),
+      ).filter((f: any) =>
+        JSON.stringify(f.Properties.FilterPattern).includes(
+          "graph_cluster_claim_release_failed",
+        ),
+      ) as any[];
+      // Each filter reads the log group CDK pre-creates for the function (a LogRetention resource naming it).
+      const resources = template.toJSON().Resources;
+      const groups = JSON.stringify(
+        filters.map((f) => {
+          const name = f.Properties.LogGroupName;
+          const owner = name["Fn::GetAtt"]?.[0];
+          return owner ? resources[owner].Properties.LogGroupName : name;
+        }),
+      );
+      const [verifyId] = verifyFn();
+      const [apiId] = resourceNamed(
+        "AWS::Lambda::Function",
+        "FunctionName",
+        /-sources-api$/,
+      );
+      // A deployed stack runs source deletes in the delete worker, which releases the claim too.
+      const [deleteWorkerId] = resourceNamed(
+        "AWS::Lambda::Function",
+        "FunctionName",
+        /-sources-delete-worker$/,
+      );
+      expect(groups).toContain(verifyId);
+      expect(groups).toContain(apiId);
+      expect(groups).toContain(deleteWorkerId);
+      const metricNames = new Set(
+        filters.map((f) => f.Properties.MetricTransformations[0].MetricName),
+      );
+      expect(metricNames).toEqual(new Set(["GraphClusterClaimReleaseFailed"]));
+      template.hasResourceProperties("AWS::CloudWatch::Alarm", {
+        MetricName: "GraphClusterClaimReleaseFailed",
+        Threshold: 1,
+        TreatMissingData: "notBreaching",
+      });
+    });
+  });
+
   describe("Bulk Review Pipeline", () => {
     it("creates a SQS queue with SQS-managed encryption and 6-minute visibility timeout", () => {
       template.hasResourceProperties("AWS::SQS::Queue", {
@@ -1930,13 +2238,30 @@ describe("SourcesStack", () => {
       }
     });
 
-    it("has CONSUMER_QUERY_ROLE_ARN environment variable (from SSM)", () => {
+    it("resolves the serve runtime role ARN from SSM at runtime, not deploy time", () => {
+      // A deploy-time SSM read would make SourcesStack wait for ServeStack.
       template.hasResourceProperties("AWS::Lambda::Function", {
         FunctionName: Match.stringLikeRegexp(".*sources-db-connector$"),
         Environment: {
           Variables: Match.objectLike({
-            CONSUMER_QUERY_ROLE_ARN: Match.anyValue(),
+            CONSUMER_QUERY_ROLE_SSM_PARAM: Match.stringLikeRegexp(
+              "/serve/runtime-role-arn$",
+            ),
+            CONSUMER_QUERY_ROLE_ARN: Match.absent(),
           }),
+        },
+      });
+      template.hasResourceProperties("AWS::IAM::Policy", {
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Sid: "ReadConsumerQueryRoleArn",
+              Action: "ssm:GetParameter",
+              Resource: Match.stringLikeRegexp(
+                ":parameter/.*/serve/runtime-role-arn$",
+              ),
+            }),
+          ]),
         },
       });
     });
@@ -2018,6 +2343,49 @@ describe("SourcesStack", () => {
       // an approved source this routes the terminal status to RESCAN_REVIEW.
       expect(definition).toContain("IS_RESCAN");
       expect(definition).toContain("$.isRescan");
+    });
+  });
+
+  describe("Namespace-language snapshot", () => {
+    // Workers take the namespace language from the job input the Sources API
+    // built when it triggered the job; they never re-read the namespace.
+    const flatDefinitions = (): string =>
+      JSON.stringify(
+        Object.values(
+          template.findResources("AWS::StepFunctions::StateMachine"),
+        ),
+      ).replace(/\\+"/g, '"');
+
+    it("passes NAMESPACE_LANGUAGE from $.namespaceLanguage to the enrichment task", () => {
+      expect(flatDefinitions()).toMatch(
+        /"Name":"NAMESPACE_LANGUAGE","Value.\$":"\$\.namespaceLanguage"/,
+      );
+    });
+
+    it("lets the document trigger resolve a pre-snapshot message with GetItem only", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-doc-ingestion-trigger"),
+        Environment: {
+          Variables: Match.objectLike({ NAMESPACES_TABLE: Match.anyValue() }),
+        },
+      });
+      template.hasResourceProperties("AWS::IAM::Policy", {
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Sid: "ReadNamespaceLanguage",
+              Action: "dynamodb:GetItem",
+              Effect: "Allow",
+            }),
+          ]),
+        },
+      });
+    });
+
+    it("passes NAMESPACE_LANGUAGE from $.namespace_language to the KG-build task", () => {
+      expect(flatDefinitions()).toMatch(
+        /"Name":"NAMESPACE_LANGUAGE","Value.\$":"\$\.namespace_language"/,
+      );
     });
   });
 
@@ -2240,6 +2608,14 @@ describe("SourcesStack", () => {
       const resourceStr = JSON.stringify(batchJobStatement.Resource);
       expect(resourceStr).toContain("foundation-model/*");
       expect(resourceStr).toContain("inference-profile/*");
+      // CreateModelInvocationJob authorizes against the job resource it creates
+      // too; omitting it fails every batch submit with AccessDenied. Batch
+      // inference is the default ingestion path, so this ARN must stay.
+      expect(resourceStr).toContain("model-invocation-job/*");
+      // The job resource is account-scoped (the account segment is an
+      // AWS::AccountId Ref), never the cross-account wildcard
+      // `arn:aws:bedrock:*::model-invocation-job/*`.
+      expect(resourceStr).not.toContain("*::model-invocation-job");
     });
 
     it("Bedrock InvokeModel is scoped to specific model ARNs", () => {
@@ -2767,6 +3143,55 @@ describe("SourcesStack", () => {
       });
     });
 
+    // The account check alone admitted any EventBridge rule anyone in the
+    // account created, and the consumer takes the source ids from the message.
+    // Bound to this deployment's re-scan rules on the default bus, the same
+    // pattern the API Lambda is allowed to create rules under.
+    it("accepts sends only from this deployment's Glue re-scan rules", () => {
+      const statements = Object.values(
+        template.findResources("AWS::SQS::QueuePolicy"),
+      ).flatMap(
+        (p) =>
+          (p as { Properties: { PolicyDocument: { Statement: any[] } } })
+            .Properties.PolicyDocument.Statement,
+      );
+      const send = statements.filter((s) => s.Sid === "AllowEventBridgeSend");
+      expect(send).toHaveLength(1);
+      const condition = send[0].Condition;
+      expect(condition.StringEquals).toEqual({
+        "aws:SourceAccount": "123456789012",
+      });
+      const sourceArn = JSON.stringify(condition.ArnLike?.["aws:SourceArn"]);
+      expect(sourceArn).toContain(":events:us-east-1:123456789012:rule/");
+      expect(sourceArn).toMatch(/glue-rescan-\*/);
+      // Default bus: `rule/<name>`, never `rule/<bus>/<name>`.
+      expect(sourceArn).not.toMatch(/rule\/[^"]*\/[^"]*glue-rescan/);
+    });
+
+    it("binds the queue policy to the same rule ARNs the API Lambda may create", () => {
+      const queueStatements = Object.values(
+        template.findResources("AWS::SQS::QueuePolicy"),
+      ).flatMap(
+        (p) =>
+          (p as { Properties: { PolicyDocument: { Statement: any[] } } })
+            .Properties.PolicyDocument.Statement,
+      );
+      const iamStatements = Object.values(
+        template.findResources("AWS::IAM::Policy"),
+      ).flatMap(
+        (p) =>
+          (p as { Properties: { PolicyDocument: { Statement: any[] } } })
+            .Properties.PolicyDocument.Statement,
+      );
+      const send = queueStatements.find(
+        (s) => s.Sid === "AllowEventBridgeSend",
+      );
+      const manage = iamStatements.find(
+        (s) => s.Sid === "ManageGlueEventRules",
+      );
+      expect(send.Condition.ArnLike["aws:SourceArn"]).toEqual(manage.Resource);
+    });
+
     it("creates the consumer Lambda with an SQS event source", () => {
       template.hasResourceProperties("AWS::Lambda::Function", {
         FunctionName: Match.stringLikeRegexp("sources-glue-event-rescan$"),
@@ -2829,6 +3254,48 @@ describe("SourcesStack", () => {
           Variables: Match.objectLike({ ALLOWED_ORIGIN: Match.anyValue() }),
         },
       });
+    });
+
+    // The shared re-scan path snapshots the namespace language before taking
+    // the lock. Without the table name and a read grant every EVENT re-scan
+    // fails before it starts.
+    it("lets the consumer Lambda read the namespace language with GetItem only", () => {
+      const fns = template.findResources("AWS::Lambda::Function", {
+        Properties: {
+          FunctionName: Match.stringLikeRegexp("sources-glue-event-rescan$"),
+        },
+      });
+      const [fn] = Object.values(fns) as Array<{
+        Properties: {
+          Role: { "Fn::GetAtt": [string, string] };
+          Environment: { Variables: Record<string, unknown> };
+        };
+      }>;
+      expect(
+        fn.Properties.Environment.Variables.NAMESPACES_TABLE,
+      ).toBeDefined();
+      const roleId = fn.Properties.Role["Fn::GetAtt"][0];
+      const statements = Object.values(
+        template.findResources("AWS::IAM::Policy"),
+      )
+        .filter((p) =>
+          JSON.stringify(
+            (p as { Properties: { Roles: unknown } }).Properties.Roles,
+          ).includes(roleId),
+        )
+        .flatMap(
+          (p) =>
+            (
+              p as {
+                Properties: {
+                  PolicyDocument: { Statement: Array<Record<string, unknown>> };
+                };
+              }
+            ).Properties.PolicyDocument.Statement,
+        );
+      const read = statements.find((st) => st.Sid === "ReadNamespaceLanguage");
+      expect(read).toBeDefined();
+      expect(read?.Action).toBe("dynamodb:GetItem");
     });
 
     it("grants the API Lambda scoped Glue-event rule management", () => {
@@ -3127,10 +3594,11 @@ describe("Athena catalog-name prefix budget", () => {
 
 // The running coa-dev-kg-build image accreted Critical/High OS CVEs (perl,
 // openssl, glibc, pcre2, sqlite3) whenever a build predated the Debian point
-// releases that fix them. Two Dockerfile properties keep the image patchable:
-// a pinned base digest (supply-chain integrity + a cache-busting bump lever)
-// and a post-install `apt-get upgrade` (the only mechanism pulling
-// trixie-security point releases in). These guard against regression —
+// releases that fix them; the base is now AL2023. Two Dockerfile
+// properties keep the image patchable: a pinned base digest (supply-chain
+// integrity + a cache-busting bump lever) and a post-install
+// `dnf upgrade --releasever=latest` (the only mechanism pulling AL2023 security
+// updates in past the pinned snapshot). These guard against regression —
 // removing the upgrade line, or floating the base back onto a mutable tag, is
 // exactly how the CVEs came back. Mirrors ontology-stack's hygiene block.
 describe("kg-build Dockerfile CVE hygiene", () => {
@@ -3151,16 +3619,17 @@ describe("kg-build Dockerfile CVE hygiene", () => {
 
   test("pins the base image to a digest, not a mutable tag", () => {
     const from = dockerfile.match(
-      /^FROM .*python:3\.12-slim(@sha256:[a-f0-9]{64})?/m,
+      /^FROM .*amazonlinux:2023-minimal(@sha256:[a-f0-9]{64})?/m,
     );
     expect(from).not.toBeNull();
     expect(from?.[1]).toMatch(/@sha256:[a-f0-9]{64}/);
-    expect(dockerfile).not.toMatch(/python:3\.12-slim\s*$/m);
+    expect(dockerfile).not.toMatch(/amazonlinux:2023-minimal\s*$/m);
   });
 
-  test("runs apt-get upgrade so OS security point releases are applied", () => {
-    expect(dockerfile).toMatch(/apt-get upgrade -y/);
-    expect(dockerfile).not.toMatch(/apt-get dist-upgrade/);
+  test("runs dnf upgrade against the latest AL2023 release so OS security updates are applied", () => {
+    // AL2023 locks dnf to the base image's repo snapshot; without
+    // --releasever=latest a stale digest pin freezes the OS patch level.
+    expect(dockerfile).toMatch(/dnf upgrade -y --releasever=latest/);
   });
 
   test("upgrades pip so its own advisories are picked up", () => {

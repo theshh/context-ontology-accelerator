@@ -6,10 +6,12 @@ $version: "2"
 namespace com.amazon.semanticcontext.namespace
 
 use com.amazon.semanticcontext.common#AccessDeniedError
+use com.amazon.semanticcontext.common#ClientToken
 use com.amazon.semanticcontext.common#ConflictError
 use com.amazon.semanticcontext.common#NotFoundError
 use com.amazon.semanticcontext.common#PaginatedInput
 use com.amazon.semanticcontext.common#PaginatedOutput
+use com.amazon.semanticcontext.common#PaginationToken
 use com.amazon.semanticcontext.common#Uuid
 use com.amazon.semanticcontext.common#ValidationError
 
@@ -34,9 +36,27 @@ string NamespaceDescription
 
 /// Owner email address. The local part allows the RFC 5322 atext characters
 /// except # | and backtick (the owner also becomes a grant principalId).
+/// Personal information, so marked sensitive to keep it out of
+/// generated-client logs.
 @pattern("^[A-Za-z0-9!$%&'*+/=?^_{}~-]+(\\.[A-Za-z0-9!$%&'*+/=?^_{}~-]+)*@[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*\\.[A-Za-z]{2,63}$")
 @length(min: 6, max: 254)
+@sensitive
 string OwnerEmail
+
+/// Namespace language: a BCP 47 tag limited to `language[-script][-region]`
+/// (language 2-8 letters, script 4 letters, region 2 letters or 3 digits),
+/// e.g. `en`, `ja`, `pt-BR`, `es-419`, `zh-Hant`. Variants, extensions and
+/// private-use tags are rejected.
+///
+/// The pattern is case-insensitive and tolerates surrounding ASCII spaces and
+/// tabs so that the service can trim and canonicalize the value before
+/// persisting it (e.g. ` JA-jp ` is stored and returned as `ja-JP`). Values
+/// returned by the service are always canonical.
+@pattern("^[ \\t]*[A-Za-z]{2,8}(-[A-Za-z]{4})?(-([A-Za-z]{2}|[0-9]{3}))?[ \\t]*$")
+// The canonical form is at most 17 characters; the length bound leaves room
+// for the surrounding whitespace the service trims.
+@length(min: 2, max: 64)
+string LanguageTag
 
 // ──────────────────────────────────────────────
 // Enums
@@ -100,6 +120,11 @@ structure NamespaceSummary {
     @required
     status: NamespaceStatus
 
+    /// Immutable namespace language (canonical BCP 47 tag). Namespaces created
+    /// before the language field existed report `en`.
+    @required
+    language: LanguageTag
+
     /// Number of data sources registered in the namespace.
     sourceCount: Integer
 
@@ -127,6 +152,11 @@ structure NamespaceDetail {
 
     @required
     status: NamespaceStatus
+
+    /// Immutable namespace language (canonical BCP 47 tag), set at creation.
+    /// Namespaces created before the language field existed report `en`.
+    @required
+    language: LanguageTag
 
     /// Amazon DataZone project ID linked to this namespace, when applicable.
     dataZoneProjectId: String
@@ -193,6 +223,18 @@ operation CreateNamespace {
 
         @required
         owner: OwnerEmail
+
+        /// Language of the sources, ontology and knowledge graph this
+        /// namespace will hold. Defaults to `en` when omitted. Cannot be
+        /// changed after creation.
+        language: LanguageTag
+
+        /// Optional idempotency token. A retry with the same token and the same
+        /// parameters within 24 hours returns the original result instead of creating
+        /// a duplicate; reusing the token with different parameters is rejected with
+        /// ConflictError (409).
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output: CreateNamespaceOutput
@@ -243,14 +285,16 @@ structure GetNamespaceOutput {
 /// List namespaces the caller can access, with optional pagination.
 @readonly
 @http(method: "GET", uri: "/namespaces")
+@paginated(inputToken: "nextToken", outputToken: "nextToken", pageSize: "maxResults", items: "namespaces")
 operation ListNamespaces {
     input := with [PaginatedInput] {
         /// Opaque token from a prior response; pass it to fetch the next page.
         @httpQuery("nextToken")
-        nextToken: String
+        nextToken: PaginationToken
 
         /// Maximum number of namespaces to return in a single page.
         @httpQuery("maxResults")
+        @range(min: 1, max: 100)
         maxResults: Integer
     }
 
@@ -272,6 +316,7 @@ structure ListNamespacesOutput with [PaginatedOutput] {
 // UpdateNamespace
 // ──────────────────────────────────────────────
 /// Update the mutable fields (display name, description) of an existing namespace.
+/// The namespace language is immutable and cannot be changed here.
 @idempotent
 @http(method: "PUT", uri: "/namespaces/{namespaceId}")
 operation UpdateNamespace {
@@ -340,6 +385,11 @@ operation DeleteNamespace {
 // UpdateNamespaceStatus
 // ──────────────────────────────────────────────
 /// Change a namespace's lifecycle status (e.g., archive or reactivate it).
+///
+/// Takes no `clientToken`: the request names the target status, so it is a
+/// state transition rather than a create. Repeating it after it succeeded
+/// changes nothing and is rejected with ConflictError (409) because the
+/// namespace is already in that status; GetNamespace confirms the outcome.
 @http(method: "PATCH", uri: "/namespaces/{namespaceId}/status")
 operation UpdateNamespaceStatus {
     input := {

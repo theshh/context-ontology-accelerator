@@ -8,11 +8,13 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import structlog
 from coa_common import ontology_vector_index_name
+from coa_common.constants import StructuredBackend
+from coa_common.sparql_config import graph_sources_enabled
 
 from .clients.base import LLMClient, QueryExecutor, VectorClient
 from .exceptions import AccessDeniedError, DataSourceUnavailableError, NamespaceScopeDeniedError, NoResultError
@@ -35,15 +37,18 @@ from .tier2.sql_firewall import FirewallResult, SQLFirewall
 from .tier2.strategy import (
     DEFAULT_STRATEGY,
     EMPTY_RESULT_CONFIDENCE_FLOOR,
+    NOT_ANSWERABLE_FIELD,
     StrategyContext,
     StrategyOption,
     StrategyResult,
     StructuredQueryTier,
     capped_max_rows,
     normalize_strategy_option,
+    not_answerable_kind,
 )
+from .tier3.agentic.defaults import with_recommended_options
 from .tier3.knowledge_retriever import VECTOR_SEARCH_TIMEOUT_S, KnowledgeRetriever
-from .trace import TraceCollector
+from .trace import TraceCollector, client_error_detail
 
 logger = structlog.get_logger(__name__)
 
@@ -67,21 +72,25 @@ class TierGating:
     skip_tier1: bool = False
     skip_tier2: bool = False
     skip_tier3_vector_search: bool = False
+    # Not a skip: which structured backends the namespace has, for Tier-2 strategy
+    # selection. ``None`` (no registry / lookup failed) means the SQL default.
+    structured_backends: frozenset[StructuredBackend] | None = None
 
     @classmethod
     def from_composition(cls, composition: SourceComposition) -> TierGating:
         """Map a namespace's source composition to tier skips.
 
-        Tier 1 (metric resolver) and Tier 2 (VKG/Ontop NL→SQL) can only produce a
-        result over a DATABASE source, so both are gated on the same
-        no-structured-source signal — expressed once here so the two can never
-        drift apart. Tier 3's vector search needs a DOCUMENTS-derived chunk index.
+        Tier 2 needs a structured source of either backend. Tier 1 needs a SQL one
+        specifically: a governed metric is a SQL formula, so a graph-only namespace
+        has nothing for it to execute against. Tier 3's vector search needs a
+        DOCUMENTS-derived chunk index.
         """
-        no_structured = not composition.has_structured_source
+        backends = composition.structured_backends or frozenset()
         return cls(
-            skip_tier1=no_structured,
-            skip_tier2=no_structured,
+            skip_tier1=StructuredBackend.SQL not in backends,
+            skip_tier2=not backends,
             skip_tier3_vector_search=not composition.has_unstructured_source,
+            structured_backends=backends,
         )
 
     @property
@@ -325,6 +334,8 @@ class Orchestrator:
                 model_id=model_id_override,
                 deadline=deadline,
                 declined_metric=declined_metric,
+                has_unstructured_source=not gating.skip_tier3_vector_search,
+                structured_backends=gating.structured_backends,
             )
             if strategy_result:
                 return strategy_result
@@ -382,6 +393,24 @@ class Orchestrator:
         keeps its own firewall.evaluate() gate; this runs upstream of dispatch.
         """
         return self._firewall.authorize_namespace(namespace, profile)
+
+    def _resolve_include_debug_info(self, options: dict | None, namespace: str, profile: dict | None) -> bool:
+        """Effective includeDebugInfo = caller opt-in AND viewNamespace right (#1166).
+
+        The SQL/SPARQL artifacts are returned only when the caller BOTH asked for
+        them (``includeDebugInfo=true``) AND holds ``viewNamespace`` on the
+        namespace — the SAME Cedar right that gates reading a source's
+        table/column schema in the Sources/Tables view. A caller who can already
+        see the schema gains no new disclosure from the query that touches it; a
+        caller who cannot is denied the artifacts even when they pass the flag.
+        Fails CLOSED (the firewall returns False on evaluator error), so a policy
+        failure withholds artifacts rather than leaking them. Decoupling the
+        default (hidden) from this gate keeps the AppSec default-withhold posture.
+        """
+        requested = (options or {}).get("includeDebugInfo", False) is True
+        if not requested:
+            return False
+        return self._firewall.can_view_namespace(namespace, profile)
 
     # ── Tier run/skip decisions ──────────────────────────────────────
     # Each tier's guard is a named predicate so resolve() reads as a plain
@@ -569,7 +598,11 @@ class Orchestrator:
         The result is traced (ROUTING_SELECT) only when something is actually
         skipped, so normal requests are not cluttered.
         """
-        if self._sources_registry is None or tier_override is not None:
+        # With graph sources off, serve is main's: a pin skips the lookup, and graph
+        # sources answer nothing, so a graph-only namespace gates as one without
+        # structured sources and a mixed one keeps only SQL.
+        graph_sources = graph_sources_enabled()
+        if self._sources_registry is None or (tier_override is not None and not graph_sources):
             return TierGating()
 
         try:
@@ -578,8 +611,16 @@ class Orchestrator:
             logger.warning("source_gating_lookup_failed", namespace=namespace, error=type(e).__name__)
             return TierGating()
 
-        if composition.unknown:
-            return TierGating()
+        if not graph_sources:
+            backends = (composition.structured_backends or frozenset()) - {StructuredBackend.RDF_SPARQL}
+            composition = replace(composition, has_structured_source=bool(backends), structured_backends=backends)
+
+        # A pin or an uncertain read skips nothing, but strategy selection still
+        # needs the backends — a graph-only namespace pinned to Tier 2 must get the
+        # SPARQL strategy. (An unknown composition reports {SQL}: fail safe.)
+        # An empty set under a pin falls back to the SQL default, exactly as before.
+        if tier_override is not None or composition.unknown:
+            return TierGating(structured_backends=composition.structured_backends or None)
 
         gating = TierGating.from_composition(composition)
 
@@ -616,13 +657,28 @@ class Orchestrator:
             StrategyOption.ONTOP_FIRST,
             StrategyOption.NL_TO_SQL_FIRST,
             StrategyOption.DEEP_REASONING,
+            StrategyOption.NL_TO_SPARQL,
         }
     )
 
     @classmethod
+    def _explicit_strategy(cls, options: dict) -> StrategyOption | None:
+        """The Tier-2 strategy the caller pinned, if any.
+
+        With graph sources off ``nl_to_sparql`` is no pin: as on main, where the value
+        was unknown, the request runs the default chain.
+        """
+        strategy = normalize_strategy_option(options.get("strategy"))
+        if strategy not in cls._EXPLICIT_STRATEGY_OPTIONS:
+            return None
+        if strategy == StrategyOption.NL_TO_SPARQL and not graph_sources_enabled():
+            return None
+        return strategy
+
+    @classmethod
     def _has_explicit_strategy(cls, options: dict) -> bool:
         """True when the caller pinned a specific Tier-2 strategy."""
-        return normalize_strategy_option(options.get("strategy")) in cls._EXPLICIT_STRATEGY_OPTIONS
+        return cls._explicit_strategy(options) is not None
 
     @classmethod
     def _resolve_strategy_selection(cls, options: dict, tier_override: int | None) -> StrategyOption | None:
@@ -637,8 +693,8 @@ class Orchestrator:
         # Normalized so the pre-rename "agentic" spelling still counts as a pin —
         # otherwise it drops through to DEFAULT_STRATEGY and silently runs the cheap
         # fallback chain instead of the agent the caller asked for.
-        strategy = normalize_strategy_option(options.get("strategy"))
-        if strategy in cls._EXPLICIT_STRATEGY_OPTIONS:
+        strategy = cls._explicit_strategy(options)
+        if strategy is not None:
             return strategy
 
         # tierOverride=2 pins Tier 2 with the default strategy (no Tier-3 fallback).
@@ -665,6 +721,8 @@ class Orchestrator:
         model_id: str | None = None,
         deadline: Deadline | None = None,
         declined_metric: DeclinedMetricContext | None = None,
+        has_unstructured_source: bool = True,
+        structured_backends: frozenset[StructuredBackend] | None = None,
     ) -> tuple[InvokeResponse | None, str | None]:
         """Run Tier 2 strategies and return (response, sparql_for_tier3_grounding).
 
@@ -685,7 +743,9 @@ class Orchestrator:
             declined_metric=declined_metric,
         )
 
-        result = await self._structured_query_tier.resolve(query, namespace, context, option=strategy_selection)
+        result = await self._structured_query_tier.resolve(
+            query, namespace, context, option=strategy_selection, structured_backends=structured_backends
+        )
 
         if result is not None:
             max_rows = capped_max_rows(options)
@@ -700,9 +760,27 @@ class Orchestrator:
             # forced through NL→SQL/VKG). Unless the caller pinned Tier 2, drop it
             # to None so we fall through to Tier 3. Mirrors is_low_confidence_empty
             # but also covers non-empty low-confidence results.
-            if tier_override != 2 and result.confidence < EMPTY_RESULT_CONFIDENCE_FLOOR:
+            # A NOT_ANSWERABLE_RANGE row (a period the tables do not cover) is final whatever
+            # confidence the writer reported: the tables are the authority, and documents often
+            # mention other periods. A NOT_ANSWERABLE_FIELD row (no column holds the measure) is
+            # final only when the namespace has no unstructured source; otherwise a document may
+            # hold the answer, so it falls through to Tier 3 whatever confidence the writer
+            # reported (a writer sure that no column exists can still report a high confidence).
+            refusal_kind = not_answerable_kind(result)
+            field_to_tier3 = refusal_kind == NOT_ANSWERABLE_FIELD and has_unstructured_source
+            keep_refusal = refusal_kind is not None and not field_to_tier3
+            low_confidence = result.confidence < EMPTY_RESULT_CONFIDENCE_FLOOR
+            if keep_refusal and low_confidence:
                 logger.info(
-                    "tier2_low_confidence_fallthrough",
+                    "tier2_not_answerable_final",
+                    kind=refusal_kind,
+                    tier2_confidence=result.confidence,
+                    strategy=result.strategy_name,
+                    namespace=namespace,
+                )
+            if tier_override != 2 and not keep_refusal and (field_to_tier3 or low_confidence):
+                logger.info(
+                    "tier2_not_answerable_field_fallthrough" if field_to_tier3 else "tier2_low_confidence_fallthrough",
                     tier2_confidence=result.confidence,
                     row_count=result.row_count,
                     strategy=result.strategy_name,
@@ -745,7 +823,7 @@ class Orchestrator:
             namespace,
             profile,
             model_id=model_id,
-            include_debug_info=options.get("includeDebugInfo", False) is True,
+            include_debug_info=self._resolve_include_debug_info(options, namespace, profile),
         )
         return response, result.sparql or None
 
@@ -759,12 +837,15 @@ class Orchestrator:
         include_debug_info: bool = False,
     ) -> InvokeResponse:
         """Convert a StrategyResult into the appropriate InvokeResponse."""
-        if result.ontop_assembly:
+        # A native SPARQL answer is shaped like an Ontop one (SPARQL, no SQL leg), but
+        # it names the graph source it ran against — Ontop's VKG spans its mappings.
+        native_sparql = result.strategy_name == StrategyOption.NL_TO_SPARQL
+        if result.ontop_assembly or native_sparql:
             response = InvokeResponse(
                 result=self._assembler.assemble_tier2(
                     rows=result.rows,
                     columns=result.columns,
-                    sql_used=result.sql,
+                    sql_used=result.sql or None,
                     sparql=result.sparql,
                     confidence=result.confidence,
                     # The ONLY truthful source: the translate response of the
@@ -772,7 +853,7 @@ class Orchestrator:
                     # snapshot version report null by design — a namespace-level
                     # "current version" is not the version THIS query used (#986).
                     ontology_version=result.ontology_version or None,
-                    data_sources=None,
+                    data_sources=[result.data_source_id] if native_sparql and result.data_source_id else None,
                     trace=trace,
                     namespace=namespace,
                     principal=display_principal(profile),
@@ -980,7 +1061,7 @@ class Orchestrator:
                     StepId.T1_FIREWALL,
                     "error",
                     fw_ms,
-                    detail={"error": type(e).__name__, "message": str(e)[:120]},
+                    detail=client_error_detail(e),
                     tool_used="sql-firewall",
                 )
                 logger.warning(
@@ -1064,11 +1145,7 @@ class Orchestrator:
                     StepId.T1_EXECUTE,
                     "error",
                     exec_ms,
-                    detail={
-                        "error": type(e).__name__,
-                        "message": str(e)[:120],
-                        "timeoutSeconds": timeout_seconds,
-                    },
+                    detail=client_error_detail(e, timeoutSeconds=timeout_seconds),
                     tool_used="sql-engine",
                 )
                 logger.warning(
@@ -1080,12 +1157,15 @@ class Orchestrator:
                     timeout_seconds=timeout_seconds,
                 )
                 # A cross-namespace SQL reference is a policy denial, not a data-source
-                # outage: surface it as 403 with its (non-sensitive) policy reason.
+                # outage: surface it as 403 with a fixed policy reason (never the
+                # executor's message, which is not ours to vouch for).
                 # Detected via the wrapped firewall cause so the executor keeps raising
                 # its own {Athena,Redshift}QueryError (unit-test contract) and generic
                 # executor failures stay masked as DataSourceUnavailableError.
                 if isinstance(e.__cause__, NamespaceSQLScopeError):
-                    raise NamespaceScopeDeniedError(str(e)) from e
+                    raise NamespaceScopeDeniedError(
+                        "Access denied: SQL reference is outside the requested namespace"
+                    ) from e
                 raise DataSourceUnavailableError(
                     f"Metric '{metric_match.metric_name}' execution failed: {type(e).__name__}"
                 ) from e
@@ -1122,7 +1202,7 @@ class Orchestrator:
                     match_confidence=metric_match.match_confidence,
                     match_source=metric_match.match_source,
                     model_id=model_id,
-                    include_debug_info=options.get("includeDebugInfo", False) is True,
+                    include_debug_info=self._resolve_include_debug_info(options, namespace, profile),
                 )
             ), None
 
@@ -1225,6 +1305,12 @@ class Orchestrator:
         has_structured_source: bool = True,
         has_unstructured_source: bool = True,
     ) -> InvokeResponse:
+        # options.includeSupporting=False omits supportingContent from the response
+        # (default True). Tier 3 still retrieves and synthesizes over the chunks;
+        # only the response payload drops them. Checked `is not False` so any other
+        # value (absent, None, True) keeps the chunks — the Smithy/REST default.
+        include_supporting = (options or {}).get("includeSupporting") is not False
+
         # Deep-reasoning Tier-3 path (opt-in). Engaged per-request via
         # options.mode=="deep-reasoning" or as the deployment default. Returns the
         # same Tier3Result contract, so the assembler tail below is shared. When
@@ -1250,12 +1336,13 @@ class Orchestrator:
                 # rendered as "0 rows". options carries the row cap; model_id the
                 # per-request model override the standard Tier-2 path already honors.
                 profile=profile,
-                options=options,
+                # Unset Deep Reasoning options take the measured recommended values.
+                options=with_recommended_options(options),
                 model_id=model_id,
             )
             result = self._assembler.assemble_tier3(
                 synthesized_answer=tier3_result.synthesized_answer,
-                supporting_content=tier3_result.supporting_content,
+                supporting_content=tier3_result.supporting_content if include_supporting else None,
                 graph_context=tier3_result.graph_context,
                 confidence=tier3_result.confidence,
                 guardrail_blocked=tier3_result.guardrail_blocked,
@@ -1265,7 +1352,19 @@ class Orchestrator:
                 degraded_sources=tier3_result.degraded_sources or None,
                 model_id=model_id,
                 partial=tier3_result.partial,
+                # Label by MODE, not tier: Deep Reasoning resolves at tier=3 but is
+                # a distinct execution mode; without this the console mislabels it
+                # as Standard mode's "Tier 3 — Knowledge Retrieval" (#1166).
+                execution_mode=Mode.DEEP_REASONING.value,
+                # Return the SQL/SPARQL the agentic loop ran, same as Standard mode
+                # does — gated by the same includeDebugInfo opt-in (#1166).
+                query_used=tier3_result.query_used,
+                sparql_generated=tier3_result.sparql_generated,
+                include_debug_info=self._resolve_include_debug_info(options, namespace, profile),
             )
+            # Also keep the free-form metadata["mode"] stamp for request logs / eval
+            # attribution (unchanged observability contract); execution_mode above is
+            # the structural field the console reads (#1166).
             result.metadata = {**(result.metadata or {}), "mode": Mode.DEEP_REASONING.value}
             return InvokeResponse(result=result)
 
@@ -1316,7 +1415,7 @@ class Orchestrator:
 
         result = self._assembler.assemble_tier3(
             synthesized_answer=tier3_result.synthesized_answer,
-            supporting_content=tier3_result.supporting_content,
+            supporting_content=tier3_result.supporting_content if include_supporting else None,
             graph_context=tier3_result.graph_context,
             confidence=tier3_result.confidence,
             guardrail_blocked=tier3_result.guardrail_blocked,

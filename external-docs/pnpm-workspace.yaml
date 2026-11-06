@@ -1,1 +1,31 @@
+# External-docs is its own pnpm project, separate from the repo root workspace.
+#
+# IMPORTANT: pnpm 12 NO LONGER reads the `pnpm.overrides` field from package.json
+# (it prints a WARN and silently ignores it). Overrides MUST live here in
+# pnpm-workspace.yaml or they are dead config and the pinned versions drift off
+# on the next `pnpm install`. The postcss / @ai-sdk pins were previously in
+# package.json and only survived because the committed lock predated the pnpm 12
+# upgrade; they are migrated here so they actually hold.
 packages: []
+
+overrides:
+  # Pre-existing pins, migrated from package.json so pnpm 12 honours them.
+  postcss: 8.5.23
+  "@ai-sdk/provider-utils": 4.0.33
+  # source-map-js <1.2.2 — event-loop DoS (GHSA-68fv-2mgg-jv7q, HIGH). Transitive
+  # via @scalar/api-reference-react. 1.2.2 is the patched floor; same major.
+  "source-map-js@<1.2.2": 1.2.2
+  # @vue/server-renderer <3.5.42 — XSS via missing CR in attribute-name blacklist
+  # (GHSA, HIGH). Transitive via @scalar/api-reference-react. 3.5.42 patched floor.
+  "@vue/server-renderer@<3.5.42": 3.5.42
+  # zod <4.6.6 — uncontrolled resource consumption / memory exhaustion on
+  # unbounded array schemas (GHSA, HIGH). Transitive via the AI SDK / Scalar
+  # packages. 4.6.6 is the patched floor; same major.
+  "zod@<4.6.6": 4.6.7
+  # katex <0.18.2 — prototype pollution can bypass the trust restrictions (GHSA-238p-pmpm-9mq7).
+  # Only mermaid 11 pulls it (for math in diagram labels, which these docs don't use);
+  # mermaid 12 is a major bump, so pin the patched katex under mermaid 11 instead.
+  "katex@<0.18.2": 0.18.11
+  # dompurify <3.4.17 — sanitizer bypasses (GHSA, CRITICAL/HIGH). Only mermaid 11 pulls it,
+  # for diagram labels; 3.4.17 is the patched floor on the same minor line.
+  "dompurify@<3.4.17": 3.4.17

@@ -10,6 +10,8 @@
  */
 import React, { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Alert from "@cloudscape-design/components/alert";
 import Tabs from "@cloudscape-design/components/tabs";
 import FormField from "@cloudscape-design/components/form-field";
@@ -28,9 +30,9 @@ import Box from "@cloudscape-design/components/box";
 import Link from "@cloudscape-design/components/link";
 import Popover from "@cloudscape-design/components/popover";
 import { formatTimestamp } from "@utils/helpers";
+import { LIST_ALL_MAX_PAGES } from "@utils/pagination";
 import {
   proposalBlocksNewInduction,
-  proposalScope,
   proposalScopeSortKey,
   proposalSourceTypeLabel,
 } from "./ontology/induce/helpers";
@@ -38,7 +40,7 @@ import {
   listFoundationalOntologies,
   listOntologies,
   deleteOntology,
-  listProposals,
+  listAllProposals,
   triggerInduction,
   getInductionJob,
   uploadOntologyFile,
@@ -56,6 +58,7 @@ import {
 import { SortableTable } from "@components/SortableTable";
 import { OntologyDeleteWarning } from "@components/ontology/OntologyDeleteWarning";
 import {
+  localizeOntologyType,
   ontologyTypeDisplay,
   ontologyTypeGroup,
 } from "@utils/ontology-display";
@@ -64,6 +67,8 @@ import Badge from "@cloudscape-design/components/badge";
 import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import FileUpload from "@cloudscape-design/components/file-upload";
 import Input from "@cloudscape-design/components/input";
+import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
+import type { AppMessage } from "../i18n/appMessages";
 
 /** Map a custom-uploaded ontology filename to the format string the
  *  uploadOntologyFile endpoint expects. */
@@ -108,9 +113,47 @@ function latestRescanMs(
   return max;
 }
 
+/**
+ * Newest resolved re-scan time (epoch ms) in a source's scan history, or null.
+ *
+ * The history (ListSourceScanJobs) is paginated newest first, so the first page
+ * holding any re-scan row holds the newest one: page only until that row is
+ * found. A page can be short or empty while nextToken is still set.
+ */
+async function fetchLatestRescanMs(
+  apiClient: ApiClient,
+  namespaceId: string,
+  sourceId: string,
+): Promise<number | null> {
+  let nextToken: string | undefined;
+  for (let i = 0; i < LIST_ALL_MAX_PAGES; i++) {
+    const query = nextToken
+      ? `?nextToken=${encodeURIComponent(nextToken)}`
+      : "";
+    const page = await apiClient.get<{
+      items?: Array<{ eventType?: string; isRescan?: boolean; at?: unknown }>;
+      nextToken?: string;
+    }>(`/namespaces/${namespaceId}/sources/${sourceId}/scan${query}`);
+    const ms = latestRescanMs(page.items);
+    if (ms !== null) return ms;
+    nextToken = page.nextToken || undefined;
+    if (!nextToken) return null;
+  }
+  return null;
+}
+
 export function OntologyPage() {
+  const { t } = useAppI18n();
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const [activeTab, setActiveTab] = useState("proposals");
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: t("Ontology") },
+    { text: t("Induction") },
+  ]);
+
   const [inducting, setInducting] = useState(false);
   const [inductionError, setInductionError] = useState<string | null>(null);
   // Set when a run is short-circuited by duplicate detection: the proposal_id of
@@ -213,7 +256,7 @@ export function OntologyPage() {
                 s.sourceType,
                 s.sourceSubType,
                 s.tablesDiscovered != null
-                  ? `${s.tablesDiscovered} tables`
+                  ? t("{count} tables", { count: s.tablesDiscovered })
                   : undefined,
               ]
                 .filter(Boolean)
@@ -245,24 +288,19 @@ export function OntologyPage() {
           }
         } else {
           Promise.all([
-            // No status filter: we need accepted AND pending inductions.
-            listProposals(apiClient, namespaceId ?? "").catch(
-              (): Proposal[] => [],
-            ),
+            // Only structured inductions can cover a database source, so filter
+            // to those. No status filter: we need accepted AND pending inductions.
+            listAllProposals(apiClient, namespaceId ?? "", {
+              type: "induction",
+              source_type: "STRUCTURED",
+            }).catch((): Proposal[] => []),
             Promise.all(
               approvedDbSources.map((s) =>
-                apiClient
-                  .get<{
-                    items?: Array<{
-                      eventType?: string;
-                      isRescan?: boolean;
-                      at?: unknown;
-                    }>;
-                  }>(`/namespaces/${namespaceId}/sources/${s.sourceId}/scan`)
-                  .then((h) => ({
+                fetchLatestRescanMs(apiClient, namespaceId ?? "", s.sourceId)
+                  .then((rescanMs) => ({
                     sourceId: s.sourceId,
                     name: s.name,
-                    rescanMs: latestRescanMs(h.items),
+                    rescanMs,
                   }))
                   .catch(() => ({
                     sourceId: s.sourceId,
@@ -327,7 +365,7 @@ export function OntologyPage() {
       })
       .catch((e: Error) => {
         if (cancelled) return;
-        setDatasourceError(e.message || "Failed to load data sources");
+        setDatasourceError(e.message || t("Failed to load data sources"));
         // Reset the stale-source lists so a banner from a previous namespace
         // doesn't linger when this namespace's source fetch fails.
         setStaleInducedSourceNames([]);
@@ -339,7 +377,7 @@ export function OntologyPage() {
     // lockRefreshKey + pollingJobStatus mirror the induction-lock effect so the
     // staleness banners recompute after a trigger/accept (and the lock-key
     // bump), clearing in place once the user re-induces — not only on remount.
-  }, [namespaceId, apiClient, lockRefreshKey, pollingJobStatus]);
+  }, [namespaceId, apiClient, lockRefreshKey, pollingJobStatus, t]);
 
   // Lazy-fetch the foundational ontology catalog and all loaded ontologies
   // when the Induce modal opens. The grounding multiselect shows only
@@ -383,13 +421,13 @@ export function OntologyPage() {
       .catch((e: Error) => {
         if (!cancelled)
           setFoundationalError(
-            e.message || "Failed to load foundational ontologies",
+            e.message || t("Failed to load foundational ontologies"),
           );
       });
     return () => {
       cancelled = true;
     };
-  }, [showInductionModal, namespaceId, apiClient, foundationalCatalog]);
+  }, [showInductionModal, namespaceId, apiClient, foundationalCatalog, t]);
 
   // Load DOCUMENTS sources for unstructured induction.
   useEffect(() => {
@@ -418,12 +456,12 @@ export function OntologyPage() {
       })
       .catch((e: Error) => {
         if (cancelled) return;
-        setDatasourceError(e.message || "Failed to load data sources");
+        setDatasourceError(e.message || t("Failed to load data sources"));
       });
     return () => {
       cancelled = true;
     };
-  }, [namespaceId, apiClient]);
+  }, [namespaceId, apiClient, t]);
   // Poll induction job status. Cleanup ensures interval is cancelled on
   // unmount or when pollingJobId changes (e.g. user starts a second induction).
   // On completion the page navigates to the freshly-created proposal so
@@ -463,14 +501,14 @@ export function OntologyPage() {
         } else if (j.status === "failed") {
           setPollingJobId(null);
           setInducting(false);
-          setPollingJobError(j.error ?? "Induction failed");
+          setPollingJobError(j.error ?? t("Induction failed"));
         }
       } catch {
         /* keep polling */
       }
     }, 3000);
     return () => clearInterval(interval);
-  }, [pollingJobId, namespaceId, apiClient, navigate]);
+  }, [pollingJobId, namespaceId, apiClient, navigate, t]);
 
   // Derive the induction lock from the server: an in-flight ("inducing") or a
   // completed-but-unreviewed ("pending"/"updated") proposal means a new
@@ -480,7 +518,7 @@ export function OntologyPage() {
   useEffect(() => {
     if (!namespaceId) return;
     let cancelled = false;
-    listProposals(apiClient, namespaceId)
+    listAllProposals(apiClient, namespaceId)
       .then((proposals) => {
         if (cancelled) return;
         const locked = proposals.some((p) =>
@@ -498,7 +536,8 @@ export function OntologyPage() {
 
   async function startInduction() {
     if (!namespaceId) return;
-    if (selectedDatasources.length === 0) return;
+    const isBridge = strategy === "bridge_to_tables";
+    if (!isBridge && selectedDatasources.length === 0) return;
     setInducting(true);
     setInductionError(null);
     setDuplicateProposalId(null);
@@ -516,16 +555,26 @@ export function OntologyPage() {
       // curated keys map to canonical ontology IDs in the catalog, and
       // custom uploads went into the same ontologies table.
       const groundingIds = [...selectedFoundationalKeys];
-      const job = await triggerInduction(apiClient, namespaceId, {
-        datasource_ids: dsIds,
-        ontology_uri_prefix: `http://coa.amazon.com/namespace/${namespaceId}/ontology/induced#`,
-        namespace: namespaceId,
-        strategy,
-        confidence_threshold: confidenceThreshold,
-        grounding_mode: groundingMode,
-        grounding_ontology_ids:
-          groundingIds.length > 0 ? groundingIds : undefined,
-      });
+      // The bridge works on the namespace's accepted induced ontology (the
+      // prefix below, the one table inductions from this page write); it reads
+      // no source selection and no grounding.
+      const job = isBridge
+        ? await triggerInduction(apiClient, namespaceId, {
+            datasource_ids: [],
+            ontology_uri_prefix: `http://coa.amazon.com/namespace/${namespaceId}/ontology/induced#`,
+            namespace: namespaceId,
+            strategy,
+          })
+        : await triggerInduction(apiClient, namespaceId, {
+            datasource_ids: dsIds,
+            ontology_uri_prefix: `http://coa.amazon.com/namespace/${namespaceId}/ontology/induced#`,
+            namespace: namespaceId,
+            strategy,
+            confidence_threshold: confidenceThreshold,
+            grounding_mode: groundingMode,
+            grounding_ontology_ids:
+              groundingIds.length > 0 ? groundingIds : undefined,
+          });
       setActiveTab("proposals");
       setPollingJobId(job.job_id);
       // Re-derive the lock from the server now that a run is in flight.
@@ -536,8 +585,9 @@ export function OntologyPage() {
       // "API POST … failed (409): …") and lock the button to match the server.
       if (e instanceof ApiError && e.status === 409) {
         setInductionError(
-          "An induction is already in progress or a proposal is awaiting review for this namespace. " +
-            "Finish reviewing it before starting a new one.",
+          t(
+            "An induction is already in progress or a proposal is awaiting review for this namespace. Finish reviewing it before starting a new one.",
+          ),
         );
         setInductionLocked(true);
         setActiveTab("proposals");
@@ -552,7 +602,9 @@ export function OntologyPage() {
     <SpaceBetween size="l">
       <Header
         variant="h1"
-        description="Induce an ontology from your approved sources, review the proposal, then accept it to publish."
+        description={t(
+          "Induce an ontology from your approved sources, review the proposal, then accept it to publish.",
+        )}
         actions={
           <SpaceBetween direction="horizontal" size="xs">
             <Button
@@ -560,55 +612,60 @@ export function OntologyPage() {
                 navigate(`/namespaces/${namespaceId}/ontology/graph`)
               }
             >
-              Open Explorer
+              {t("Open Explorer")}
             </Button>
             <Button
               variant="primary"
               onClick={() => setShowInductionModal(true)}
               loading={inducting}
               disabled={inductionLocked}
-              disabledReason="An induction is already in progress or a proposal is awaiting review. Finish reviewing it before starting a new one."
+              disabledReason={t(
+                "An induction is already in progress or a proposal is awaiting review. Finish reviewing it before starting a new one.",
+              )}
             >
-              Start induction
+              {t("Start induction")}
             </Button>
           </SpaceBetween>
         }
       >
-        Induction
+        {t("Induction")}
       </Header>
       {staleInducedSourceNames.length > 0 && (
         <Alert
           type="warning"
-          header="A re-scanned source has an out-of-date induction"
+          header={t("A re-scanned source has an out-of-date induction")}
         >
           <SpaceBetween size="xs">
             <Box variant="p">
-              Re-scanned and re-approved since their last induction:{" "}
-              <b>{staleInducedSourceNames.join(", ")}</b>. That induction no
-              longer matches the current source.
+              {t("Re-scanned and re-approved since their last induction:")}{" "}
+              <b>{staleInducedSourceNames.join(", ")}</b>
+              {t(". That induction no longer matches the current source.")}
             </Box>
             <Box variant="p">
-              Right now, re-inducing only merges into the existing ontology
-              (append-only): it won&apos;t remove tables dropped at the source
-              and can duplicate edited labels. For a clean rebuild today, delete
-              the affected induction below and induce again. Editing an
-              induction in place isn&apos;t available yet.
+              {t(
+                "Right now, re-inducing only merges into the existing ontology (append-only): it won't remove tables dropped at the source and can duplicate edited labels. For a clean rebuild today, delete the affected induction below and induce again. Editing an induction in place isn't available yet.",
+              )}
             </Box>
           </SpaceBetween>
         </Alert>
       )}
       {stalePendingSourceNames.length > 0 && (
-        <Alert type="warning" header="A pending induction predates a re-scan">
+        <Alert
+          type="warning"
+          header={t("A pending induction predates a re-scan")}
+        >
           <SpaceBetween size="xs">
             <Box variant="p">
-              You have a pending induction for:{" "}
-              <b>{stalePendingSourceNames.join(", ")}</b>. The source was
-              re-scanned and re-approved after you triggered that induction.
+              {t("You have a pending induction for:")}{" "}
+              <b>{stalePendingSourceNames.join(", ")}</b>
+              {t(
+                ". The source was re-scanned and re-approved after you triggered that induction.",
+              )}
             </Box>
             <Box variant="p">
-              The pending proposal was built on the older source, so accepting
-              it won&apos;t include the re-scan&apos;s changes. Re-run the
-              induction on the current source, then accept the new proposal.
+              {t(
+                "The pending proposal was built on the older source, so accepting it won't include the re-scan's changes. Re-run the induction on the current source, then accept the new proposal.",
+              )}
             </Box>
           </SpaceBetween>
         </Alert>
@@ -617,7 +674,7 @@ export function OntologyPage() {
         <Alert
           type={pollingJobError ? "error" : "info"}
           header={
-            pollingJobError ? "Induction failed" : "Induction in progress"
+            pollingJobError ? t("Induction failed") : t("Induction in progress")
           }
           dismissible={!!pollingJobError}
           onDismiss={() => {
@@ -632,7 +689,9 @@ export function OntologyPage() {
             />
             {!pollingJobError && (
               <Box variant="small" color="text-status-inactive">
-                You'll be redirected to the new proposal as soon as it's ready.
+                {t(
+                  "You'll be redirected to the new proposal as soon as it's ready.",
+                )}
               </Box>
             )}
           </SpaceBetween>
@@ -642,15 +701,15 @@ export function OntologyPage() {
       {duplicateProposalId && (
         <Alert
           type="warning"
-          header="Datasource already inducted"
+          header={t("Datasource already inducted")}
           dismissible
           onDismiss={() => setDuplicateProposalId(null)}
         >
           <SpaceBetween size="xs">
             <Box>
-              This selection has the same structure as an existing accepted
-              proposal, so no new proposal was created. Open the existing
-              proposal to review or edit it.
+              {t(
+                "This selection has the same structure as an existing accepted proposal, so no new proposal was created. Open the existing proposal to review or edit it.",
+              )}
             </Box>
             <Link
               onFollow={(e) => {
@@ -661,7 +720,7 @@ export function OntologyPage() {
               }}
               href={`/namespaces/${namespaceId}/ontology/proposals/${duplicateProposalId}`}
             >
-              View existing proposal
+              {t("View existing proposal")}
             </Link>
           </SpaceBetween>
         </Alert>
@@ -671,7 +730,7 @@ export function OntologyPage() {
           type="warning"
           dismissible
           onDismiss={() => setDatasourceError(null)}
-          header="Could not load data sources"
+          header={t("Could not load data sources")}
         >
           {datasourceError}
         </Alert>
@@ -680,24 +739,30 @@ export function OntologyPage() {
         <Modal
           visible
           onDismiss={() => setShowInductionModal(false)}
-          header="Induce Ontology"
+          header={t("Induce Ontology")}
           footer={
             <Box float="right">
               <SpaceBetween direction="horizontal" size="xs">
                 <Button onClick={() => setShowInductionModal(false)}>
-                  Cancel
+                  {t("Cancel")}
                 </Button>
                 <Button
                   variant="primary"
                   onClick={startInduction}
-                  disabled={selectedDatasources.length === 0 || inductionLocked}
+                  disabled={
+                    (strategy !== "bridge_to_tables" &&
+                      selectedDatasources.length === 0) ||
+                    inductionLocked
+                  }
                   disabledReason={
                     inductionLocked
-                      ? "An induction is already in progress or a proposal is awaiting review. Finish reviewing it before starting a new one."
+                      ? t(
+                          "An induction is already in progress or a proposal is awaiting review. Finish reviewing it before starting a new one.",
+                        )
                       : undefined
                   }
                 >
-                  Start induction
+                  {t("Start induction")}
                 </Button>
               </SpaceBetween>
             </Box>
@@ -705,43 +770,48 @@ export function OntologyPage() {
         >
           <SpaceBetween size="m">
             <FormField
-              label="Strategy"
+              label={t("Strategy")}
               info={
                 <Popover
-                  header="Induction strategies"
+                  header={t("Induction strategies")}
                   size="large"
                   triggerType="custom"
                   content={
                     <SpaceBetween size="xs">
                       <Box variant="p">
-                        <strong>Table to Ontology</strong> — Maps each database
-                        table to an OWL class and columns to properties. Fast,
-                        deterministic, and cost-effective. Best for structured
-                        relational schemas where the table/column names are
-                        meaningful.
+                        {t(
+                          "Table to Ontology — Maps each database table to an OWL class and columns to properties. Fast, deterministic, and cost-effective. Best for structured relational schemas where the table/column names are meaningful.",
+                        )}
                       </Box>
                       <Box variant="p">
-                        <strong>Unstructured (Lexical Graph)</strong> — Extracts
-                        concepts and relationships from document sources (PDFs,
-                        text) using NLP and builds a lexical knowledge graph.
-                        Exclusively for document sources. Supports grounding
-                        against loaded ontologies.
+                        {t(
+                          "Unstructured (Lexical Graph) — Extracts concepts and relationships from document sources (PDFs, text) using NLP and builds a lexical knowledge graph. Exclusively for document sources. Supports grounding against loaded ontologies.",
+                        )}
+                      </Box>
+                      <Box variant="p">
+                        {t(
+                          "Bridge documents to tables — Reads what your documents say about each table and column and proposes definitions for them, so SQL generation knows what a column means. Runs on the accepted ontology after both a table and a document induction; the result is a proposal to review like any other.",
+                        )}
                       </Box>
                     </SpaceBetween>
                   }
                 >
-                  <Link variant="info">Info</Link>
+                  <Link variant="info">{t("Info")}</Link>
                 </Popover>
               }
-              description="Determines how the ontology is constructed from your data."
+              description={t(
+                "Determines how the ontology is constructed from your data.",
+              )}
             >
               <Select
                 selectedOption={{
                   value: strategy,
                   label:
                     strategy === "unstructured_lexical_graph"
-                      ? "Unstructured (Lexical Graph)"
-                      : "Table to Ontology",
+                      ? t("Unstructured (Lexical Graph)")
+                      : strategy === "bridge_to_tables"
+                        ? t("Bridge documents to tables")
+                        : t("Table to Ontology"),
                 }}
                 onChange={({ detail }) => {
                   setStrategy(
@@ -753,223 +823,253 @@ export function OntologyPage() {
                 options={[
                   {
                     value: "table_to_ontology",
-                    label: "Table to Ontology",
-                    description:
+                    label: t("Table to Ontology"),
+                    description: t(
                       "Maps relational tables → OWL classes, columns → properties. Best for structured databases.",
+                    ),
                   },
                   {
                     value: "unstructured_lexical_graph",
-                    label: "Unstructured (Lexical Graph)",
-                    description:
+                    label: t("Unstructured (Lexical Graph)"),
+                    description: t(
                       "Extracts concepts from document sources via NLP and builds a lexical knowledge graph. Exclusively for document sources.",
+                    ),
+                  },
+                  {
+                    value: "bridge_to_tables",
+                    label: t("Bridge documents to tables"),
+                    description: t(
+                      "Proposes table and column definitions from what the documents say. Needs an accepted table and document induction.",
+                    ),
                   },
                 ]}
               />
             </FormField>
-            <FormField
-              label="Data sources"
-              description={
-                strategy === "unstructured_lexical_graph"
-                  ? "Select one or more document sources to induce from."
-                  : "Select one or more connected database sources to induce from."
-              }
-            >
-              <Multiselect
-                selectedOptions={selectedDatasources}
-                onChange={({ detail }) =>
-                  setSelectedDatasources([...detail.selectedOptions])
-                }
-                options={
-                  strategy === "unstructured_lexical_graph"
-                    ? docSourceOptions
-                    : datasourceOptions
-                }
-                placeholder="Select data sources"
-                filteringType="auto"
-              />
-            </FormField>
-
-            {/* Grounding ontologies — available for BOTH strategies. The
-                structured path grounds tables and the unstructured (lexical
-                graph) path grounds its induced classes against the same
-                loaded foundational ontologies. */}
-            <FormField
-              label="Grounding ontologies (optional)"
-              info={
-                <Popover
-                  header="What is grounding?"
-                  size="large"
-                  triggerType="custom"
-                  content={
-                    <SpaceBetween size="xs">
-                      <Box variant="p">
-                        Grounding aligns your induced ontology against existing
-                        well-known ontologies. Instead of creating novel classes
-                        for every table or concept, the inducer checks if an
-                        equivalent concept already exists in a loaded ontology
-                        and reuses it.
-                      </Box>
-                      <Box variant="p">
-                        This improves interoperability — your ontology shares
-                        vocabulary with industry standards (Schema.org, FIBO,
-                        Dublin Core, etc.) making it easier to integrate with
-                        other systems.
-                      </Box>
-                      <Box variant="p">
-                        This run grounds against EXACTLY the ontologies selected
-                        here. Your namespace's accepted induced ontologies are
-                        pre-selected by default (so new runs converge with prior
-                        ones), but you can deselect them. With nothing selected,
-                        every table/concept is treated as novel.
-                      </Box>
-                    </SpaceBetween>
-                  }
-                >
-                  <Link variant="info">Info</Link>
-                </Popover>
-              }
-              description="Pick the ontologies to ground against for this run. Accepted induced ontologies are pre-selected (deselect to skip). Load foundational/uploaded ontologies from the Reference ontologies tab first."
-              constraintText="Ontologies still embedding or failed to ingest are shown but not selectable."
-            >
-              {foundationalError && (
-                <Alert
-                  type="warning"
-                  dismissible
-                  onDismiss={() => setFoundationalError(null)}
-                >
-                  Could not load ontologies: {foundationalError}
-                </Alert>
-              )}
-              <Multiselect
-                placeholder={
-                  foundationalCatalog === null
-                    ? "Loading…"
-                    : "Pick loaded ontologies to ground against"
-                }
-                selectedOptions={selectedFoundationalKeys.map((uri) => {
-                  const rec = loadedOntologyRecords.find((r) => r.uri === uri);
-                  return {
-                    value: uri,
-                    label: rec?.title || uri.split("/").pop() || uri,
-                  };
-                })}
-                onChange={({ detail }) =>
-                  setSelectedFoundationalKeys(
-                    detail.selectedOptions
-                      .map((o) => o.value)
-                      .filter((v): v is string => Boolean(v)),
-                  )
-                }
-                // All loaded ontologies are SHOWN — induced, foundational, and
-                // uploaded. Ready ones (finished embedding) are SELECTABLE; the
-                // backend grounds against EXACTLY the selected pool (no
-                // server-side auto-include), and ready induced ontologies are
-                // pre-checked by default (see the load effect) so new runs
-                // converge with prior ones. Ontologies that have not finished
-                // embedding or failed to ingest are shown DISABLED with a
-                // per-row status label so they are not silently hidden from
-                // Start Induction (issue #540). Readiness is derived from
-                // ontologyIngestState() — the single source of truth also used
-                // by the Ontologies-list StatusIndicator — so the two views can
-                // never disagree about whether a row is ready.
-                options={loadedOntologyRecords.map((rec) => {
-                  const ingestState = ontologyIngestState(rec);
-                  const isReady = ingestState === "ready";
-                  const statusLabel =
-                    ingestState === "failed"
-                      ? "⚠️ Ingest failed"
-                      : ingestState === "ingesting"
-                        ? "⏳ Embedding…"
-                        : undefined;
-                  return {
-                    value: rec.uri,
-                    label: rec.title || rec.ontologyId,
-                    labelTag:
-                      rec.ontologyType === "induced"
-                        ? "Induced"
-                        : rec.ontologyType === "foundational"
-                          ? "Foundational"
-                          : "Uploaded",
-                    description: statusLabel ?? rec.uri,
-                    disabled: !isReady,
-                  };
-                })}
-                disabled={foundationalCatalog === null}
-                filteringType="auto"
-              />
-            </FormField>
-
-            {/* Grounding mode + confidence — shown whenever grounding will run,
-                i.e. at least one ontology is selected (induced ontologies are
-                pre-selected by default). If the user deselects everything, no
-                grounding happens, so the mode controls are hidden. */}
-            {selectedFoundationalKeys.length > 0 && (
+            {strategy === "bridge_to_tables" ? (
+              <Box variant="p">
+                {t(
+                  "The bridge runs on this namespace's accepted ontology: it needs an accepted table induction and an accepted document induction. It reads no source selection. When it finishes, its proposal opens for review; nothing changes until you accept it.",
+                )}
+              </Box>
+            ) : (
               <>
                 <FormField
-                  label="Grounding mode"
+                  label={t("Data sources")}
+                  description={
+                    strategy === "unstructured_lexical_graph"
+                      ? t("Select one or more document sources to induce from.")
+                      : t(
+                          "Select one or more connected database sources to induce from.",
+                        )
+                  }
+                >
+                  <Multiselect
+                    selectedOptions={selectedDatasources}
+                    onChange={({ detail }) =>
+                      setSelectedDatasources([...detail.selectedOptions])
+                    }
+                    options={
+                      strategy === "unstructured_lexical_graph"
+                        ? docSourceOptions
+                        : datasourceOptions
+                    }
+                    placeholder={t("Select data sources")}
+                    filteringType="auto"
+                  />
+                </FormField>
+
+                {/* Grounding ontologies — available for BOTH strategies. The
+                    structured path grounds tables and the unstructured (lexical
+                    graph) path grounds its induced classes against the same
+                    loaded foundational ontologies. */}
+                <FormField
+                  label={t("Grounding ontologies (optional)")}
                   info={
                     <Popover
-                      header="Grounding modes"
+                      header={t("What is grounding?")}
                       size="large"
                       triggerType="custom"
                       content={
                         <SpaceBetween size="xs">
                           <Box variant="p">
-                            <strong>Enhanced</strong> — Three-stage matching:
-                            exact name match → embedding similarity recall → LLM
-                            disambiguation for ambiguous candidates. Most
-                            accurate but incurs ~1 LLM call per table. Use when
-                            precision matters and cost is acceptable.
+                            {t(
+                              "Grounding aligns your induced ontology against existing well-known ontologies. Instead of creating novel classes for every table or concept, the inducer checks if an equivalent concept already exists in a loaded ontology and reuses it.",
+                            )}
                           </Box>
                           <Box variant="p">
-                            <strong>Standard</strong> — Two-stage matching:
-                            exact name match → embedding similarity with a
-                            confidence threshold. Fully deterministic, no LLM
-                            cost. Use for large schemas where speed and cost are
-                            priorities.
+                            {t(
+                              "This improves interoperability — your ontology shares vocabulary with industry standards (Schema.org, FIBO, Dublin Core, etc.) making it easier to integrate with other systems.",
+                            )}
+                          </Box>
+                          <Box variant="p">
+                            {t(
+                              "This run grounds against EXACTLY the ontologies selected here. Your namespace's accepted induced ontologies are pre-selected by default (so new runs converge with prior ones), but you can deselect them. With nothing selected, every table/concept is treated as novel.",
+                            )}
                           </Box>
                         </SpaceBetween>
                       }
                     >
-                      <Link variant="info">Info</Link>
+                      <Link variant="info">{t("Info")}</Link>
                     </Popover>
                   }
-                  description="How to match source concepts against the selected ontologies."
+                  description={t(
+                    "Pick the ontologies to ground against for this run. Accepted induced ontologies are pre-selected (deselect to skip). Load foundational/uploaded ontologies from the Reference ontologies tab first.",
+                  )}
+                  constraintText={t(
+                    "Ontologies still embedding or failed to ingest are shown but not selectable.",
+                  )}
                 >
-                  <RadioGroup
-                    value={groundingMode}
-                    onChange={({ detail }) => setGroundingMode(detail.value)}
-                    items={[
-                      {
-                        value: "ENHANCED",
-                        label: "Enhanced (recommended)",
-                        description:
-                          "Exact-name match + embedding recall + LLM disambiguation. Best accuracy, ~1 LLM call per table.",
-                      },
-                      {
-                        value: "STANDARD",
-                        label: "Standard",
-                        description:
-                          "Exact-name match + embedding recall only. Deterministic, faster, no LLM cost.",
-                      },
-                    ]}
+                  {foundationalError && (
+                    <Alert
+                      type="warning"
+                      dismissible
+                      onDismiss={() => setFoundationalError(null)}
+                    >
+                      {t("Could not load ontologies: {error}", {
+                        error: foundationalError,
+                      })}
+                    </Alert>
+                  )}
+                  <Multiselect
+                    placeholder={
+                      foundationalCatalog === null
+                        ? t("Loading…")
+                        : t("Pick loaded ontologies to ground against")
+                    }
+                    selectedOptions={selectedFoundationalKeys.map((uri) => {
+                      const rec = loadedOntologyRecords.find(
+                        (r) => r.uri === uri,
+                      );
+                      return {
+                        value: uri,
+                        label: rec?.title || uri.split("/").pop() || uri,
+                      };
+                    })}
+                    onChange={({ detail }) =>
+                      setSelectedFoundationalKeys(
+                        detail.selectedOptions
+                          .map((o) => o.value)
+                          .filter((v): v is string => Boolean(v)),
+                      )
+                    }
+                    // All loaded ontologies are SHOWN — induced, foundational, and
+                    // uploaded. Ready ones (finished embedding) are SELECTABLE; the
+                    // backend grounds against EXACTLY the selected pool (no
+                    // server-side auto-include), and ready induced ontologies are
+                    // pre-checked by default (see the load effect) so new runs
+                    // converge with prior ones. Ontologies that have not finished
+                    // embedding or failed to ingest are shown DISABLED with a
+                    // per-row status label so they are not silently hidden from
+                    // Start Induction (issue #540). Readiness is derived from
+                    // ontologyIngestState() — the single source of truth also used
+                    // by the Ontologies-list StatusIndicator — so the two views can
+                    // never disagree about whether a row is ready.
+                    options={loadedOntologyRecords.map((rec) => {
+                      const ingestState = ontologyIngestState(rec);
+                      const isReady = ingestState === "ready";
+                      const statusLabel =
+                        ingestState === "failed"
+                          ? t("⚠️ Ingest failed")
+                          : ingestState === "ingesting"
+                            ? t("⏳ Embedding…")
+                            : undefined;
+                      return {
+                        value: rec.uri,
+                        label: rec.title || rec.ontologyId,
+                        labelTag:
+                          rec.ontologyType === "induced"
+                            ? t("Induced")
+                            : rec.ontologyType === "foundational"
+                              ? t("Foundational")
+                              : t("Uploaded"),
+                        description: statusLabel ?? rec.uri,
+                        disabled: !isReady,
+                      };
+                    })}
+                    disabled={foundationalCatalog === null}
+                    filteringType="auto"
                   />
                 </FormField>
-                {groundingMode === "STANDARD" && (
-                  <FormField
-                    label={`Confidence threshold: ${Math.round(confidenceThreshold * 100)}%`}
-                    description="Only concepts above this threshold are auto-matched. Lower = more matches but more false positives."
-                  >
-                    <Slider
-                      value={confidenceThreshold}
-                      onChange={({ detail }) =>
-                        setConfidenceThreshold(detail.value)
+
+                {/* Grounding mode + confidence — shown whenever grounding will run,
+                    i.e. at least one ontology is selected (induced ontologies are
+                    pre-selected by default). If the user deselects everything, no
+                    grounding happens, so the mode controls are hidden. */}
+                {selectedFoundationalKeys.length > 0 && (
+                  <>
+                    <FormField
+                      label={t("Grounding mode")}
+                      info={
+                        <Popover
+                          header={t("Grounding modes")}
+                          size="large"
+                          triggerType="custom"
+                          content={
+                            <SpaceBetween size="xs">
+                              <Box variant="p">
+                                {t(
+                                  "Enhanced — Three-stage matching: exact name match → embedding similarity recall → LLM disambiguation for ambiguous candidates. Most accurate but incurs ~1 LLM call per table. Use when precision matters and cost is acceptable.",
+                                )}
+                              </Box>
+                              <Box variant="p">
+                                {t(
+                                  "Standard — Two-stage matching: exact name match → embedding similarity with a confidence threshold. Fully deterministic, no LLM cost. Use for large schemas where speed and cost are priorities.",
+                                )}
+                              </Box>
+                            </SpaceBetween>
+                          }
+                        >
+                          <Link variant="info">{t("Info")}</Link>
+                        </Popover>
                       }
-                      min={0.5}
-                      max={0.95}
-                      step={0.05}
-                    />
-                  </FormField>
+                      description={t(
+                        "How to match source concepts against the selected ontologies.",
+                      )}
+                    >
+                      <RadioGroup
+                        value={groundingMode}
+                        onChange={({ detail }) =>
+                          setGroundingMode(detail.value)
+                        }
+                        items={[
+                          {
+                            value: "ENHANCED",
+                            label: t("Enhanced (recommended)"),
+                            description: t(
+                              "Exact-name match + embedding recall + LLM disambiguation. Best accuracy, ~1 LLM call per table.",
+                            ),
+                          },
+                          {
+                            value: "STANDARD",
+                            label: t("Standard"),
+                            description: t(
+                              "Exact-name match + embedding recall only. Deterministic, faster, no LLM cost.",
+                            ),
+                          },
+                        ]}
+                      />
+                    </FormField>
+                    {groundingMode === "STANDARD" && (
+                      <FormField
+                        label={t("Confidence threshold: {percent}%", {
+                          percent: Math.round(confidenceThreshold * 100),
+                        })}
+                        description={t(
+                          "Only concepts above this threshold are auto-matched. Lower = more matches but more false positives.",
+                        )}
+                      >
+                        <Slider
+                          value={confidenceThreshold}
+                          onChange={({ detail }) =>
+                            setConfidenceThreshold(detail.value)
+                          }
+                          min={0.5}
+                          max={0.95}
+                          step={0.05}
+                        />
+                      </FormField>
+                    )}
+                  </>
                 )}
               </>
             )}
@@ -983,14 +1083,14 @@ export function OntologyPage() {
         tabs={[
           {
             id: "proposals",
-            label: "Proposals",
+            label: t("Proposals"),
             content: (
               <ProposalsTab apiClient={apiClient} namespace={namespaceId} />
             ),
           },
           {
             id: "ontologies",
-            label: "Reference ontologies",
+            label: t("Reference ontologies"),
             content: (
               <OntologiesTab apiClient={apiClient} namespace={namespaceId} />
             ),
@@ -1020,11 +1120,26 @@ export const ONTOLOGY_INGEST_TERMINAL: ReadonlySet<OntologyIngestState> =
 /** StatusIndicator presentation per ingest state. */
 export const ONTOLOGY_INGEST_STATUS: Record<
   OntologyIngestState,
-  { type: "success" | "error" | "in-progress"; label: string }
+  { type: "success" | "error" | "in-progress"; label: AppMessage }
 > = {
   ready: { type: "success", label: "Ready" },
   failed: { type: "error", label: "Parse failed" },
   ingesting: { type: "in-progress", label: "Ingesting" },
+};
+
+const PROPOSAL_STATUS_MESSAGES: Record<string, AppMessage> = {
+  accepted: "accepted",
+  "accept failed": "accept failed",
+  rejected: "rejected",
+  failed: "failed",
+  "Inducing…": "Inducing…",
+  "Syncing embeddings…": "Syncing embeddings…",
+  accepting: "accepting",
+  pending: "pending",
+  updated: "updated",
+  // Set when a pending proposal is cancelled; the label falls through
+  // proposalStatusDisplay unchanged, so it needs its own entry here.
+  cancelled: "cancelled",
 };
 
 /** Derive the ingest state of a registered ontology row.
@@ -1076,6 +1191,19 @@ export function proposalStatusDisplay(status: string): {
   return { type: "pending", label: status };
 }
 
+/** The Proposals-list status label in the reader's locale; a status this
+ * console does not know is shown raw. */
+export function proposalStatusText(status: string, t: AppTranslate): string {
+  const { label } = proposalStatusDisplay(status);
+  const message = Object.prototype.hasOwnProperty.call(
+    PROPOSAL_STATUS_MESSAGES,
+    label,
+  )
+    ? PROPOSAL_STATUS_MESSAGES[label]
+    : undefined;
+  return message ? t(message) : label;
+}
+
 /** What the UI should do when an induction job reaches ``completed``.
  *
  *  - ``duplicate`` — the run was short-circuited by structural-fingerprint
@@ -1087,17 +1215,31 @@ export function proposalStatusDisplay(status: string): {
  *    resilient when induced_ontology_id isn't hydrated on the DDB-fallback poll).
  *  - ``refresh`` — nothing to navigate to (no id at all); just refresh the list.
  *
+ *  A bridge job (``bridge_report`` set) names its proposal in
+ *  ``bridge_report.proposal_id``; without one the run found nothing to change
+ *  and there is no proposal row, so the job id must not be used.
+ *
  *  Exported as a pure function so the duplicate-vs-navigate decision is unit
  *  tested directly (the 4s poll loop + Cloudscape Tabs render is flaky in jsdom).
  */
 export function resolveCompletedInductionAction(
-  job: { duplicate_of?: string; report?: Record<string, unknown> },
+  job: {
+    duplicate_of?: string;
+    report?: Record<string, unknown>;
+    bridge_report?: { proposal_id?: string };
+  },
   polledJobId: string | null,
 ):
   | { kind: "duplicate" | "navigate"; proposalId: string }
   | { kind: "refresh" } {
   if (job.duplicate_of) {
     return { kind: "duplicate", proposalId: job.duplicate_of };
+  }
+  if (job.bridge_report) {
+    const bridged = job.bridge_report.proposal_id;
+    return bridged
+      ? { kind: "navigate", proposalId: bridged }
+      : { kind: "refresh" };
   }
   const proposalId =
     (job.report?.["induced_ontology_id"] as string | undefined) ??
@@ -1137,6 +1279,7 @@ function OntologiesTab({
   apiClient: ApiClient;
   namespace?: string;
 }) {
+  const { t } = useAppI18n();
   const [items, setItems] = useState<OntologyRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1193,8 +1336,8 @@ function OntologiesTab({
       // distinguishable, not collapsed into one generic string.
       setDeleteError(
         e instanceof Error
-          ? `Failed to delete ontology: ${e.message}`
-          : "Failed to delete ontology",
+          ? t("Failed to delete ontology: {error}", { error: e.message })
+          : t("Failed to delete ontology"),
       );
     } finally {
       setDeleteBusy(false);
@@ -1236,9 +1379,11 @@ function OntologiesTab({
           }));
         setItems([...registered, ...placeholders]);
       })
-      .catch((e: Error) => setError(e.message || "Failed to load ontologies"))
+      .catch((e: Error) =>
+        setError(e.message || t("Failed to load ontologies")),
+      )
       .finally(() => setLoading(false));
-  }, [apiClient, namespace, refreshKey]);
+  }, [apiClient, namespace, refreshKey, t]);
 
   // Poll while any registered (non-placeholder) row is still ingesting so
   // counts + the ingest StatusIndicator flip to their terminal state without a
@@ -1323,12 +1468,13 @@ function OntologiesTab({
       setUploadTitle("");
       setRefreshKey((k) => k + 1);
       setIngestNotice(
-        `"${uploadedTitle}" uploaded. Parsing and embedding run in the ` +
-          `background — class and embedding counts will appear here once ` +
-          `ingestion completes. Refresh in a moment to check progress.`,
+        t(
+          '"{name}" uploaded. Parsing and embedding run in the background — class and embedding counts will appear here once ingestion completes. Refresh in a moment to check progress.',
+          { name: uploadedTitle },
+        ),
       );
     } catch (e) {
-      setUploadError(e instanceof Error ? e.message : "Upload failed");
+      setUploadError(e instanceof Error ? e.message : t("Upload failed"));
     } finally {
       setUploadBusy(false);
     }
@@ -1338,8 +1484,12 @@ function OntologiesTab({
     <SpaceBetween size="s">
       {inducedOntologies.length > 0 && (
         <Box variant="small" color="text-status-inactive">
-          {inducedOntologies.length} induced ontolog
-          {inducedOntologies.length === 1 ? "y" : "ies"} in this namespace.{" "}
+          {t(
+            inducedOntologies.length === 1
+              ? "{count} induced ontology in this namespace."
+              : "{count} induced ontologies in this namespace.",
+            { count: inducedOntologies.length },
+          )}{" "}
           <Link
             href={`/namespaces/${namespace}/ontology/graph?tab=ontologies`}
             onFollow={(ev) => {
@@ -1349,7 +1499,7 @@ function OntologiesTab({
               );
             }}
           >
-            View in Explorer
+            {t("View in Explorer")}
           </Link>
         </Box>
       )}
@@ -1358,7 +1508,7 @@ function OntologiesTab({
           type="info"
           dismissible
           onDismiss={() => setIngestNotice(null)}
-          header="Ontology uploaded — ingestion in progress"
+          header={t("Ontology uploaded — ingestion in progress")}
         >
           {ingestNotice}
         </Alert>
@@ -1368,7 +1518,7 @@ function OntologiesTab({
           type="warning"
           dismissible
           onDismiss={() => setError(null)}
-          header="Could not load ontologies"
+          header={t("Could not load ontologies")}
         >
           {error}
         </Alert>
@@ -1379,14 +1529,14 @@ function OntologiesTab({
             <Modal
               visible
               onDismiss={closeDeleteModal}
-              header={`Delete ontology "${
-                ontologyToDelete.title || ontologyToDelete.ontologyId
-              }"?`}
+              header={t('Delete ontology "{name}"?', {
+                name: ontologyToDelete.title || ontologyToDelete.ontologyId,
+              })}
               footer={
                 <Box float="right">
                   <SpaceBetween direction="horizontal" size="xs">
                     <Button variant="link" onClick={closeDeleteModal}>
-                      Cancel
+                      {t("Cancel")}
                     </Button>
                     <Button
                       variant="primary"
@@ -1394,7 +1544,7 @@ function OntologiesTab({
                       disabled={deleteBusy || deleteConfirmText !== "delete"}
                       onClick={confirmDeleteOntology}
                     >
-                      Delete
+                      {t("Delete")}
                     </Button>
                   </SpaceBetween>
                 </Box>
@@ -1406,11 +1556,11 @@ function OntologiesTab({
                   name={ontologyToDelete.title || ontologyToDelete.ontologyId}
                 />
                 {deleteError && (
-                  <Alert type="error" header="Delete failed">
+                  <Alert type="error" header={t("Delete failed")}>
                     {deleteError}
                   </Alert>
                 )}
-                <FormField label="Type delete to confirm">
+                <FormField label={t('Type "delete" to confirm')}>
                   <Input
                     value={deleteConfirmText}
                     onChange={({ detail }) =>
@@ -1441,7 +1591,7 @@ function OntologiesTab({
         columnDefinitions={[
           {
             id: "title",
-            header: "Title",
+            header: t("Title"),
             sortingField: "title",
             cell: (e) => (
               <SpaceBetween size="xxxs">
@@ -1454,38 +1604,42 @@ function OntologiesTab({
           },
           {
             id: "type",
-            header: "Type",
+            header: t("Type"),
             sortingField: "ontologyType",
             cell: (e) => {
               const isAvailable = e._available;
               if (isAvailable) {
-                return <Badge color="green">Foundational</Badge>;
+                return <Badge color="green">{t("Foundational")}</Badge>;
               }
-              const { label, color } = ontologyTypeDisplay(e.ontologyType);
-              return <Badge color={color}>{label}</Badge>;
+              const { color } = ontologyTypeDisplay(e.ontologyType);
+              return (
+                <Badge color={color}>
+                  {localizeOntologyType(e.ontologyType, t)}
+                </Badge>
+              );
             },
           },
           {
             id: "classes",
-            header: "Classes",
+            header: t("Classes"),
             sortingField: "classCount",
             cell: (e) => e.classCount,
           },
           {
             id: "properties",
-            header: "Properties",
+            header: t("Properties"),
             sortingField: "propertyCount",
             cell: (e) => e.propertyCount,
           },
           {
             id: "created",
-            header: "Created",
+            header: t("Created"),
             sortingField: "createdAt",
             cell: (e) => formatTimestamp(e.createdAt),
           },
           {
             id: "actions",
-            header: "Actions",
+            header: t("Actions"),
             cell: (e) => {
               // Curated-but-not-yet-loaded rows offer a "Load" action; loaded /
               // registered rows show their ingest state inline (no separate
@@ -1518,9 +1672,13 @@ function OntologiesTab({
                         );
                       } catch (err) {
                         setError(
-                          `Failed to load ${entry.title}: ${
-                            err instanceof Error ? err.message : "unknown error"
-                          }`,
+                          t("Failed to load {name}: {error}", {
+                            name: entry.title,
+                            error:
+                              err instanceof Error
+                                ? err.message
+                                : t("unknown error"),
+                          }),
                         );
                       } finally {
                         setLoadingUris((s) => {
@@ -1532,14 +1690,14 @@ function OntologiesTab({
                       }
                     }}
                   >
-                    Load
+                    {t("Load")}
                   </Button>
                 );
               }
               const { type, label } =
                 ONTOLOGY_INGEST_STATUS[ontologyIngestState(e)];
               const statusIndicator = (
-                <StatusIndicator type={type}>{label}</StatusIndicator>
+                <StatusIndicator type={type}>{t(label)}</StatusIndicator>
               );
               // Every LOADED reference ontology is deletable here — both
               // user-uploaded content and loaded foundational ontologies (the
@@ -1567,14 +1725,14 @@ function OntologiesTab({
                   disabled={isDeleting || blockedByInduced}
                   onClick={() => setOntologyToDelete(e)}
                 >
-                  Delete
+                  {t("Delete")}
                 </Button>
               );
               return (
                 <SpaceBetween direction="horizontal" size="xs">
                   {isDeleting ? (
                     <StatusIndicator type="in-progress">
-                      Delete in progress
+                      {t("Delete in progress")}
                     </StatusIndicator>
                   ) : (
                     statusIndicator
@@ -1584,7 +1742,9 @@ function OntologiesTab({
                       dismissButton={false}
                       position="top"
                       triggerType="custom"
-                      content="Delete the induced ontology first — it's grounded against this reference, so this can't be removed while it exists. Open it from Explorer → Ontologies and use Delete ontology there."
+                      content={t(
+                        "Delete the induced ontology first — it's grounded against this reference, so this can't be removed while it exists. Open it from Explorer → Ontologies and use Delete ontology there.",
+                      )}
                     >
                       {deleteButton}
                     </Popover>
@@ -1599,33 +1759,52 @@ function OntologiesTab({
         empty={
           <Box textAlign="center">
             {typeFilter === "induced"
-              ? "No induced ontologies yet. Run an induction and accept its proposal to see one here."
+              ? t(
+                  "No induced ontologies yet. Run an induction and accept its proposal to see one here.",
+                )
               : typeFilter === "foundational"
-                ? "No foundational ontologies loaded yet. Load one from the catalog below."
+                ? t(
+                    "No foundational ontologies loaded yet. Load one from the catalog below.",
+                  )
                 : typeFilter === "uploaded"
-                  ? "No uploaded ontologies yet. Use Upload your own ontology above."
-                  : "No reference ontologies yet. Load one from the catalog, or upload your own."}
+                  ? t(
+                      "No uploaded ontologies yet. Use Upload your own ontology above.",
+                    )
+                  : t(
+                      "No reference ontologies yet. Load one from the catalog, or upload your own.",
+                    )}
           </Box>
         }
         header={
           <Header
             counter={`(${sortedItems.length})`}
-            description="Ontologies available for grounding. Load one from the catalog, or upload your own."
+            description={t(
+              "Ontologies available for grounding. Load one from the catalog, or upload your own.",
+            )}
             actions={
               <SpaceBetween direction="horizontal" size="xs">
                 <SegmentedControl
                   selectedId={typeFilter}
                   onChange={({ detail }) => setTypeFilter(detail.selectedId)}
-                  label="Filter by ontology type"
+                  label={t("Filter by ontology type")}
                   options={[
-                    { id: "all", text: `All (${nonInducedItems.length})` },
+                    {
+                      id: "all",
+                      text: t("All ({count})", {
+                        count: nonInducedItems.length,
+                      }),
+                    },
                     {
                       id: "uploaded",
-                      text: `Uploaded (${uploadedCount})`,
+                      text: t("Uploaded ({count})", {
+                        count: uploadedCount,
+                      }),
                     },
                     {
                       id: "foundational",
-                      text: `Foundational (${foundationalCount})`,
+                      text: t("Foundational ({count})", {
+                        count: foundationalCount,
+                      }),
                     },
                   ]}
                 />
@@ -1634,18 +1813,18 @@ function OntologiesTab({
                   loading={loading}
                   onClick={() => setRefreshKey((k) => k + 1)}
                 >
-                  Refresh
+                  {t("Refresh")}
                 </Button>
                 <Button
                   iconName="upload"
                   onClick={() => setShowUploadModal(true)}
                 >
-                  Upload your own ontology
+                  {t("Upload your own ontology")}
                 </Button>
               </SpaceBetween>
             }
           >
-            Reference Ontologies
+            {t("Reference Ontologies")}
           </Header>
         }
       />
@@ -1653,13 +1832,13 @@ function OntologiesTab({
         <Modal
           visible
           onDismiss={() => setShowUploadModal(false)}
-          header="Upload your own ontology"
+          header={t("Upload your own ontology")}
           size="medium"
           footer={
             <Box float="right">
               <SpaceBetween direction="horizontal" size="xs">
                 <Button onClick={() => setShowUploadModal(false)}>
-                  Cancel
+                  {t("Cancel")}
                 </Button>
                 <Button
                   variant="primary"
@@ -1671,7 +1850,7 @@ function OntologiesTab({
                     !uploadTitle
                   }
                 >
-                  Upload
+                  {t("Upload")}
                 </Button>
               </SpaceBetween>
             </Box>
@@ -1679,9 +1858,9 @@ function OntologiesTab({
         >
           <SpaceBetween size="m">
             <Box variant="small" color="text-status-inactive">
-              Upload your own ontology file (Turtle, RDF/XML, or JSON-LD). For a
-              curated public ontology (e.g. FIBO, Schema.org), use the{" "}
-              <b>Load</b> action on its catalog row instead.
+              {t(
+                "Upload your own ontology file (Turtle, RDF/XML, or JSON-LD). For a curated public ontology (e.g. FIBO, Schema.org), use the Load action on its catalog row instead.",
+              )}
             </Box>
             {uploadError && (
               <Alert
@@ -1693,8 +1872,10 @@ function OntologiesTab({
               </Alert>
             )}
             <FormField
-              label="Ontology IRI"
-              description="Canonical IRI (e.g. http://example.org/myonto/). Used as the ontology_id."
+              label={t("Ontology IRI")}
+              description={t(
+                "Canonical IRI (e.g. http://example.org/myonto/). Used as the ontology_id.",
+              )}
             >
               <Input
                 value={uploadOntologyId}
@@ -1702,16 +1883,18 @@ function OntologiesTab({
                 placeholder="https://example.org/my-ontology/"
               />
             </FormField>
-            <FormField label="Display title">
+            <FormField label={t("Display title")}>
               <Input
                 value={uploadTitle}
                 onChange={({ detail }) => setUploadTitle(detail.value)}
-                placeholder="My internal ontology"
+                placeholder={t("My internal ontology")}
               />
             </FormField>
             <FormField
-              label="File"
-              description="Turtle (.ttl), RDF/XML (.rdf), or JSON-LD (.jsonld)."
+              label={t("File")}
+              description={t(
+                "Turtle (.ttl), RDF/XML (.rdf), or JSON-LD (.jsonld).",
+              )}
             >
               <FileUpload
                 value={uploadFiles}
@@ -1721,10 +1904,9 @@ function OntologiesTab({
                 showFileLastModified
                 showFileSize
                 i18nStrings={{
-                  uploadButtonText: () => "Choose file",
-                  dropzoneText: () => "Drop ontology file here",
-                  removeFileAriaLabel: () => "Remove file",
-                  errorIconAriaLabel: "Error",
+                  // App copy ("ontology file"); the button, remove and error
+                  // strings come from the I18nProvider.
+                  dropzoneText: () => t("Drop ontology file here"),
                 }}
               />
             </FormField>
@@ -1742,6 +1924,7 @@ function ProposalsTab({
   apiClient: ApiClient;
   namespace?: string;
 }) {
+  const { t } = useAppI18n();
   const [items, setItems] = useState<Proposal[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -1750,7 +1933,7 @@ function ProposalsTab({
   useEffect(() => {
     if (!namespace) return;
     setLoading(true);
-    listProposals(apiClient, namespace)
+    listAllProposals(apiClient, namespace)
       .then(setItems)
       .finally(() => setLoading(false));
   }, [apiClient, namespace, refreshKey]);
@@ -1779,7 +1962,7 @@ function ProposalsTab({
       columnDefinitions={[
         {
           id: "id",
-          header: "Proposal ID",
+          header: t("Proposal ID"),
           sortingField: "proposal_id",
           // Show the full UUID — it's the proposal's only unique identifier
           // (proposal_id == the induction job_id, minted as uuid4). A proposal
@@ -1801,27 +1984,34 @@ function ProposalsTab({
         },
         {
           id: "status",
-          header: "Status",
+          header: t("Status"),
           sortingField: "status",
           cell: (e) => {
-            const { type, label } = proposalStatusDisplay(e.status);
-            return <StatusIndicator type={type}>{label}</StatusIndicator>;
+            const { type } = proposalStatusDisplay(e.status);
+            return (
+              <StatusIndicator type={type}>
+                {proposalStatusText(e.status, t)}
+              </StatusIndicator>
+            );
           },
         },
         {
           id: "type",
-          header: "Type",
+          header: t("Type"),
           // STRUCTURED vs UNSTRUCTURED induction. Makes the Scope unit
           // explicit (tables vs classes) and disambiguates same-ontology runs.
           sortingComparator: (a, b) =>
             proposalSourceTypeLabel(a.source_type).localeCompare(
               proposalSourceTypeLabel(b.source_type),
             ),
-          cell: (e) => proposalSourceTypeLabel(e.source_type),
+          cell: (e) =>
+            e.source_type === "UNSTRUCTURED"
+              ? t("Unstructured")
+              : t("Structured"),
         },
         {
           id: "scope",
-          header: "Scope",
+          header: t("Scope"),
           // A per-run size that means something for both source types:
           // tables processed for structured runs, classes induced for
           // unstructured. A single label can't disambiguate co-named runs
@@ -1830,16 +2020,29 @@ function ProposalsTab({
           sortingComparator: (a, b) =>
             proposalScopeSortKey(a.metadata, a.source_type) -
             proposalScopeSortKey(b.metadata, b.source_type),
-          cell: (e) => proposalScope(e.metadata, e.source_type) ?? "—",
+          cell: (e) => {
+            const value = proposalScopeSortKey(e.metadata, e.source_type);
+            if (value < 0) return "—";
+            return t(
+              e.source_type === "UNSTRUCTURED"
+                ? value === 1
+                  ? "{count} class"
+                  : "{count} classes"
+                : value === 1
+                  ? "{count} table"
+                  : "{count} tables",
+              { count: value },
+            );
+          },
         },
         {
           id: "created",
-          header: "Created",
+          header: t("Created"),
           sortingField: "created_at",
           cell: (e) => formatTimestamp(e.created_at),
         },
       ]}
-      empty={<Box textAlign="center">No proposals yet.</Box>}
+      empty={<Box textAlign="center">{t("No proposals yet.")}</Box>}
       header={
         <Header
           counter={`(${items.length})`}
@@ -1849,11 +2052,11 @@ function ProposalsTab({
               loading={loading}
               onClick={() => setRefreshKey((k) => k + 1)}
             >
-              Refresh
+              {t("Refresh")}
             </Button>
           }
         >
-          Proposals
+          {t("Proposals")}
         </Header>
       }
     />

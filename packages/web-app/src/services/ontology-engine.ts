@@ -13,6 +13,9 @@
  */
 import type { OntologyRecord } from "@coa/control-plane-client";
 import type { ApiClient } from "../components/ApiClientProvider";
+import { collectAllPages } from "../utils/pagination";
+
+export { LIST_ALL_MAX_PAGES } from "../utils/pagination";
 
 // ─── Types ─────────────────────────────────────────────────────────────
 
@@ -39,6 +42,10 @@ export interface InductionJob {
    * No new proposal is created in that case, so the client must redirect HERE
    * (not to the job id, which has no proposal row → 404). */
   duplicate_of?: string;
+  /** Set on a document-to-table bridge job (``bridge_to_tables``) once it
+   * completes. ``proposal_id`` names the pending proposal it created; it is
+   * absent when the run found nothing to change (no proposal row). */
+  bridge_report?: { proposal_id?: string } & Record<string, unknown>;
 }
 
 export interface Proposal {
@@ -236,19 +243,76 @@ export async function getInductionJob(
 
 // ─── Proposals ─────────────────────────────────────────────────────────
 
+/** One page of the Smithy ``ListProposals`` output. */
+export interface ListProposalsPage {
+  proposals: Proposal[];
+  /** Present only when more proposals may follow; pass back as ``nextToken``. */
+  nextToken?: string;
+}
+
+type ListProposalsOpts = {
+  ontologyId?: string;
+  status?: string;
+  type?: string;
+  source_type?: string;
+  maxResults?: number;
+  nextToken?: string;
+};
+
+/**
+ * Fetch one page of a namespace's proposals (the first page unless
+ * ``opts.nextToken`` is given). Query keys use the contract's camelCase.
+ *
+ * Also accepts the pre-pagination bare-array response, so the UI keeps working
+ * against a backend rolled back to before the ``ListProposals`` envelope.
+ */
+export async function listProposalsPage(
+  apiClient: ApiClient,
+  namespace: string,
+  opts?: ListProposalsOpts,
+): Promise<ListProposalsPage> {
+  const page = await apiClient.get<ListProposalsPage | Proposal[]>(
+    `/namespaces/${encodeURIComponent(namespace)}/proposals${qs(opts ?? {})}`,
+  );
+  if (Array.isArray(page)) return { proposals: page };
+  if (!Array.isArray(page?.proposals)) {
+    console.warn("ListProposals response has no proposals list", {
+      namespace,
+    });
+    return { proposals: [], nextToken: page?.nextToken };
+  }
+  return { proposals: page.proposals, nextToken: page.nextToken };
+}
+
+/**
+ * List the first page of a namespace's proposals. Use
+ * {@link listAllProposals} when the caller needs every proposal (e.g. to
+ * decide whether ANY proposal blocks a new induction).
+ */
 export async function listProposals(
   apiClient: ApiClient,
   namespace: string,
-  opts?: {
-    ontology_id?: string;
-    status?: string;
-    type?: string;
-    limit?: number;
-  },
+  opts?: ListProposalsOpts,
 ): Promise<Proposal[]> {
-  return apiClient.get<Proposal[]>(
-    `/namespaces/${encodeURIComponent(namespace)}/proposals${qs(opts ?? {})}`,
-  );
+  return (await listProposalsPage(apiClient, namespace, opts)).proposals;
+}
+
+/**
+ * List every proposal in a namespace by following ``nextToken`` to the end
+ * (see {@link collectAllPages} for the short/empty-page and loop-guard rules).
+ */
+export async function listAllProposals(
+  apiClient: ApiClient,
+  namespace: string,
+  opts?: Omit<ListProposalsOpts, "nextToken">,
+): Promise<Proposal[]> {
+  return collectAllPages("ListProposals", async (nextToken) => {
+    const page = await listProposalsPage(apiClient, namespace, {
+      ...opts,
+      nextToken,
+    });
+    return { items: page.proposals, nextToken: page.nextToken };
+  });
 }
 
 export async function getProposal(
@@ -307,17 +371,12 @@ export async function fetchJsonFromUrl(url: string): Promise<unknown> {
 }
 
 /**
- * Upload Turtle directly to S3 via a presigned PUT URL — the write-side mirror
- * of {@link fetchTurtleFromUrl}.
+ * Upload Turtle directly to S3 via a create-only presigned PUT URL.
  *
- * Why straight to S3 (and NOT through apiClient / the Lambda proxy): a large
- * edited ontology (6+ MB) sent inline in an update request would exceed the
- * 6 MB API Gateway / Lambda *request* payload limit and fail before ever
- * reaching the backend — the inverse of the response-limit problem the read
- * path avoids. The presigned URL carries its own auth, so this MUST NOT go
- * through apiClient. Content-Type is intentionally not part of the signature,
- * so sending ``text/turtle`` is safe and keeps the stored object's type
- * consistent with the read path.
+ * The URL carries its own authorization and signs ``If-None-Match: *``, so
+ * this request must bypass apiClient and include that exact header. The
+ * precondition prevents a replay from replacing bytes that UpdateProposal
+ * already validated. Content-Type remains unsigned.
  */
 export async function putToPresignedUrl(
   url: string,
@@ -326,14 +385,25 @@ export async function putToPresignedUrl(
 ): Promise<void> {
   const resp = await fetch(url, {
     method: "PUT",
-    headers: { "Content-Type": contentType },
+    headers: {
+      "Content-Type": contentType,
+      "If-None-Match": "*",
+    },
     body,
   });
-  if (!resp.ok) {
+  if (resp.ok) return;
+
+  if (resp.status === 409 || resp.status === 412) {
     throw new Error(
-      `Failed to upload to S3 (${resp.status} ${resp.statusText})`,
+      `The proposal revision already has an upload or the write outcome conflicted (${resp.status} ${resp.statusText}). Save again to create a fresh revision and re-upload.`,
     );
   }
+  if (resp.status === 403) {
+    throw new Error(
+      `Failed to upload to S3 (403 ${resp.statusText}). The upload URL may have expired or a required signed header may be missing. Save again to request a fresh revision.`,
+    );
+  }
+  throw new Error(`Failed to upload to S3 (${resp.status} ${resp.statusText})`);
 }
 
 /**
@@ -345,8 +415,16 @@ export async function getProposalUploadUrls(
   apiClient: ApiClient,
   namespace: string,
   proposalId: string,
-): Promise<{ ontology_put_url: string; r2rml_put_url: string }> {
-  return apiClient.post<{ ontology_put_url: string; r2rml_put_url: string }>(
+): Promise<{
+  revisionId: string;
+  ontologyPutUrl: string;
+  r2rmlPutUrl: string;
+}> {
+  return apiClient.post<{
+    revisionId: string;
+    ontologyPutUrl: string;
+    r2rmlPutUrl: string;
+  }>(
     `/namespaces/${encodeURIComponent(namespace)}/proposals/${encodeURIComponent(proposalId)}/upload-url`,
     {},
   );
@@ -387,7 +465,9 @@ export async function updateProposal(
     r2rml_turtle?: string;
     ontology_uploaded?: boolean;
     r2rml_uploaded?: boolean;
-    grounding_overrides?: Record<string, string | null>;
+    grounding_overrides?: Record<string, string>;
+    novel_tables?: string[];
+    upload_revision_id?: string;
   },
 ): Promise<{ proposal_id: string; status: string }> {
   return apiClient.post<{ proposal_id: string; status: string }>(
@@ -550,6 +630,10 @@ export function hasOntologyId(o: OntologyRecord): o is ListedOntology {
   return typeof o.ontologyId === "string" && o.ontologyId.length > 0;
 }
 
+/**
+ * List a namespace's ontologies. Follows ``nextToken`` across every page unless
+ * ``opts.limit`` is given, in which case only that one bounded page is fetched.
+ */
 export async function listOntologies(
   apiClient: ApiClient,
   namespace: string,
@@ -562,10 +646,20 @@ export async function listOntologies(
   // Unwraps the `{ontologies: [...]}` envelope the Smithy contract declares.
   // `?? []` guards a legacy deployment still emitting a bare array: callers get
   // an empty list rather than a crash mid-render.
-  const out = await apiClient.get<{ ontologies?: OntologyRecord[] }>(
-    `/namespaces/${encodeURIComponent(namespace)}/ontologies${qs(opts ?? {})}`,
-  );
-  return (out.ontologies ?? []).filter(hasOntologyId);
+  const fetchPage = async (nextToken: string | undefined) => {
+    const out = await apiClient.get<{
+      ontologies?: OntologyRecord[];
+      nextToken?: string;
+    }>(
+      `/namespaces/${encodeURIComponent(namespace)}/ontologies${qs({ ...opts, nextToken })}`,
+    );
+    return { items: out.ontologies ?? [], nextToken: out.nextToken };
+  };
+  const rows =
+    opts?.limit !== undefined
+      ? (await fetchPage(undefined)).items
+      : await collectAllPages("ListOntologies", fetchPage);
+  return rows.filter(hasOntologyId);
 }
 
 /**
@@ -800,13 +894,26 @@ export interface InducedDatasource {
   novel_classes_created: number;
 }
 
+/**
+ * List every datasource behind a namespace's accepted proposals, following
+ * ``nextToken`` across pages. Accepts both the paginated
+ * ``{datasources: [...], nextToken}`` envelope and the bare array older
+ * deployments returned.
+ */
 export async function listInducedDatasources(
   apiClient: ApiClient,
   namespace: string,
 ): Promise<InducedDatasource[]> {
-  return apiClient.get<InducedDatasource[]>(
-    `/namespaces/${encodeURIComponent(namespace)}/induce/datasources/induced`,
-  );
+  return collectAllPages("ListInducedDatasources", async (nextToken) => {
+    const out = await apiClient.get<
+      | InducedDatasource[]
+      | { datasources?: InducedDatasource[]; nextToken?: string }
+    >(
+      `/namespaces/${encodeURIComponent(namespace)}/induce/datasources/induced${qs({ nextToken })}`,
+    );
+    if (Array.isArray(out)) return { items: out };
+    return { items: out?.datasources ?? [], nextToken: out?.nextToken };
+  });
 }
 
 // ─── Foundational ontologies ───────────────────────────────────────────

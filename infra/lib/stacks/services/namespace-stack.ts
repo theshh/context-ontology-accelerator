@@ -17,7 +17,9 @@ import { DynamoDBTable } from "../../constructs/dynamodb-table";
 import { Paths, fromRoot } from "../../paths";
 import { resolveContext } from "../../context";
 import { bundlePython } from "../../utils/python-bundling";
+import { grantIdempotencyTable } from "../../utils/idempotency";
 import { NamespaceDeletionPipeline } from "./namespace-deletion-pipeline";
+import { METRIC_API_FUNCTION_NAME } from "./metric-service-stack";
 import { TABLE_NAMES } from "@coa/shared";
 
 export interface NamespaceStackProps extends cdk.StackProps {
@@ -531,6 +533,11 @@ export class NamespaceStack extends SCLStack {
           "    tags: smithy.api#String",
           "    enrichmentSource: smithy.api#String",
           "    reviewStatus: smithy.api#String",
+          // JSON-encoded list of the table fields COA generated in full
+          // ("description", "synonyms", "glossaryTerms", "tags"). Optional:
+          // assets written before this member existed omit it and read as an
+          // empty set, which proves nothing.
+          "    generatedFields: smithy.api#String",
           "    primaryKeyColumns: smithy.api#String",
           "    primaryKeySource: smithy.api#String",
           "    primaryKeyConfidence: smithy.api#Float",
@@ -563,7 +570,13 @@ export class NamespaceStack extends SCLStack {
 
     assetTypeFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ["datazone:CreateAssetType", "datazone:DeleteAssetType"],
+        // GetAssetType lets an Update verify which form-type revision the
+        // asset type currently pins before and after creating a new revision.
+        actions: [
+          "datazone:CreateAssetType",
+          "datazone:GetAssetType",
+          "datazone:DeleteAssetType",
+        ],
         resources: ["*"],
       }),
     );
@@ -640,7 +653,9 @@ export class NamespaceStack extends SCLStack {
         Paths.commonLib,
         Paths.smithyGeneratedControlPlanePythonServer,
       ],
-      requirementsFile: fromRoot("packages/control-plane/requirements.txt"),
+      requirementsFile: fromRoot(
+        "packages/control-plane/requirements.lock.txt",
+      ),
     });
 
     // ── Namespace API Lambda (combined create + list + delete-trigger) ──
@@ -698,6 +713,8 @@ export class NamespaceStack extends SCLStack {
     );
 
     namespaces.table.grantReadWriteData(namespaceApiFn);
+    // CreateNamespace is retry-safe with a caller-supplied clientToken.
+    grantIdempotencyTable(this, namespaceApiFn);
     props.rolesTable.grantReadWriteData(namespaceApiFn);
     props.resourceRoleMappingsTable.grantReadWriteData(namespaceApiFn);
 
@@ -814,6 +831,7 @@ export class NamespaceStack extends SCLStack {
     const deletionPipeline: NamespaceDeletionPipeline =
       new NamespaceDeletionPipeline(this, "DeletionPipeline", {
         prefixed: (name: string) => this.prefixed(name),
+        aossName: (name: string) => this.aossName(name),
         lambdaCode,
         vpc: props.vpc,
         vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
@@ -822,7 +840,7 @@ export class NamespaceStack extends SCLStack {
         resourceRoleMappingsTable: props.resourceRoleMappingsTable,
         rolesTable: props.rolesTable,
         sourcesApiFnName: this.prefixed("sources-api"),
-        metricApiFnName: this.prefixed("metric-api"),
+        metricApiFnName: this.prefixed(METRIC_API_FUNCTION_NAME),
         datazoneDomainId: domain.attrId,
         // DeletePlatform assumes namespaceApiFn's own execution role for
         // datazone:DeleteProject — DataZone records the CreateProject
@@ -873,6 +891,9 @@ export class NamespaceStack extends SCLStack {
       memorySize: 256,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      // Shared platform Lambda SG (also on the two Lambdas below): a per-function
+      // auto SG is a new Hyperplane ENI combination, which costs ~228 s on first create.
+      securityGroups: [props.lambdaSecurityGroup],
       environment: {
         ROLES_TABLE: props.rolesTable.tableName,
         ALLOWED_ORIGIN: allowedOrigin,
@@ -889,6 +910,7 @@ export class NamespaceStack extends SCLStack {
       memorySize: 256,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      securityGroups: [props.lambdaSecurityGroup],
       environment: {
         ROLES_TABLE: props.rolesTable.tableName,
         ALLOWED_ORIGIN: allowedOrigin,
@@ -909,6 +931,7 @@ export class NamespaceStack extends SCLStack {
       memorySize: 256,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      securityGroups: [props.lambdaSecurityGroup],
       environment: {
         ROLES_TABLE: props.rolesTable.tableName,
         RESOURCE_ROLE_MAPPINGS_TABLE: props.resourceRoleMappingsTable.tableName,
@@ -917,6 +940,8 @@ export class NamespaceStack extends SCLStack {
     });
     props.rolesTable.grantReadData(grantsApiFn);
     props.resourceRoleMappingsTable.grantReadWriteData(grantsApiFn);
+    // CreateGrant / CreatePlatformGrant are retry-safe with a clientToken.
+    grantIdempotencyTable(this, grantsApiFn);
 
     this.grantsApiFn = grantsApiFn;
 

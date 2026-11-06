@@ -20,15 +20,24 @@ import { Construct } from "constructs";
 
 import { SCLStack } from "../../constructs/scl-stack";
 import { SclMonitoring } from "../../constructs";
-import { Paths } from "../../paths";
-import { resolveContext } from "../../context";
+import { fromRoot, Paths } from "../../paths";
+import { resolveContext, guardrailProfileResources } from "../../context";
 import { bundlePython } from "../../utils/python-bundling";
+import {
+  GRAPH_SOURCES_ENV,
+  graphSourcesEnabled,
+} from "../../utils/graph-sources";
+import { grantIdempotencyTable } from "../../utils/idempotency";
+import { grantGuardDutyAgentPull } from "../../utils/guardduty-agent";
 import { NetworkStack } from "../foundation/network-stack";
 import {
   DEFAULT_BEDROCK_MODEL_ID,
   DEFAULT_BEDROCK_CHAT_MODEL_ID,
   DEFAULT_BEDROCK_INDUCTION_MODEL_ID,
 } from "../../constants";
+
+/** Name (without the `{prefix}-{env}-` prefix) of the ontology API proxy Lambda. */
+export const ONTOLOGY_API_PROXY_FUNCTION_NAME = "ontology-api-proxy";
 
 export interface OntologyStackProps extends cdk.StackProps {
   readonly network: NetworkStack;
@@ -64,6 +73,7 @@ export interface OntologyStackProps extends cdk.StackProps {
   readonly bedrockEmbedDimensions?: number;
   readonly bedrockInductionLlmModelId?: string;
   readonly bedrockChatModelId?: string;
+  readonly bedrockGroundingLlmModelId?: string;
   readonly alarmAction?: IAlarmActionStrategy;
 }
 
@@ -113,6 +123,9 @@ export class OntologyStack extends SCLStack {
       props.bedrockInductionLlmModelId ?? DEFAULT_BEDROCK_INDUCTION_MODEL_ID;
     const chatModelId =
       props.bedrockChatModelId ?? DEFAULT_BEDROCK_CHAT_MODEL_ID;
+    // Grounding rerank defaults to the chat (Haiku-class) model — a cheap
+    // reranker — matching the ontology-engine GROUNDING_LLM_MODEL_ID default.
+    const groundingModelId = props.bedrockGroundingLlmModelId ?? chatModelId;
 
     // ── OpenSearch config via SSM ──────────────────────────────────────
     const opensearchEndpoint = ssm.StringParameter.valueForStringParameter(
@@ -203,6 +216,7 @@ export class OntologyStack extends SCLStack {
       cpu,
       memoryLimitMiB,
     });
+    grantGuardDutyAgentPull(taskDef);
 
     const logGroup = new logs.LogGroup(this, "OntologyLogGroup", {
       logGroupName: `/ecs/${this.prefixed("ontology-engine")}`,
@@ -220,6 +234,18 @@ export class OntologyStack extends SCLStack {
     const ecrRepositoryName = this.node.tryGetContext("ecr_repository_name") as
       | string
       | undefined;
+
+    // String(): context from cdk.json may be a non-string; CLI values always are.
+    const oopsEndpoint = String(
+      this.node.tryGetContext("oops_endpoint") ?? "",
+    ).trim();
+    // The scan POSTs the whole serialised ontology, so never over plaintext.
+    // URL schemes are case-insensitive (RFC 3986), so HTTPS:// is accepted too.
+    if (oopsEndpoint && !/^https:\/\//i.test(oopsEndpoint)) {
+      throw new Error(
+        `oops_endpoint must be an https:// URL (got "${oopsEndpoint}"): the OoPS! scan sends the serialised ontology to it.`,
+      );
+    }
 
     let containerImage: ecs.ContainerImage;
     if (imageUri && ecrRepositoryArn && ecrRepositoryName) {
@@ -263,6 +289,10 @@ export class OntologyStack extends SCLStack {
         DESCRIPTION_LLM_MODEL_ID: inductionModelId,
         // Shared BedrockClient default (constraint inference / nl_generator).
         BEDROCK_CHAT_MODEL_ID: chatModelId,
+        // Grounding reranker model (ontology-engine). Defaults to the chat
+        // (Haiku-class) model; override via bedrockGroundingLlmModelId for a
+        // region-valid profile on a non-US deploy (GH #236).
+        GROUNDING_LLM_MODEL_ID: groundingModelId,
         LLM_REGION: cdk.Aws.REGION,
         // SSM path to the Bedrock guardrail id — the app resolves it at runtime
         // and applies content filtering to LLM calls (constraint inference).
@@ -276,6 +306,13 @@ export class OntologyStack extends SCLStack {
         SOURCES_API_FN_NAME: `${this.prefixed("sources-api")}`,
         INDUCE_OUTPUT_DIR: "/tmp/induce",
         PORT: String(this.containerPort),
+        // Optional OoPS! pitfall scan (Tier-3 validation). It sends the
+        // serialised ontology to this endpoint, so it is opt-in: absent context
+        // leaves the variable unset and the validator makes no request.
+        ...(oopsEndpoint && { OOPS_ENDPOINT: oopsEndpoint }),
+        // Ontology import binds classes to RDF_SPARQL graph sources only with
+        // `-c graph_sources=on`; absent means off.
+        ...(graphSourcesEnabled(this.node) && { [GRAPH_SOURCES_ENV]: "true" }),
       },
       portMappings: [
         {
@@ -335,7 +372,7 @@ export class OntologyStack extends SCLStack {
       this,
       "OSSDataAccessPolicy",
       {
-        name: this.prefixed("ontology-oss"),
+        name: this.aossName("ontology-oss"),
         type: "data",
         policy: JSON.stringify([
           {
@@ -405,6 +442,7 @@ export class OntologyStack extends SCLStack {
           `arn:aws:bedrock:*::foundation-model/*`,
           `arn:aws:bedrock:*:${account}:inference-profile/*`,
           `arn:aws:bedrock:${region}:${account}:guardrail/*`,
+          ...guardrailProfileResources(this),
         ],
       }),
     );
@@ -593,17 +631,25 @@ export class OntologyStack extends SCLStack {
     new events.Rule(this, "OntologyTaskOomRule", {
       ruleName: this.prefixed("ontology-oom"),
       description:
-        "Ontology induction ECS task stopped by OOM (exit 137 / OutOfMemory stoppedReason)",
+        "Ontology induction ECS task stopped by OOM (OutOfMemory reason, or an essential container that exited 137)",
       eventPattern: {
         source: ["aws.ecs"],
         detailType: ["ECS Task State Change"],
         detail: {
           clusterArn: [this.cluster.clusterArn],
           lastStatus: ["STOPPED"],
-          // Either the OOM stoppedReason OR any container that exited 137.
+          // Exit 137 alone is any SIGKILL, including ECS killing a task that
+          // outlived its stop timeout during a deploy (stopCode
+          // ServiceSchedulerInitiated). Count it only when the essential
+          // container died on its own; an OOM during a stop still matches on
+          // its OutOfMemory reason.
           $or: [
             { stoppedReason: [{ wildcard: "*OutOfMemory*" }] },
-            { containers: { exitCode: [137] } },
+            { containers: { reason: [{ wildcard: "*OutOfMemory*" }] } },
+            {
+              stopCode: ["EssentialContainerExited"],
+              containers: { exitCode: [137] },
+            },
           ],
         },
       },
@@ -730,8 +776,16 @@ export class OntologyStack extends SCLStack {
     // container environment above (#94) — they used to be duplicate literals, so
     // a model change for a non-US deploy left these widgets querying a
     // dimension with no data.
-    const rerankModelId = inductionModelId; // configured LLM_MODEL_ID
-    const haikuModelId = chatModelId; // actual rerank/enrichment invoker
+    //
+    // Three DISTINCT Bedrock invokers feed these widgets, each priced on its
+    // own tier — never overload one slot across two models, or a token series
+    // gets double-counted / mispriced (grounding is Haiku-class, induction is
+    // Sonnet-class). Grounding defaults to the chat model, so its term/series
+    // is only emitted when it actually differs — otherwise the default deploy
+    // would plot and charge the same Haiku series twice.
+    const sonnetModelId = inductionModelId; // induction + description generation (Sonnet-priced)
+    const haikuModelId = chatModelId; // enrichment / doc-ingestion invoker (Haiku-priced)
+    const groundingDistinct = groundingModelId !== chatModelId;
 
     // ponytail: Hardcoded us-west-2 on-demand list prices (USD per 1K tokens) as of
     // 2026-07-21 — CloudWatch math cannot look prices up, so these MUST be updated by
@@ -920,13 +974,19 @@ export class OntologyStack extends SCLStack {
       new cloudwatch.GraphWidget({
         title: "AWS/Bedrock per-model",
         left: [
-          bedrockModelMetric("Invocations", rerankModelId),
+          bedrockModelMetric("Invocations", sonnetModelId),
           bedrockModelMetric("Invocations", haikuModelId),
+          ...(groundingDistinct
+            ? [bedrockModelMetric("Invocations", groundingModelId)]
+            : []),
           bedrockModelMetric("Invocations", embedModelId),
         ],
         right: [
-          bedrockModelMetric("InvocationThrottles", rerankModelId),
+          bedrockModelMetric("InvocationThrottles", sonnetModelId),
           bedrockModelMetric("InvocationThrottles", haikuModelId),
+          ...(groundingDistinct
+            ? [bedrockModelMetric("InvocationThrottles", groundingModelId)]
+            : []),
           bedrockModelMetric("InvocationThrottles", embedModelId),
         ],
         leftYAxis: { label: "invocations", showUnits: false },
@@ -942,14 +1002,34 @@ export class OntologyStack extends SCLStack {
         metrics: [
           new cloudwatch.MathExpression({
             // Total Bedrock spend: tokens are counts, so divide each term by 1000.
+            // si/so = induction (Sonnet), hi/ho = chat/enrichment (Haiku),
+            // ei = embed (input-only). gi/go = grounding (Haiku), added only
+            // when the grounding model differs from the chat model — otherwise
+            // its tokens are already the hi/ho series and would be double-charged.
             // Cohere embed is input-only (no output term).
-            expression: `si*${sonnetInputPer1K}/1000 + so*${sonnetOutputPer1K}/1000 + hi*${haikuInputPer1K}/1000 + ho*${haikuOutputPer1K}/1000 + ei*${embedInputPer1K}/1000`,
+            expression: [
+              `si*${sonnetInputPer1K}/1000 + so*${sonnetOutputPer1K}/1000`,
+              `hi*${haikuInputPer1K}/1000 + ho*${haikuOutputPer1K}/1000`,
+              ...(groundingDistinct
+                ? [`gi*${haikuInputPer1K}/1000 + go*${haikuOutputPer1K}/1000`]
+                : []),
+              `ei*${embedInputPer1K}/1000`,
+            ].join(" + "),
             label: "Est. cost (USD)",
             usingMetrics: {
-              si: bedrockModelMetric("InputTokenCount", rerankModelId),
-              so: bedrockModelMetric("OutputTokenCount", rerankModelId),
+              si: bedrockModelMetric("InputTokenCount", sonnetModelId),
+              so: bedrockModelMetric("OutputTokenCount", sonnetModelId),
               hi: bedrockModelMetric("InputTokenCount", haikuModelId),
               ho: bedrockModelMetric("OutputTokenCount", haikuModelId),
+              ...(groundingDistinct
+                ? {
+                    gi: bedrockModelMetric("InputTokenCount", groundingModelId),
+                    go: bedrockModelMetric(
+                      "OutputTokenCount",
+                      groundingModelId,
+                    ),
+                  }
+                : {}),
               ei: bedrockModelMetric("InputTokenCount", embedModelId),
             },
             period: defaultPeriod,
@@ -985,8 +1065,11 @@ export class OntologyStack extends SCLStack {
           // Rerank errors are intentionally absent — the emitter publishes no
           // rerank-errors metric (out of scope for this consolidation).
           inductionSearch("InductionJobErrors", "Sum", "Job errors"),
-          bedrockModelMetric("InvocationThrottles", rerankModelId),
+          bedrockModelMetric("InvocationThrottles", sonnetModelId),
           bedrockModelMetric("InvocationThrottles", haikuModelId),
+          ...(groundingDistinct
+            ? [bedrockModelMetric("InvocationThrottles", groundingModelId)]
+            : []),
           bedrockModelMetric("InvocationThrottles", embedModelId),
         ],
         width: 24,
@@ -1034,26 +1117,19 @@ export class OntologyStack extends SCLStack {
     // API Proxy Lambda (forwards API Gateway → ECS via Cloud Map DNS)
     // ================================================================
     const apiProxyFn = new lambda.Function(this, "ApiProxyFn", {
-      functionName: this.prefixed("ontology-api-proxy"),
+      functionName: this.prefixed(ONTOLOGY_API_PROXY_FUNCTION_NAME),
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: "coa_ontology.api_proxy_handler.handler",
       // Merges libs/common/src into the asset root so
       // `coa_common` (used for resolve_region) is importable.
-      // Its transitive deps (structlog, pydantic-settings, etc. — see
-      // libs/common/pyproject.toml) must be installed explicitly since this
-      // Lambda has no requirements.txt of its own; mirrors the pipDeps used
-      // wherever else commonLib is bundled (e.g. api-stack.ts).
+      // Its runtime deps (structlog, pydantic-settings, etc. — see
+      // libs/common/pyproject.toml) are listed in the requirements file next
+      // to the handler's lock, since the Lambda has no package of its own.
       code: bundlePython({
         srcDirs: [Paths.ontologyEngineSrc, Paths.commonLib],
-        pipDeps: [
-          "cedarpy>=4.8.0",
-          "pydantic>=2.0",
-          "pydantic-settings>=2.0",
-          "structlog>=24.0",
-          "cryptography>=43.0",
-          "PyJWT>=2.9.0",
-          "requests>=2.32.0",
-        ],
+        requirementsFile: fromRoot(
+          "packages/ontology-engine/lambda/api-proxy/requirements.lock.txt",
+        ),
       }),
       timeout: cdk.Duration.seconds(60),
       memorySize: 256,
@@ -1072,6 +1148,9 @@ export class OntologyStack extends SCLStack {
         ALLOWED_ORIGIN: props.allowedOrigin,
       },
     });
+    // StartInduction is retry-safe with a clientToken; the proxy (not the ECS
+    // service) enforces it because only it sees the caller identity.
+    grantIdempotencyTable(this, apiProxyFn);
     // System-health check describes only the sources table (SOURCES_TABLE).
     apiProxyFn.addToRolePolicy(
       new iam.PolicyStatement({

@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+from coa_common.bedrock import PromptSegment, prompt_text
 from coa_common.domain_models import Column
+from coa_common.language_tags import describe_language, needs_language_instruction
 
 SYSTEM_PROMPT = """\
 You are a data catalog expert. \
@@ -61,7 +63,34 @@ If a column has a source comment (shown after "--"), use it as-is for the descri
 to improve both the table description and the column descriptions."""
 
 
-def build_user_prompt(
+def build_system_prompt(namespace_language: str) -> str:
+    """Return the trusted system prompt for a namespace language.
+
+    An English namespace (primary subtag ``en``) gets :data:`SYSTEM_PROMPT`
+    unchanged. Any other language appends a fixed output-language instruction.
+
+    The instruction is application-owned control text, so it lives in the system
+    prompt: the table schema, identifiers, comments and external evidence stay
+    in the user message, which is what the Bedrock guardrail's prompt-attack
+    filter screens. Only the canonical tag and a name from a fixed table are
+    interpolated.
+    """
+    if not needs_language_instruction(namespace_language):
+        return SYSTEM_PROMPT
+    target = describe_language(namespace_language)
+    return (
+        SYSTEM_PROMPT + "\n\nOutput language:\n"
+        f"- Write every newly generated description, synonym, glossary term, and tag in {target}.\n"
+        f"- A synonym is another name a business user would use in {target}. Do not add an English "
+        "translation of a table or column name, or an English-style identifier made from it (such as a "
+        "snake_case name), as a synonym. An abbreviation or code that the source itself uses may stay as written.\n"
+        "- Keep table names, column names, and other identifiers (model numbers, product names, "
+        "units, codes) exactly as they appear. Do not translate or transliterate them.\n"
+        "- Reproduce existing metadata and source comments unchanged, even when they use another language."
+    )
+
+
+def build_user_prompt_segments(
     table_name: str,
     database: str,
     columns: list[Column],
@@ -70,9 +99,16 @@ def build_user_prompt(
     existing_pk: list[str] | None = None,
     existing_fks: list[dict] | None = None,
     extra_context: str = "",
-    extra_context_hint: str = "",
-) -> str:
-    """Build the user prompt with table schema details and existing metadata.
+) -> list[PromptSegment]:
+    """Build the user message as ordered segments with table schema details and existing metadata.
+
+    Everything derived from the source (table and database names, column names,
+    types and comments, existing description, keys, external evidence) is a
+    guarded segment, so the Bedrock guardrail screens it. The headings and fixed
+    instructions written here are unguarded: the guardrail's prompt-attack filter
+    otherwise flags the application's own "you MUST generate" wording on a small
+    table, where it outweighs the schema. Line formatting next to source data
+    stays inside the guarded segment.
 
     Args:
         table_name: Name of the table being enriched.
@@ -82,11 +118,10 @@ def build_user_prompt(
         existing_pk: Known primary-key columns to preserve, if any.
         existing_fks: Known foreign-key relationships to preserve, if any.
         extra_context: Domain knowledge appended as "External evidence" section.
-        extra_context_hint: Specific instructions for how to interpret the evidence
-            (e.g., "Emit one foreign_key per dependency. Use target_table='__any__'.").
 
     Returns:
-        The assembled prompt string sent to the enrichment model.
+        Ordered segments. Their concatenation is the text the model sees, see
+        :func:`build_user_prompt`.
     """
     col_lines = []
     for c in columns:
@@ -94,7 +129,12 @@ def build_user_prompt(
         if c.business_metadata.description:
             line += f"  -- {c.business_metadata.description}"
         col_lines.append(line)
-    prompt = f"Table: {database}.{table_name}\n\nColumns:\n" + "\n".join(col_lines)
+    segments = [
+        PromptSegment("Table: ", guarded=False),
+        PromptSegment(f"{database}.{table_name}"),
+        PromptSegment("\n\nColumns:\n", guarded=False),
+        PromptSegment("\n".join(col_lines)),
+    ]
 
     existing_parts: list[str] = []
     if existing_description:
@@ -110,9 +150,13 @@ def build_user_prompt(
         existing_parts.append(f"columns_with_descriptions: {described}")
 
     if existing_parts:
-        prompt += "\n\nExisting metadata (reproduce these fields unchanged; generate everything else):\n" + "\n".join(
-            f"  {p}" for p in existing_parts
+        segments.append(
+            PromptSegment(
+                "\n\nExisting metadata (reproduce these fields unchanged; generate everything else):\n",
+                guarded=False,
+            )
         )
+        segments.append(PromptSegment("\n".join(f"  {p}" for p in existing_parts)))
 
     # State the requirement explicitly rather than relying on the model to
     # infer it from the *absence* of a "description:" entry above. Without
@@ -120,11 +164,39 @@ def build_user_prompt(
     # on every column) reads as "metadata already exists" and the model
     # silently omits table.description while still emitting synonyms/tags.
     if not existing_description:
-        prompt += "\n\nREQUIRED: this table has no description yet — you MUST generate a non-empty table.description."
+        segments.append(
+            PromptSegment(
+                "\n\nREQUIRED: this table has no description yet — you MUST generate a non-empty table.description.",
+                guarded=False,
+            )
+        )
 
     if extra_context:
-        prompt += "\n\nExternal evidence:\n" + extra_context
-        if extra_context_hint:
-            prompt += "\n\nInstructions for evidence:\n" + extra_context_hint
+        segments.append(PromptSegment("\n\nExternal evidence:\n", guarded=False))
+        segments.append(PromptSegment(extra_context))
 
-    return prompt
+    return segments
+
+
+def build_user_prompt(
+    table_name: str,
+    database: str,
+    columns: list[Column],
+    *,
+    existing_description: str = "",
+    existing_pk: list[str] | None = None,
+    existing_fks: list[dict] | None = None,
+    extra_context: str = "",
+) -> str:
+    """Return the user message text exactly as the model sees it (see :func:`build_user_prompt_segments`)."""
+    return prompt_text(
+        build_user_prompt_segments(
+            table_name,
+            database,
+            columns,
+            existing_description=existing_description,
+            existing_pk=existing_pk,
+            existing_fks=existing_fks,
+            extra_context=extra_context,
+        )
+    )

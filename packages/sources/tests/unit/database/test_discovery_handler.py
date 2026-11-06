@@ -690,12 +690,17 @@ class TestDiscoveryHandler:
         mock_write.return_value = {"assets_created": 0, "assets_revised": 1}
 
         # Two APPROVED tables. orders is unchanged in the fresh scan; customers
-        # drifts (column type int -> bigint) and so resets to PENDING on merge.
+        # drifts (column type int -> bigint) and so resets to PENDING on merge. orders
+        # carries curated metadata, so it is not sent back through enrichment.
         mock_read_accepted.return_value = [
             Table(
                 name="orders",
                 database="analytics_db",
-                business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+                business_metadata=BusinessMetadata(
+                    description="Curated",
+                    enrichment_source=EnrichmentSource.AI_GENERATED,
+                    review_status=ReviewStatus.APPROVED,
+                ),
                 columns=[Column(name="total", data_type="decimal")],
             ),
             Table(
@@ -1017,7 +1022,11 @@ class TestDiscoveryHandler:
             Table(
                 name="orders",
                 database="analytics_db",
-                business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+                business_metadata=BusinessMetadata(
+                    description="Curated",
+                    enrichment_source=EnrichmentSource.AI_GENERATED,
+                    review_status=ReviewStatus.APPROVED,
+                ),
                 columns=[Column(name="id", data_type="int"), Column(name="promo_code", data_type="varchar")],
             ),
         ]
@@ -1093,7 +1102,7 @@ class TestGlueOwnershipGate:
                 f"{MODULE}.assert_namespace_may_catalog",
                 side_effect=_go.GlueOwnershipError("not registered to namespace 'ns-test'"),
             ),
-            pytest.raises(RuntimeError, match="not registered to namespace"),
+            pytest.raises(_go.GlueOwnershipError, match="not registered to namespace"),
         ):
             mod._discover(
                 connector,
@@ -1270,6 +1279,54 @@ class TestDiscoveryHandlerStatusLifecycle:
         scan_update = mock_scan_dao.update.call_args_list
         assert len(scan_update) == 1
         assert "errorMessage" in scan_update[0][1]["update_fields"]
+
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    def test_scan_job_error_message_omits_aws_error_text(self, mock_get_ds, mock_get_scan):
+        """The stored errorMessage is returned to callers: AWS error code only, no ARNs."""
+        from botocore.exceptions import ClientError
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        mock_ds_dao = MagicMock()
+        mock_ds_dao.get.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "AccessDeniedException",
+                    "Message": "User: arn:aws:sts::123456789012:assumed-role/coa-discovery/x is not authorized",
+                }
+            },
+            "GetItem",
+        )
+        mock_get_ds.return_value = mock_ds_dao
+        mock_scan_dao = dao_double()
+        mock_get_scan.return_value = mock_scan_dao
+
+        with pytest.raises(PermanentScanError):
+            handler({"datasourceId": "DS#ds-1", "scanJobId": "SCAN#s-1", "namespaceId": "ns-1"}, None)
+
+        fields = mock_scan_dao.update.call_args_list[0][1]["update_fields"]
+        assert fields["errorMessage"] == "GetItem failed: AccessDeniedException"
+        assert fields["errorMessageClientSafe"] is False
+
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    def test_glue_ownership_refusal_is_stored_verbatim_and_flagged(self, mock_get_ds, mock_get_scan):
+        """The steward-facing tag hint is neither truncated nor redacted on its way to the scan job."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        hint = _go._tag_hint("123456789012", "sales_db", "0b8f0e8e-1111-4222-8333-444455556666", "us-east-1")
+        mock_ds_dao = MagicMock()
+        mock_ds_dao.get.side_effect = _go.GlueOwnershipError(hint)
+        mock_get_ds.return_value = mock_ds_dao
+        mock_scan_dao = dao_double()
+        mock_get_scan.return_value = mock_scan_dao
+
+        with pytest.raises(TransientScanError):
+            handler({"datasourceId": "DS#ds-1", "scanJobId": "SCAN#s-1", "namespaceId": "ns-1"}, None)
+
+        fields = mock_scan_dao.update.call_args_list[0][1]["update_fields"]
+        assert fields["errorMessage"] == hint
+        assert fields["errorMessageClientSafe"] is True
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2053,7 +2110,9 @@ def _open_rescan_backup(source_summary: dict | None) -> dict:
     approved_orders = Table(
         name="orders",
         database="analytics_db",
-        business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+        business_metadata=BusinessMetadata(
+            description="Curated", enrichment_source=EnrichmentSource.AI_GENERATED, review_status=ReviewStatus.APPROVED
+        ),
         columns=[Column(name="total", data_type="decimal")],
     )
     backup = {

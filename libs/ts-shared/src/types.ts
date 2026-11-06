@@ -20,6 +20,10 @@ export interface RuntimeConfig {
   readonly apiEndpoint?: string;
   /** AgentCore Runtime ARN for SSE streaming queries. Frontend constructs the invocations URL. */
   readonly serveRuntimeArn?: string;
+  /** AgentCore Runtime ARN for the MCP Server. Frontend derives the MCP endpoint URL from this + region. */
+  readonly mcpRuntimeArn?: string;
   /** Monorepo version (repo-root VERSION file) surfaced in the UI. E.g. "0.2.2". */
   readonly version?: string;
+  /** Set to true only when the deployment turns on graph sources (`graph_sources`); absent means off. */
+  readonly graphSourcesEnabled?: boolean;
 }

@@ -15,6 +15,8 @@ import {
   DEFAULT_ENV,
   DEFAULT_GRAPH_URI_BASE,
 } from "../../lib/constants";
+import { expectValidAossNames } from "../utils/aoss-name-assertions";
+import { expectAossGrantsCoveredByDataPolicies } from "../utils/aoss-access-assertions";
 
 jest.mock("../../lib/utils/python-bundling", () => ({
   bundlePython: () =>
@@ -743,6 +745,35 @@ describe("ServeStack - deep-reasoning budget variables", () => {
     });
   });
 
+  it("defaults the stop signals to off when no context is set", () => {
+    createStack().hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE: "0",
+        DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD: "0",
+        DEEP_REASONING_STABILITY_STEPS: "2",
+        DEEP_REASONING_STOP_TELEMETRY: "false",
+      }),
+    });
+  });
+
+  it("stringifies non-string stop-signal context values", () => {
+    // cdk.json or a programmatic context can hand over a JSON number/boolean;
+    // the runtime env var must still be a string.
+    createStack({
+      deep_reasoning_sufficiency_min_confidence: 0.7,
+      deep_reasoning_progress_similarity_threshold: 0.95,
+      deep_reasoning_stability_steps: 3,
+      deep_reasoning_stop_telemetry: true,
+    }).hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE: "0.7",
+        DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD: "0.95",
+        DEEP_REASONING_STABILITY_STEPS: "3",
+        DEEP_REASONING_STOP_TELEMETRY: "true",
+      }),
+    });
+  });
+
   it("sets no pre-rename AGENTIC_* budget variables", () => {
     // Both spellings present would be ambiguous: config.py prefers the new name,
     // so a stale AGENTIC_* would look effective while being ignored.
@@ -767,11 +798,19 @@ describe("ServeStack - deep-reasoning budget variables", () => {
       deep_reasoning_time_budget_s: "150",
       deep_reasoning_per_tool_timeout_s: "60",
       deep_reasoning_synthesis_reserve_s: "30",
+      deep_reasoning_sufficiency_min_confidence: "0.7",
+      deep_reasoning_progress_similarity_threshold: "0.95",
+      deep_reasoning_stability_steps: "3",
+      deep_reasoning_stop_telemetry: "true",
     }).hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
       EnvironmentVariables: Match.objectLike({
         DEEP_REASONING_TIME_BUDGET_S: "150",
         DEEP_REASONING_PER_TOOL_TIMEOUT_S: "60",
         DEEP_REASONING_SYNTHESIS_RESERVE_S: "30",
+        DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE: "0.7",
+        DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD: "0.95",
+        DEEP_REASONING_STABILITY_STEPS: "3",
+        DEEP_REASONING_STOP_TELEMETRY: "true",
       }),
     });
   });
@@ -883,7 +922,6 @@ describe("ServeStack - GRAPH_URI_TEMPLATE reader/writer alignment", () => {
   });
 });
 
-
 describe("ServeStack - SERVE_VKG_TRANSLATION_TIMEOUT_S wiring", () => {
   const envOf = (template: Template): Record<string, unknown> => {
     const runtimes = template.findResources("AWS::BedrockAgentCore::Runtime");
@@ -900,9 +938,12 @@ describe("ServeStack - SERVE_VKG_TRANSLATION_TIMEOUT_S wiring", () => {
     // The load-bearing case: a numeric 0 in cdk.json context is falsy in JS, so a
     // truthiness check would drop it. serve-stack uses `!== undefined`, so it must
     // survive as "0" and be clamped downstream rather than silently ignored.
-    expect(envOf(createStack({ serve_vkg_translation_timeout_s: 0 }))).toMatchObject(
-      { SERVE_VKG_TRANSLATION_TIMEOUT_S: "0" },
-    );
+    expect(
+      envOf(createStack({ serve_vkg_translation_timeout_s: 0 })),
+    ).toMatchObject({ SERVE_VKG_TRANSLATION_TIMEOUT_S: "0" });
+    expect(
+      envOf(createStack({ serve_vkg_translation_timeout_s: 0 })),
+    ).toMatchObject({ SERVE_VKG_TRANSLATION_TIMEOUT_S: "0" });
   });
 
   it("passes a set value through verbatim", () => {
@@ -951,10 +992,11 @@ describe("ServeStack - parameter read is deliberately broad", () => {
 // (perl, openssl, glibc, pcre2, sqlite3) whenever a build predated the Debian
 // point releases that fix them. This image is also an arm64 OCI index, which
 // ECR BASIC scanning silently refuses — so regressions here go unnoticed until
-// a child manifest is scanned by digest. Two Dockerfile properties keep the
-// image patchable: a pinned base digest (supply-chain integrity + a
-// cache-busting bump lever) and a post-install `apt-get upgrade` (the only
-// mechanism pulling trixie-security point releases in). Mirrors ontology-stack.
+// a child manifest is scanned by digest. The base is now AL2023. Two
+// Dockerfile properties keep the image patchable: a pinned base digest
+// (supply-chain integrity + a cache-busting bump lever) and a post-install
+// `dnf upgrade --releasever=latest` (the only mechanism pulling AL2023 security
+// updates in past the pinned snapshot). Mirrors ontology-stack.
 describe("context-manager Dockerfile CVE hygiene", () => {
   const dockerfile = fs.readFileSync(
     path.join(
@@ -971,19 +1013,181 @@ describe("context-manager Dockerfile CVE hygiene", () => {
 
   test("pins the base image to a digest, not a mutable tag", () => {
     const from = dockerfile.match(
-      /^FROM .*python:3\.12-slim(@sha256:[a-f0-9]{64})?/m,
+      /^FROM .*amazonlinux:2023-minimal(@sha256:[a-f0-9]{64})?/m,
     );
     expect(from).not.toBeNull();
     expect(from?.[1]).toMatch(/@sha256:[a-f0-9]{64}/);
-    expect(dockerfile).not.toMatch(/python:3\.12-slim\s*$/m);
+    expect(dockerfile).not.toMatch(/amazonlinux:2023-minimal\s*$/m);
   });
 
-  test("runs apt-get upgrade so OS security point releases are applied", () => {
-    expect(dockerfile).toMatch(/apt-get upgrade -y/);
-    expect(dockerfile).not.toMatch(/apt-get dist-upgrade/);
+  test("runs dnf upgrade against the latest AL2023 release so OS security updates are applied", () => {
+    // AL2023 locks dnf to the base image's repo snapshot; without
+    // --releasever=latest a stale digest pin freezes the OS patch level.
+    expect(dockerfile).toMatch(/dnf upgrade -y --releasever=latest/);
   });
 
   test("upgrades pip so its own advisories are picked up", () => {
     expect(dockerfile).toMatch(/pip install[^\n]*--upgrade pip/);
+  });
+});
+
+describe("ServeStack - Cedar policy source", () => {
+  // Serve denies every query when it has no Roles table, and uses the shipped
+  // seed policies only under the dev/test opt-in ALLOW_WITHOUT_ROLES. The
+  // deployed runtime must therefore always carry the table (and the region the
+  // shared policy loader needs), and must never carry the opt-in.
+  it("passes ROLES_TABLE_NAME and AWS_REGION to the runtime", () => {
+    createStack().hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        ROLES_TABLE_NAME: Match.anyValue(),
+        AWS_REGION: Match.anyValue(),
+      }),
+    });
+  });
+
+  it("never sets the ALLOW_WITHOUT_ROLES seed-policy opt-in", () => {
+    const runtimes = createStack().findResources(
+      "AWS::BedrockAgentCore::Runtime",
+    );
+    expect(Object.keys(runtimes).length).toBeGreaterThan(0);
+    for (const runtime of Object.values(runtimes)) {
+      expect(runtime.Properties.EnvironmentVariables).not.toHaveProperty(
+        "ALLOW_WITHOUT_ROLES",
+      );
+    }
+  });
+});
+
+describe("ServeStack - teardown", () => {
+  // AgentCore's ENIs keep AgentCoreSG in use for hours after the runtime is
+  // deleted. Retained, the stack deletes at once instead of failing on the group
+  // and keeping storage, authnz and network alive; destroy.sh deletes the group.
+  it("retains the runtime security group and tags it for destroy.sh", () => {
+    createStack().hasResource("AWS::EC2::SecurityGroup", {
+      DeletionPolicy: "Retain",
+      UpdateReplacePolicy: "Retain",
+      Properties: Match.objectLike({
+        GroupDescription: "AgentCore Runtime - Context Manager",
+        Tags: Match.arrayWith([
+          {
+            Key: `${DEFAULT_RESOURCE_PREFIX}:teardown`,
+            Value: "delete-after-eni-release",
+          },
+        ]),
+      }),
+    });
+  });
+});
+
+describe("ServeStack with a long resource_prefix", () => {
+  it("keeps every OpenSearch Serverless name valid", () => {
+    // Long enough to shorten the proxy and serve read-only access policy names
+    // (prefix + env over 15 characters), short enough for the AgentCore memory
+    // name's own 48-character limit, which LONG_PREFIX_CONTEXT exceeds.
+    const template = createStack({
+      resource_prefix: "coa-demo-long",
+      env: "staging",
+    });
+    expectValidAossNames(template, 2);
+  });
+});
+
+describe("ServeStack - AOSS data access", () => {
+  it("names every aoss:APIAccessAll role in an AOSS data-access policy", () => {
+    expectAossGrantsCoveredByDataPolicies(createStack());
+  });
+});
+
+describe("ServeStack - RDF_SPARQL graph sources", () => {
+  const GRAPH_ON = { graph_sources: "on" };
+  const runtimeEnv = (template: Template): Record<string, unknown> => {
+    const runtimes = Object.values(
+      template.findResources("AWS::BedrockAgentCore::Runtime"),
+    ) as any[];
+    expect(runtimes).toHaveLength(1);
+    return runtimes[0].Properties.EnvironmentVariables ?? {};
+  };
+  const neptuneStatements = (template: Template) =>
+    Object.values(template.findResources("AWS::IAM::Policy"))
+      .flatMap((p: any) => p.Properties.PolicyDocument.Statement)
+      .filter((s: any) => JSON.stringify(s.Action).includes("neptune-db:"));
+  const peer8182Egress = (template: Template, cidr: string) =>
+    Object.values(template.findResources("AWS::EC2::SecurityGroup"))
+      .flatMap((sg: any) => sg.Properties.SecurityGroupEgress ?? [])
+      .filter((e: any) => e.FromPort === 8182 && e.CidrIp === cidr);
+  const PEER = {
+    jdbc_peer_vpc_id: "vpc-peer123",
+    jdbc_peer_cidrs: "10.20.0.0/16",
+  };
+
+  describe("off (the default): main's template", () => {
+    it("sets no graph-sources env var", () => {
+      const env = runtimeEnv(createStack());
+      expect(env).not.toHaveProperty("GRAPH_SOURCES_ENABLED");
+      expect(env).not.toHaveProperty("SERVE_SPARQL_STRATEGY");
+    });
+
+    it("grants only the platform ontology read, without a sid", () => {
+      const statements = neptuneStatements(createStack());
+      expect(statements).toEqual([
+        {
+          Action: "neptune-db:ReadDataViaQuery",
+          Effect: "Allow",
+          Resource:
+            "arn:aws:neptune-db:us-east-1:123456789012:cluster:test-cluster/*",
+        },
+      ]);
+    });
+
+    it("adds no SPARQL egress to a peer network", () => {
+      expect(peer8182Egress(createStack(PEER), "10.20.0.0/16")).toHaveLength(0);
+    });
+  });
+
+  it("turns graph sources on in the runtime when the switch is on", () => {
+    const env = runtimeEnv(createStack(GRAPH_ON));
+    expect(env.GRAPH_SOURCES_ENABLED).toBe("true");
+    expect(env).not.toHaveProperty("SERVE_SPARQL_STRATEGY");
+  });
+
+  it("no longer reads the retired serve_sparql_strategy context", () => {
+    const env = runtimeEnv(createStack({ serve_sparql_strategy: "true" }));
+    expect(env).not.toHaveProperty("SERVE_SPARQL_STRATEGY");
+    expect(env).not.toHaveProperty("GRAPH_SOURCES_ENABLED");
+  });
+
+  it("splits Neptune reads into the ontology cluster and same-account source clusters", () => {
+    const statements = neptuneStatements(createStack(GRAPH_ON));
+    const bySid = Object.fromEntries(statements.map((s: any) => [s.Sid, s]));
+    expect(bySid.ServeNeptuneOntologyRead.Resource).toBe(
+      "arn:aws:neptune-db:us-east-1:123456789012:cluster:test-cluster/*",
+    );
+    const sourceResource = JSON.stringify(
+      bySid.ServeNeptuneSourceDataRead.Resource,
+    );
+    // Same region only: the source contract refuses any other region.
+    expect(sourceResource).toContain("neptune-db:us-east-1:123456789012:*/*");
+    expect(sourceResource).not.toContain("neptune-db:*:");
+    for (const s of statements) {
+      expect(s.Action).toBe("neptune-db:ReadDataViaQuery");
+      expect(s.Resource).not.toBe("*");
+    }
+  });
+
+  it("adds SPARQL egress to each peer network", () => {
+    const template = createStack({
+      ...GRAPH_ON,
+      ...PEER,
+    });
+    template.hasResourceProperties("AWS::EC2::SecurityGroup", {
+      SecurityGroupEgress: Match.arrayWith([
+        Match.objectLike({
+          IpProtocol: "tcp",
+          FromPort: 8182,
+          ToPort: 8182,
+          CidrIp: "10.20.0.0/16",
+        }),
+      ]),
+    });
   });
 });

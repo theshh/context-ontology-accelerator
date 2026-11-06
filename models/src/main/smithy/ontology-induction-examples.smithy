@@ -23,6 +23,17 @@ apply StartInduction @examples([
         }
         output: { jobId: "3f8a1c2d-9b4e-4a6f-8c1d-2e5f7a9b0c3d" }
     }
+    {
+        title: "Preview the document-to-table bridge on an accepted ontology"
+        input: {
+            namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+            datasourceIds: []
+            ontologyUriPrefix: "https://ontology.example.com/sales#"
+            strategy: "bridge_to_tables"
+            bridgeOptions: { dryRun: true, maxTables: 20 }
+        }
+        output: { jobId: "7c2e4b1a-5d3f-4e8a-9b6c-1a2b3c4d5e6f" }
+    }
 ])
 
 apply GetInductionJob @examples([
@@ -213,7 +224,7 @@ apply GetProposalUploadUrls @examples([
     {
         title: "Get presigned PUT URLs for a large proposal revision"
         input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", proposalId: "7c2e9a1b-4d6f-4b8a-9e3c-1f0a2b5d7c9e" }
-        output: { ontologyPutUrl: "https://coa-proposals.s3.amazonaws.com/ont-sales-2026/ontology.ttl?X-Amz-Signature=abc123", r2rmlPutUrl: "https://coa-proposals.s3.amazonaws.com/ont-sales-2026/mappings.ttl?X-Amz-Signature=def456" }
+        output: { revisionId: "d3bc58e9-52a4-43cf-b8b2-44a2f05b43f8", ontologyPutUrl: "https://coa-proposals.s3.amazonaws.com/ont-sales-2026/ontology.ttl?X-Amz-Signature=abc123", r2rmlPutUrl: "https://coa-proposals.s3.amazonaws.com/ont-sales-2026/mappings.ttl?X-Amz-Signature=def456" }
     }
 ])
 
