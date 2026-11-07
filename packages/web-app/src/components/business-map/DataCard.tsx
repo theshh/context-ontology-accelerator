@@ -12,6 +12,7 @@ import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
+import Icon from "@cloudscape-design/components/icon";
 import Link from "@cloudscape-design/components/link";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Spinner from "@cloudscape-design/components/spinner";
@@ -36,6 +37,20 @@ const EXAMPLES_SHOWN = 3;
 const LONG_DESCRIPTION = 160;
 
 const divider = "1px solid var(--color-border-divider-default, #e9ebed)";
+const rowStyle: React.CSSProperties = {
+  display: "flex",
+  width: "100%",
+  gap: 8,
+  alignItems: "baseline",
+  justifyContent: "space-between",
+  padding: "6px 10px",
+  border: 0,
+  background: "none",
+  color: "inherit",
+  font: "inherit",
+  textAlign: "left",
+  cursor: "pointer",
+};
 const pill: React.CSSProperties = {
   border: divider,
   borderRadius: 14,
@@ -144,13 +159,15 @@ export function DataCard({
                 {description}
               </div>
               {longDescription && (
-                <Link
-                  variant="secondary"
-                  fontSize="body-s"
-                  onFollow={() => setFullDescription((v) => !v)}
-                >
-                  {fullDescription ? "Less" : "More"}
-                </Link>
+                <div>
+                  <Link
+                    variant="secondary"
+                    fontSize="body-s"
+                    onFollow={() => setFullDescription((v) => !v)}
+                  >
+                    {fullDescription ? "Less" : "More"}
+                  </Link>
+                </div>
               )}
             </>
           ) : (
@@ -158,8 +175,8 @@ export function DataCard({
           )}
           {synonyms.length > 0 && (
             <Box
-              variant="small"
               color="text-body-secondary"
+              fontSize="body-s"
               margin={{ top: "xxs" }}
             >
               Also called: {synonyms.join(", ")}
@@ -178,79 +195,107 @@ export function DataCard({
         </div>
 
         {tableRef && (
-          <Section title="Fields">
+          <Section
+            title={columns.length > 0 ? `Fields (${columns.length})` : "Fields"}
+          >
             {table.isLoading ? (
               <Spinner />
             ) : columns.length === 0 ? (
               <Box color="text-body-secondary">No fields found.</Box>
             ) : (
               <div>
-                {shown.map((c) => {
-                  const name = c.name ?? "";
-                  const meaning =
-                    c.businessMetadata?.description || c.description || "";
-                  const values = c.distinctValues ?? [];
-                  const examples =
-                    values.slice(0, EXAMPLES_SHOWN).join(", ") +
-                    (values.length > EXAMPLES_SHOWN
-                      ? ` +${values.length - EXAMPLES_SHOWN}`
-                      : "");
-                  const open = openField === name;
-                  return (
-                    <div key={name} style={{ borderBottom: divider }}>
-                      <button
-                        type="button"
-                        aria-expanded={open}
-                        title={meaning || undefined}
-                        onClick={() => setOpenField(open ? null : name)}
-                        style={{
-                          display: "flex",
-                          width: "100%",
-                          gap: 8,
-                          alignItems: "baseline",
-                          justifyContent: "space-between",
-                          padding: "5px 0",
-                          border: 0,
-                          background: "none",
-                          color: "inherit",
-                          font: "inherit",
-                          textAlign: "left",
-                          cursor: "pointer",
-                        }}
-                      >
-                        <span style={{ fontWeight: 600 }}>
-                          {humanize(name)}
-                        </span>
-                        {examples && (
+                <div
+                  style={{
+                    border: divider,
+                    borderRadius: 8,
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    style={{
+                      ...rowStyle,
+                      background:
+                        "var(--color-background-container-header, #f4f6f8)",
+                      cursor: "default",
+                      fontSize: 12,
+                      color: "var(--color-text-body-secondary, #5f6b7a)",
+                    }}
+                  >
+                    <span>Field</span>
+                    <span>Example values</span>
+                  </div>
+                  {shown.map((c) => {
+                    const name = c.name ?? "";
+                    const meaning =
+                      c.businessMetadata?.description || c.description || "";
+                    const values = c.distinctValues ?? [];
+                    const examples =
+                      values.slice(0, EXAMPLES_SHOWN).join(", ") +
+                      (values.length > EXAMPLES_SHOWN
+                        ? ` +${values.length - EXAMPLES_SHOWN}`
+                        : "");
+                    const open = openField === name;
+                    return (
+                      <div key={name} style={{ borderTop: divider }}>
+                        <button
+                          type="button"
+                          aria-expanded={open}
+                          title={meaning || undefined}
+                          onClick={() => setOpenField(open ? null : name)}
+                          style={rowStyle}
+                        >
                           <span
                             style={{
-                              fontSize: 12,
-                              color:
-                                "var(--color-text-body-secondary, #5f6b7a)",
-                              whiteSpace: "nowrap",
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              maxWidth: "60%",
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 4,
                             }}
                           >
-                            {examples}
+                            <Icon
+                              name={
+                                open
+                                  ? "caret-down-filled"
+                                  : "caret-right-filled"
+                              }
+                              size="small"
+                              variant="subtle"
+                            />
+                            {humanize(name)}
                           </span>
-                        )}
-                      </button>
-                      {open && (
-                        <Box variant="small" padding={{ bottom: "xs" }}>
-                          {meaning && <div>{meaning}</div>}
-                          {values.length > EXAMPLES_SHOWN && (
-                            <div>Values: {values.join(", ")}</div>
+                          {examples && (
+                            <span
+                              style={{
+                                fontSize: 12,
+                                color:
+                                  "var(--color-text-body-secondary, #5f6b7a)",
+                                whiteSpace: "nowrap",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                maxWidth: "60%",
+                              }}
+                            >
+                              {examples}
+                            </span>
                           )}
-                          <Box variant="small" color="text-body-secondary">
-                            <code>{name}</code>
+                        </button>
+                        {open && (
+                          <Box
+                            variant="small"
+                            padding={{ left: "l", right: "s", bottom: "xs" }}
+                          >
+                            {meaning && <div>{meaning}</div>}
+                            {values.length > EXAMPLES_SHOWN && (
+                              <div>Values: {values.join(", ")}</div>
+                            )}
+                            <Box variant="small" color="text-body-secondary">
+                              <code>{name}</code>
+                            </Box>
                           </Box>
-                        </Box>
-                      )}
-                    </div>
-                  );
-                })}
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
                 {columns.length > FIELDS_SHOWN && (
                   <Box margin={{ top: "xs" }}>
                     <Link
@@ -387,7 +432,17 @@ function Section({
           justifyContent: "space-between",
         }}
       >
-        <Box variant="awsui-key-label">{title}</Box>
+        <span
+          style={{
+            fontSize: 12,
+            fontWeight: 700,
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+            color: "var(--color-text-body-secondary, #5f6b7a)",
+          }}
+        >
+          {title}
+        </span>
         {action}
       </div>
       <div style={{ marginTop: 4 }}>{children}</div>
