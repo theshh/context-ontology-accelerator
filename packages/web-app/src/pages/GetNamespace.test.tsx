@@ -56,6 +56,8 @@ vi.mock("../api-hooks/use-list-sources", () => ({
             {
               sourceId: "src-1",
               name: "My Database",
+              sourceType: "DATABASE",
+              sourceSubType: "GLUE_DATABASE",
               status: "APPROVED",
               tablesDiscovered: 5,
             },
@@ -126,6 +128,12 @@ describe("GetNamespace", () => {
     expect(
       screen.getByRole("heading", { name: "Graph details" }),
     ).toBeInTheDocument();
+  });
+
+  it("names the kind of database and has no Sources count row", () => {
+    render(<GetNamespace />, { wrapper });
+    expect(screen.getByText("Glue database")).toBeInTheDocument();
+    expect(screen.queryByText("Sources")).not.toBeInTheDocument();
   });
 
   it("hides the technical rows when the switch is off", () => {

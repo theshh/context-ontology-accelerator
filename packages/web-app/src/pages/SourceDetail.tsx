@@ -62,6 +62,7 @@ import { RuntimeConfigContext } from "@components/RuntimeContext";
 import { sourceStatusType, sourceStatusLabel } from "@utils/source-status";
 import { formatTimestamp } from "@utils/helpers";
 import { tableDetailPath } from "@utils/routes";
+import { DATABASE_SUBTYPE_LABELS } from "@utils/source-status";
 import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
@@ -82,17 +83,6 @@ const ACTIVE_STATUSES = new Set([
   "APPROVING",
   "REJECTING",
 ]);
-
-// Human labels for the DATABASE sub-types. A lookup rather than a ternary so a
-// sub-type without an entry shows its own name instead of being mislabelled as
-// one of the others.
-const DATABASE_SUBTYPE_LABELS: Record<string, AppMessage> = {
-  GLUE_DATABASE: "Glue database",
-  JDBC_DATABASE: "JDBC database",
-  CUSTOM_CONNECTOR: "Custom connector",
-  DATABRICKS_SQL_WAREHOUSE: "Databricks SQL Warehouse",
-  RDF_SPARQL: "Graph database (SPARQL)",
-};
 
 const SOURCE_STATUS_MESSAGES: Record<string, AppMessage> = {
   APPROVED: "Approved",

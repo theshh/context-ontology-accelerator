@@ -44,6 +44,7 @@ import {
   localizeVkgHealth,
 } from "@utils/namespace-status";
 import { SHOW_GRAPH_TECHNICAL_DETAILS } from "@constants/ux";
+import { DATABASE_SUBTYPE_LABELS } from "@utils/source-status";
 import { useAppI18n } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
@@ -222,10 +223,6 @@ export const GetNamespace: React.FC = () => {
                   },
                 ]
               : []),
-            {
-              label: t("Sources"),
-              value: String(ns.sourceCount ?? 0),
-            },
             { label: t("Created"), value: formatDate(ns.createdAt, locale) },
             {
               label: t("Updated"),
@@ -287,10 +284,12 @@ const ConnectionsTable: React.FC<{ namespaceId: string }> = ({
     {
       id: "type",
       header: "Source type",
-      cell: (item) =>
-        item.sourceType === SourceType.DATABASE
-          ? t("Database")
-          : t("Documents"),
+      // The full kind of database (e.g. "Glue database"), not just "Database".
+      cell: (item) => {
+        if (item.sourceType !== SourceType.DATABASE) return t("Documents");
+        const label = DATABASE_SUBTYPE_LABELS[item.sourceSubType ?? ""];
+        return label ? t(label) : t("Database");
+      },
     },
     {
       id: "status",

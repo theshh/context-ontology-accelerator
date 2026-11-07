@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { StatusIndicatorProps } from "@cloudscape-design/components/status-indicator";
+import type { AppMessage } from "../i18n/appMessages";
 
 export function sourceStatusType(
   status: string | undefined,
@@ -75,3 +76,16 @@ export function sourceStatusLabel(status: string | undefined): string {
       return status ?? "—";
   }
 }
+
+/**
+ * Human labels for the DATABASE sub-types. A lookup rather than a ternary so a
+ * sub-type without an entry shows its own name instead of being mislabelled as
+ * one of the others.
+ */
+export const DATABASE_SUBTYPE_LABELS: Readonly<Record<string, AppMessage>> = {
+  GLUE_DATABASE: "Glue database",
+  JDBC_DATABASE: "JDBC database",
+  CUSTOM_CONNECTOR: "Custom connector",
+  DATABRICKS_SQL_WAREHOUSE: "Databricks SQL Warehouse",
+  RDF_SPARQL: "Graph database (SPARQL)",
+};
