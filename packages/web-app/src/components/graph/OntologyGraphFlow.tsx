@@ -121,6 +121,12 @@ interface Props {
    * wide can end up partly off-screen. Off by default.
    */
   refitAfterLayout?: boolean;
+  /**
+   * Force layout only: preferred edge length in px (default 330). A shorter
+   * length packs the graph tighter, so fitting it to the pane zooms in and
+   * the labels read larger.
+   */
+  linkDistance?: number;
   onNodeSelect?: (node: GraphNodeData | null) => void;
   /**
    * Called when a node is double-clicked. Used to lazily expand a class's
@@ -134,6 +140,8 @@ type OntologyFlowNode = Node<GraphNodeData>;
 
 /** Rendered node diameter (px). Shared with the layout so spacing matches. */
 const NODE_SIZE = 64;
+/** Force layout: preferred edge length in px (see the `linkDistance` prop). */
+const DEFAULT_LINK_DISTANCE = 330;
 
 /**
  * Shortest chord where the inner-stagger t ≈ 0.35 still lands the label
@@ -195,12 +203,13 @@ function layoutGraph<T extends Node>(
   nodes: T[],
   edges: Edge[],
   layout: GraphLayout,
+  linkDistance: number = DEFAULT_LINK_DISTANCE,
 ): { nodes: T[]; edges: Edge[] } {
   if (layout === "force") {
     const positions = layoutForceGraph(
       nodes.map((n) => n.id),
       edges,
-      { nodeSize: NODE_SIZE },
+      { nodeSize: NODE_SIZE, linkDistance },
     );
     return {
       nodes: nodes.map((node) => ({
@@ -611,6 +620,7 @@ function OntologyGraphFlowInner({
   layout = "hierarchical",
   collapseStandalone = true,
   refitAfterLayout = false,
+  linkDistance = DEFAULT_LINK_DISTANCE,
   onNodeSelect,
   onNodeExpand,
 }: Props) {
@@ -722,8 +732,8 @@ function OntologyGraphFlowInner({
     [edges],
   );
   const initialNodes = useMemo(
-    () => layoutGraph(flowNodes, structuralEdges, layout).nodes,
-    [flowNodes, structuralEdges, layout],
+    () => layoutGraph(flowNodes, structuralEdges, layout, linkDistance).nodes,
+    [flowNodes, structuralEdges, layout, linkDistance],
   );
 
   // Hold the focal point centered across pane resizes (see hook doc).
@@ -762,7 +772,7 @@ function OntologyGraphFlowInner({
     {
       enabled: isForce,
       nodeSize: NODE_SIZE,
-      linkDistance: 330,
+      linkDistance,
       nodeRadius,
     },
   );

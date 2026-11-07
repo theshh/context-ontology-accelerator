@@ -54,3 +54,10 @@ export const SHOW_GRAPH_TECHNICAL_DETAILS = false;
  * and its tab shows while it is open.
  */
 export const SHOW_GRAPH_EXPLORER_TAB = false;
+
+/**
+ * Business map: the "Show only what a rule uses" dropdown. When hidden, a rule
+ * can still be picked from a data card's Rules list, which narrows the map
+ * and opens the rule's lineage as before.
+ */
+export const SHOW_BUSINESS_MAP_RULE_FILTER = false;

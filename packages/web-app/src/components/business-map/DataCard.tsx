@@ -106,14 +106,7 @@ export function DataCard({
     ? model.entities.find((e) => e.id === entity.kindOf)
     : undefined;
   const kinds = kindsOf(model, entity.id);
-  const subtitle = parent
-    ? `A kind of ${parent.label}`
-    : [
-        `From ${entity.connection}`,
-        columns.length > 0 && `${columns.length} fields`,
-      ]
-        .filter(Boolean)
-        .join(" · ");
+  const subtitle = parent ? `A kind of ${parent.label}` : undefined;
 
   return (
     <Container

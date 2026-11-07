@@ -3,12 +3,21 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const NS = "http://coa.amazon.com/namespace/ns-1/ontology/induced#";
 
 // React Flow needs real layout; the page test checks the data wiring and the
 // side panel, so the graph is replaced by buttons that select a node.
+// The rule dropdown is behind a UX switch (off); the filter test turns it on.
+const mockUx = vi.hoisted(() => ({ ruleFilter: false }));
+vi.mock("@constants/ux", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@constants/ux")>()),
+  get SHOW_BUSINESS_MAP_RULE_FILTER() {
+    return mockUx.ruleFilter;
+  },
+}));
+
 vi.mock("@components/graph/OntologyGraphFlow", () => ({
   OntologyGraphFlow: ({
     nodes,
@@ -167,7 +176,11 @@ describe("BusinessMapPage", () => {
       await screen.findByRole("heading", { name: "Employment" }),
     ).toBeInTheDocument();
     expect(screen.getAllByText("Headcount").length).toBeGreaterThan(0);
-    expect(screen.getByText(/^From MPI HRMS/)).toBeInTheDocument();
+    // No source/field-count subtitle and no link out to the Graph explorer.
+    expect(screen.queryByText(/^From MPI HRMS/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "View the full ontology" }),
+    ).not.toBeInTheDocument();
     // Fields in business words; meaning and technical name open on click.
     const field = await screen.findByRole("button", {
       name: /Employment type/,
@@ -227,13 +240,6 @@ describe("BusinessMapPage", () => {
     expect(screen.getByDisplayValue("job")).toBeInTheDocument();
   });
 
-  it("links to the full ontology in the Graph explorer", async () => {
-    renderPage();
-    expect(
-      await screen.findByRole("link", { name: "View the full ontology" }),
-    ).toHaveAttribute("href", expect.stringMatching(/\/ontology\/graph$/));
-  });
-
   it("switches the panel when a circle is clicked", async () => {
     renderPage();
     await userEvent.click(await screen.findByText("circle Officer"));
@@ -247,7 +253,20 @@ describe("BusinessMapPage", () => {
 });
 
 describe("BusinessMapPage rule filter", () => {
+  afterEach(() => {
+    mockUx.ruleFilter = false;
+  });
+
+  it("hides the rule dropdown by default", async () => {
+    renderPage();
+    await screen.findByText("circle Officer");
+    expect(
+      screen.queryByText("Show only what a rule uses"),
+    ).not.toBeInTheDocument();
+  });
+
   it("narrows the map to the things a rule uses", async () => {
+    mockUx.ruleFilter = true;
     renderPage();
     await screen.findByText("circle Officer");
     await userEvent.click(

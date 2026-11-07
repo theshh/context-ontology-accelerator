@@ -35,6 +35,7 @@ import { useListSources } from "@api-hooks/use-list-sources";
 import { useListMetrics } from "@api-hooks/use-metrics";
 import { useGetSourceTable } from "@api-hooks/use-get-source-table";
 import { OVERVIEW_PAGE_LIMIT } from "@api-hooks/use-ontology-overview";
+import { SHOW_BUSINESS_MAP_RULE_FILTER } from "@constants/ux";
 import {
   OntologyGraphFlow,
   type GraphEdgeData,
@@ -52,6 +53,13 @@ import {
   AddKindModal,
   EditDescriptionModal,
 } from "@components/business-map/EditModals";
+
+/**
+ * Edge length for the map's force layout. Shorter than the Graph explorer's
+ * 330 px so the ~10 circles pack closer and the fitted view zooms in enough
+ * for their labels to read.
+ */
+const MAP_LINK_DISTANCE = 150;
 
 export const BusinessMapPage: React.FC = () => {
   const { namespaceId = "" } = useParams<{ namespaceId: string }>();
@@ -290,35 +298,27 @@ export const BusinessMapPage: React.FC = () => {
               <Header
                 variant="h2"
                 description="Hover a circle to see its fields. Click it for details."
-                actions={
-                  <Link
-                    href={`${base}/ontology/graph`}
-                    onFollow={(e) => {
-                      e.preventDefault();
-                      navigate(`${base}/ontology/graph`);
-                    }}
-                  >
-                    View the full ontology
-                  </Link>
-                }
               >
                 Business map
               </Header>
             }
           >
             <SpaceBetween size="s">
-              <FormField label="Show only what a rule uses">
-                <Select
-                  selectedOption={
-                    ruleOptions.find((o) => o.value === rule) ?? ruleOptions[0]
-                  }
-                  onChange={({ detail }) =>
-                    setRule(detail.selectedOption.value ?? "all")
-                  }
-                  options={ruleOptions}
-                  filteringType={ruleOptions.length > 8 ? "auto" : "none"}
-                />
-              </FormField>
+              {SHOW_BUSINESS_MAP_RULE_FILTER && (
+                <FormField label="Show only what a rule uses">
+                  <Select
+                    selectedOption={
+                      ruleOptions.find((o) => o.value === rule) ??
+                      ruleOptions[0]
+                    }
+                    onChange={({ detail }) =>
+                      setRule(detail.selectedOption.value ?? "all")
+                    }
+                    options={ruleOptions}
+                    filteringType={ruleOptions.length > 8 ? "auto" : "none"}
+                  />
+                </FormField>
+              )}
               <div style={{ height: 600 }}>
                 <OntologyGraphFlow
                   key={rule}
@@ -327,6 +327,7 @@ export const BusinessMapPage: React.FC = () => {
                   layout="force"
                   collapseStandalone={false}
                   refitAfterLayout
+                  linkDistance={MAP_LINK_DISTANCE}
                   onNodeSelect={(n) => n && setSelected(n.id)}
                 />
               </div>
