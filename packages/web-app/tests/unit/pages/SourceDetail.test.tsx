@@ -20,6 +20,13 @@ const mockUseListSourceScanJobs = vi.fn();
 const mockUsePutSourceRescanSchedule = vi.fn();
 const mockUsePutSourceEventRescan = vi.fn();
 
+// Re-scan, Reject and Delete are behind a UX switch (off by default); pin it
+// on so these tests reach them.
+vi.mock("@constants/ux", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@constants/ux")>()),
+  SHOW_CONNECTION_MAINTENANCE_ACTIONS: true,
+}));
+
 vi.mock("@api-hooks", () => ({
   useGetSource: (...args: unknown[]) => mockUseGetSource(...args),
   useDeleteSource: (...args: unknown[]) => mockUseDeleteSource(...args),

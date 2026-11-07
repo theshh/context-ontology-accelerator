@@ -16,6 +16,16 @@ const mockListScanJobs = vi.hoisted(() => vi.fn());
 const mockListTables = vi.hoisted(() => vi.fn());
 const mockRescan = vi.hoisted(() => vi.fn());
 
+// Re-scan, Reject and Delete are behind a UX switch (off by default); pin it
+// on so these tests reach them.
+const mockUx = vi.hoisted(() => ({ maintenance: true }));
+vi.mock("@constants/ux", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@constants/ux")>()),
+  get SHOW_CONNECTION_MAINTENANCE_ACTIONS() {
+    return mockUx.maintenance;
+  },
+}));
+
 vi.mock("@api-hooks", () => ({
   useGetSource: mockGetSource,
   useDeleteSource: () => ({ mutate: vi.fn(), isPending: false, error: null }),

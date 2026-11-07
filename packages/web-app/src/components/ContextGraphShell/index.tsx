@@ -17,7 +17,11 @@ import Header from "@cloudscape-design/components/header";
 import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
-import { SHOW_BUSINESS_MAP, SHOW_GRAPH_EXPLORER_TAB } from "@constants/ux";
+import {
+  SHOW_BUSINESS_MAP,
+  SHOW_CONTEXT_GRAPH_LIST,
+  SHOW_GRAPH_EXPLORER_TAB,
+} from "@constants/ux";
 import Tabs from "@cloudscape-design/components/tabs";
 import { NamespaceStatus } from "@coa/control-plane-client";
 import { useGetNamespace } from "@api-hooks/use-get-namespace";
@@ -91,12 +95,27 @@ export const ContextGraphShell: React.FC = () => {
     : "";
   const { tab, sub } = resolveContextGraphTab(rest);
 
+  // Connections live under Administration: their pages show on their own,
+  // without the graph's header and section tabs (the top-bar dropdown names
+  // the graph).
+  if (!SHOW_CONTEXT_GRAPH_LIST && rest.startsWith("/sources")) {
+    return (
+      <PageErrorBoundary key={location.pathname}>
+        <Outlet />
+      </PageErrorBoundary>
+    );
+  }
+
   return (
     <SpaceBetween size="m">
       <Header
         variant="h1"
         actions={
-          <Button onClick={() => navigate("/namespaces")}>Back to list</Button>
+          SHOW_CONTEXT_GRAPH_LIST ? (
+            <Button onClick={() => navigate("/namespaces")}>
+              Back to list
+            </Button>
+          ) : undefined
         }
       >
         <SpaceBetween direction="horizontal" size="s" alignItems="center">

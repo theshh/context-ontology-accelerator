@@ -62,6 +62,7 @@ import { RuntimeConfigContext } from "@components/RuntimeContext";
 import { sourceStatusType, sourceStatusLabel } from "@utils/source-status";
 import { formatTimestamp } from "@utils/helpers";
 import { tableDetailPath } from "@utils/routes";
+import { SHOW_CONNECTION_MAINTENANCE_ACTIONS } from "@constants/ux";
 import { DATABASE_SUBTYPE_LABELS } from "@utils/source-status";
 import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
@@ -633,26 +634,28 @@ export const SourceDetail: React.FC = () => {
             </Button>
             {isTabular && (
               <>
-                <ButtonWithHint
-                  hint={
-                    status === SourceStatus.RESCAN_REVIEW
-                      ? t(
-                          "Discards this re-scan: restores changed tables to their last approved version, removes newly-added tables, and returns the source to Approved.",
-                        )
-                      : t(
-                          "Marks all pending tables and columns in this source as rejected. Already-approved or already-rejected items are not affected.",
-                        )
-                  }
-                  onClick={handleRejectAll}
-                  loading={rejectMutation.isPending}
-                  disabled={
-                    isTransient ||
-                    status === SourceStatus.APPROVED ||
-                    tables.length === 0
-                  }
-                >
-                  {t("Reject source")}
-                </ButtonWithHint>
+                {SHOW_CONNECTION_MAINTENANCE_ACTIONS && (
+                  <ButtonWithHint
+                    hint={
+                      status === SourceStatus.RESCAN_REVIEW
+                        ? t(
+                            "Discards this re-scan: restores changed tables to their last approved version, removes newly-added tables, and returns the source to Approved.",
+                          )
+                        : t(
+                            "Marks all pending tables and columns in this source as rejected. Already-approved or already-rejected items are not affected.",
+                          )
+                    }
+                    onClick={handleRejectAll}
+                    loading={rejectMutation.isPending}
+                    disabled={
+                      isTransient ||
+                      status === SourceStatus.APPROVED ||
+                      tables.length === 0
+                    }
+                  >
+                    {t("Reject source")}
+                  </ButtonWithHint>
+                )}
                 <ButtonWithHint
                   hint={
                     status === SourceStatus.RESCAN_REVIEW
@@ -682,29 +685,32 @@ export const SourceDetail: React.FC = () => {
                 </ButtonWithHint>
               </>
             )}
-            <Button
-              onClick={() => setShowDeleteModal(true)}
-              disabled={isActive && !strandedGraphSource}
-            >
-              {t("Delete")}
-            </Button>
-            {(!isGraph || graphSourcesEnabled) && (
+            {SHOW_CONNECTION_MAINTENANCE_ACTIONS && (
               <Button
-                onClick={() => {
-                  // An open re-scan review is the only state a re-scan destroys
-                  // work in, so it is the only one that asks first.
-                  if (status === SourceStatus.RESCAN_REVIEW) {
-                    setShowRescanConfirm(true);
-                    return;
-                  }
-                  rescan({});
-                }}
-                loading={isRescanning}
-                disabled={!canRescan}
+                onClick={() => setShowDeleteModal(true)}
+                disabled={isActive && !strandedGraphSource}
               >
-                {isGraph ? t("Re-verify") : t("Re-scan")}
+                {t("Delete")}
               </Button>
             )}
+            {SHOW_CONNECTION_MAINTENANCE_ACTIONS &&
+              (!isGraph || graphSourcesEnabled) && (
+                <Button
+                  onClick={() => {
+                    // An open re-scan review is the only state a re-scan destroys
+                    // work in, so it is the only one that asks first.
+                    if (status === SourceStatus.RESCAN_REVIEW) {
+                      setShowRescanConfirm(true);
+                      return;
+                    }
+                    rescan({});
+                  }}
+                  loading={isRescanning}
+                  disabled={!canRescan}
+                >
+                  {isGraph ? t("Re-verify") : t("Re-scan")}
+                </Button>
+              )}
             <Button
               onClick={() => navigate(`/namespaces/${namespaceId}/sources`)}
             >

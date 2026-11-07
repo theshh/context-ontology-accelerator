@@ -9,7 +9,12 @@ import {
   useNavigate,
   useLocation,
 } from "react-router-dom";
-import { SHOW_ARCHIVED_CONTEXT_GRAPHS, SHOW_DASHBOARD } from "@constants/ux";
+import {
+  SHOW_ARCHIVED_CONTEXT_GRAPHS,
+  SHOW_CONTEXT_GRAPH_LIST,
+  SHOW_DASHBOARD,
+  SHOW_ONTOLOGY_NAV_LINK,
+} from "@constants/ux";
 import AppLayout from "@cloudscape-design/components/app-layout-toolbar";
 import Flashbar from "@cloudscape-design/components/flashbar";
 import SideNavigation, {
@@ -184,7 +189,14 @@ function AppShell() {
   // Context graphs are opened from the list, so the top-bar switcher is only
   // shown on the Playground, which has no graph in its URL and still needs a
   // way to choose which graph to query.
-  const showGraphSwitcher = location.pathname.startsWith("/playground");
+  // With the list hidden (SHOW_CONTEXT_GRAPH_LIST), it is also how you move
+  // between graphs, so it shows on every page inside a graph too.
+  const onGraphPage = /^\/namespaces\/(?!create(\/|$))[^/]+/.test(
+    location.pathname,
+  );
+  const showGraphSwitcher =
+    location.pathname.startsWith("/playground") ||
+    (!SHOW_CONTEXT_GRAPH_LIST && onGraphPage);
 
   useEffect(() => {
     window.localStorage.setItem(DARK_MODE_KEY, darkMode ? "1" : "0");
@@ -208,15 +220,28 @@ function AppShell() {
     ...(SHOW_DASHBOARD
       ? [{ type: "link" as const, text: "Dashboard", href: "/" }]
       : []),
-    { type: "link", text: "Context graphs", href: "/namespaces" },
-    { type: "link", text: "Connections", href: `${nsPath}/sources` },
-    { type: "link", text: "Ontology", href: `${nsPath}/ontology` },
+    {
+      type: "link",
+      text: "Context graphs",
+      // With the list hidden this opens the current graph directly.
+      href: SHOW_CONTEXT_GRAPH_LIST || !namespaceId ? "/namespaces" : nsPath,
+    },
+    ...(SHOW_ONTOLOGY_NAV_LINK
+      ? [
+          {
+            type: "link" as const,
+            text: "Ontology",
+            href: `${nsPath}/ontology`,
+          },
+        ]
+      : []),
     { type: "link", text: "Playground", href: "/playground" },
     { type: "divider" },
     {
       type: "section",
       text: "Administration",
       items: [
+        { type: "link", text: "Connections", href: `${nsPath}/sources` },
         { type: "link", text: "Identity", href: "/identity" },
         { type: "link", text: "MCP server", href: "/mcp" },
         { type: "link", text: "System health", href: "/system-health" },
@@ -343,8 +368,22 @@ function AppShell() {
               text: `Context graph: ${isLoading ? "Loading…" : (current?.displayName ?? current?.name ?? "—")}`,
               ariaLabel: "Namespace switcher",
               title: "Context graph",
-              onItemClick: ({ detail }: { detail: { id: string } }) =>
-                setNamespace(detail.id),
+              onItemClick: ({ detail }: { detail: { id: string } }) => {
+                if (detail.id === CREATE_GRAPH_ITEM) {
+                  navigate("/namespaces/create");
+                } else if (onGraphPage) {
+                  // Stay on the same section (e.g. Business map) of the new
+                  // graph. Only the first path segment is kept: a connection
+                  // or proposal id belongs to the old graph.
+                  const section =
+                    location.pathname.match(
+                      /^\/namespaces\/[^/]+(\/[^/]+)?/,
+                    )?.[1] ?? "";
+                  navigate(`/namespaces/${detail.id}${section}`);
+                } else {
+                  setNamespace(detail.id);
+                }
+              },
               items:
                 namespaces.length > 0
                   ? [...namespaces]
@@ -360,10 +399,20 @@ function AppShell() {
                           { sensitivity: "base" },
                         ),
                       )
-                      .map((n) => ({
+                      .map((n): { id: string; text: string } => ({
                         id: n.namespaceId!,
                         text: n.displayName ?? n.name ?? "",
                       }))
+                      .concat(
+                        SHOW_CONTEXT_GRAPH_LIST
+                          ? []
+                          : [
+                              {
+                                id: CREATE_GRAPH_ITEM,
+                                text: "Create a new context graph",
+                              },
+                            ],
+                      )
                   : [
                       {
                         id: "none",
@@ -465,6 +514,8 @@ function AppShell() {
     ],
     [
       showGraphSwitcher,
+      onGraphPage,
+      location.pathname,
       isLoading,
       current?.displayName,
       current?.name,
@@ -592,7 +643,16 @@ function AppShell() {
                   )
                 }
               />
-              <Route path="/namespaces" element={<NamespaceList />} />
+              <Route
+                path="/namespaces"
+                element={
+                  SHOW_CONTEXT_GRAPH_LIST ? (
+                    <NamespaceList />
+                  ) : (
+                    <CurrentContextGraph />
+                  )
+                }
+              />
               <Route path="/namespaces/create" element={<CreateNamespace />} />
               <Route
                 path="/namespaces/:namespaceId"
@@ -648,4 +708,21 @@ function AppShell() {
       <VersionBadge />
     </>
   );
+}
+
+/** Top-bar graph dropdown item that opens the create page. */
+const CREATE_GRAPH_ITEM = "__create-context-graph";
+
+/**
+ * "/namespaces" when the list is hidden (SHOW_CONTEXT_GRAPH_LIST): open the
+ * current graph (last opened, else the first active one). With no graph yet,
+ * show the list so one can be created.
+ */
+function CurrentContextGraph() {
+  const { namespaceId, namespaces, isLoading } = useCurrentNamespace();
+  if (isLoading) return null;
+  if (namespaceId && namespaces.length > 0) {
+    return <Navigate to={`/namespaces/${namespaceId}`} replace />;
+  }
+  return <NamespaceList />;
 }

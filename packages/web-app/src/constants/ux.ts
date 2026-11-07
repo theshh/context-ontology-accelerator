@@ -68,3 +68,21 @@ export const SHOW_BUSINESS_MAP_RULE_FILTER = false;
  * proposals list alone with no tab strip.
  */
 export const SHOW_REFERENCE_ONTOLOGIES_TAB = false;
+
+/**
+ * The Context graphs list page. When hidden, "Context graphs" opens the
+ * current graph (the one last opened, else the first active one) and the
+ * top-bar "Context graph" dropdown switches between graphs or creates a new
+ * one. The list still shows when there are no graphs yet.
+ */
+export const SHOW_CONTEXT_GRAPH_LIST = false;
+
+/** The side-nav "Ontology" link (the same page as a graph's Curation tab). */
+export const SHOW_ONTOLOGY_NAV_LINK = false;
+
+/**
+ * Connection maintenance actions on a connection's page: Re-scan (Re-verify),
+ * Reject source and Delete. When hidden, a connection can be added (Connect
+ * source) and approved, nothing else.
+ */
+export const SHOW_CONNECTION_MAINTENANCE_ACTIONS = false;

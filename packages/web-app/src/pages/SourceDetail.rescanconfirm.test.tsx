@@ -15,6 +15,16 @@ import { SourceDetail } from "./SourceDetail";
 const rescanMock = vi.hoisted(() => vi.fn());
 const mockGetSource = vi.hoisted(() => vi.fn());
 
+// Re-scan, Reject and Delete are behind a UX switch (off by default); pin it
+// on so these tests reach them.
+const mockUx = vi.hoisted(() => ({ maintenance: true }));
+vi.mock("@constants/ux", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@constants/ux")>()),
+  get SHOW_CONNECTION_MAINTENANCE_ACTIONS() {
+    return mockUx.maintenance;
+  },
+}));
+
 vi.mock("@api-hooks", () => ({
   useGetSource: mockGetSource,
   useDeleteSource: () => ({ mutate: vi.fn(), isPending: false, error: null }),
@@ -159,6 +169,20 @@ describe("SourceDetail — re-scan confirmation", () => {
     expect(
       screen.queryByText(/Discard the open re-scan review\?/i),
     ).not.toBeInTheDocument();
+  });
+
+  it("offers Approve but no Re-scan, Reject or Delete when the switch is off", () => {
+    mockUx.maintenance = false;
+    try {
+      setSource("RESCAN_REVIEW");
+      render(<SourceDetail />, { wrapper });
+      expect(screen.getByText("Approve source")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Re-scan" })).toBeNull();
+      expect(screen.queryByText("Reject source")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    } finally {
+      mockUx.maintenance = true;
+    }
   });
 
   it.each(["APPROVED", "SCAN_FAILED"])(
