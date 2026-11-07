@@ -10,6 +10,7 @@
 import { useState } from "react";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
+import ButtonDropdown from "@cloudscape-design/components/button-dropdown";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import Icon from "@cloudscape-design/components/icon";
@@ -20,7 +21,6 @@ import { useGetSourceTable } from "@api-hooks/use-get-source-table";
 import {
   humanize,
   kindsOf,
-  relationshipSentence,
   type BusinessMapModel,
   type MapEntity,
 } from "./model";
@@ -39,6 +39,7 @@ const LONG_DESCRIPTION = 160;
 const divider = "1px solid var(--color-border-divider-default, #e9ebed)";
 const rowStyle: React.CSSProperties = {
   display: "flex",
+  boxSizing: "border-box",
   width: "100%",
   gap: 8,
   alignItems: "baseline",
@@ -105,10 +106,6 @@ export function DataCard({
     ? model.entities.find((e) => e.id === entity.kindOf)
     : undefined;
   const kinds = kindsOf(model, entity.id);
-  const links = model.links.filter(
-    (l) =>
-      l.kind !== "kind" && (l.source === entity.id || l.target === entity.id),
-  );
   const subtitle = parent
     ? `A kind of ${parent.label}`
     : [
@@ -125,15 +122,27 @@ export function DataCard({
           variant="h2"
           description={subtitle}
           actions={
-            <Button
-              variant="inline-link"
-              iconName="edit"
-              onClick={onEditDescription}
-              disabled={!tableRef}
-              disabledReason="Only things backed by one table can be edited here."
-            >
-              Edit description
-            </Button>
+            <ButtonDropdown
+              variant="inline-icon"
+              ariaLabel={`Edit ${entity.label}`}
+              items={[
+                {
+                  id: "description",
+                  text: "Edit description",
+                  disabled: !tableRef,
+                  disabledReason:
+                    "Only things backed by one table can be edited here.",
+                },
+                {
+                  id: "kind",
+                  text: "Add a kind",
+                  description: `A category of ${entity.label.toLowerCase()}`,
+                },
+              ]}
+              onItemClick={({ detail }) =>
+                detail.id === "kind" ? onAddKind() : onEditDescription()
+              }
+            />
           }
         >
           {entity.label}
@@ -222,7 +231,7 @@ export function DataCard({
                     }}
                   >
                     <span>Field</span>
-                    <span>Example values</span>
+                    <span>Examples</span>
                   </div>
                   {shown.map((c) => {
                     const name = c.name ?? "";
@@ -271,7 +280,8 @@ export function DataCard({
                                 whiteSpace: "nowrap",
                                 overflow: "hidden",
                                 textOverflow: "ellipsis",
-                                maxWidth: "60%",
+                                maxWidth: "55%",
+                                minWidth: 0,
                               }}
                             >
                               {examples}
@@ -295,60 +305,32 @@ export function DataCard({
                       </div>
                     );
                   })}
-                </div>
-                {columns.length > FIELDS_SHOWN && (
-                  <Box margin={{ top: "xs" }}>
-                    <Link
-                      variant="secondary"
-                      onFollow={() => setAllFields((v) => !v)}
+                  {columns.length > FIELDS_SHOWN && (
+                    <button
+                      type="button"
+                      aria-expanded={allFields}
+                      onClick={() => setAllFields((v) => !v)}
+                      style={{
+                        ...rowStyle,
+                        borderTop: divider,
+                        justifyContent: "center",
+                        fontSize: 13,
+                        color: "var(--color-text-link-default, #0972d3)",
+                      }}
                     >
-                      {allFields ? "Show fewer" : `Show all ${columns.length}`}
-                    </Link>
-                  </Box>
-                )}
+                      {allFields
+                        ? "Show fewer"
+                        : `Show ${columns.length - FIELDS_SHOWN} more`}
+                    </button>
+                  )}
+                </div>
               </div>
             )}
           </Section>
         )}
 
-        {links.length > 0 && (
-          <Section title="Connected to">
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-              {links.map((l) => {
-                const other = l.source === entity.id ? l.target : l.source;
-                return (
-                  <button
-                    key={`${l.source}|${l.label}|${l.target}`}
-                    type="button"
-                    title={relationshipSentence(l, model)}
-                    onClick={() => onSelect(other)}
-                    style={pill}
-                  >
-                    {model.entities.find((e) => e.id === other)?.label ?? other}
-                  </button>
-                );
-              })}
-            </div>
-          </Section>
-        )}
-
-        <Section
-          title="Kinds"
-          action={
-            <Button
-              variant="inline-link"
-              iconName="add-plus"
-              onClick={onAddKind}
-            >
-              Add a kind
-            </Button>
-          }
-        >
-          {kinds.length === 0 ? (
-            <Box variant="small" color="text-body-secondary">
-              None yet
-            </Box>
-          ) : (
+        {kinds.length > 0 && (
+          <Section title="Kinds">
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
               {kinds.map((k) => (
                 <button
@@ -362,8 +344,8 @@ export function DataCard({
                 </button>
               ))}
             </div>
-          )}
-        </Section>
+          </Section>
+        )}
 
         <Section
           title={`Rules (${entity.rules.length})`}

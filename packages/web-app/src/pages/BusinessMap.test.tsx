@@ -179,15 +179,20 @@ describe("BusinessMapPage", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("employment_type")).toBeInTheDocument();
     expect(screen.getByText("Also called: job")).toBeInTheDocument();
-    // Connected things, with the relationship sentence as a tooltip, and the three actions.
-    expect(
-      screen.getByTitle(/Each Employment is linked to an Officer/),
-    ).toHaveTextContent("Officer");
-    expect(
-      screen.getByRole("button", { name: "Edit description" }),
-    ).toBeEnabled();
+    // Connections are on the graph, not repeated on the card; no empty Kinds section.
+    expect(screen.queryByText("Connected to")).not.toBeInTheDocument();
+    expect(screen.queryByText("Kinds")).not.toBeInTheDocument();
+    // The three actions: Add a rule on the card, the edits in the header menu.
     expect(screen.getByRole("button", { name: /Add a rule/ })).toBeEnabled();
-    expect(screen.getByRole("button", { name: /Add a kind/ })).toBeEnabled();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Edit Employment" }),
+    );
+    expect(
+      screen.getByRole("menuitem", { name: "Edit description" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitem", { name: /Add a kind/ }),
+    ).toBeInTheDocument();
   });
 
   it("shows how a rule is worked out when picked from the card", async () => {
@@ -209,7 +214,10 @@ describe("BusinessMapPage", () => {
     renderPage();
     await screen.findByText("Employment type");
     await userEvent.click(
-      screen.getByRole("button", { name: "Edit description" }),
+      screen.getByRole("button", { name: "Edit Employment" }),
+    );
+    await userEvent.click(
+      screen.getByRole("menuitem", { name: "Edit description" }),
     );
     expect(
       await screen.findByDisplayValue(
