@@ -115,6 +115,12 @@ interface Props {
    * on first render.
    */
   collapseStandalone?: boolean;
+  /**
+   * Force layout only: fit the view again once the nodes have spread out.
+   * The first fit frames the packed starting layout, so a graph that spreads
+   * wide can end up partly off-screen. Off by default.
+   */
+  refitAfterLayout?: boolean;
   onNodeSelect?: (node: GraphNodeData | null) => void;
   /**
    * Called when a node is double-clicked. Used to lazily expand a class's
@@ -575,6 +581,9 @@ export function parallelEdgeCurves(edges: readonly GraphEdgeData[]): number[] {
  * `x' = x + (w' - w) / 2` (same for height/y). Zoom is untouched — unlike
  * fitView, this preserves the user's current zoom and pan.
  */
+/** How long after a node-set change the opt-in second fit runs. */
+const REFIT_AFTER_LAYOUT_MS = 1800;
+
 function usePreserveCenterOnResize() {
   const width = useStore((s) => s.width);
   const height = useStore((s) => s.height);
@@ -601,6 +610,7 @@ function OntologyGraphFlowInner({
   edges,
   layout = "hierarchical",
   collapseStandalone = true,
+  refitAfterLayout = false,
   onNodeSelect,
   onNodeExpand,
 }: Props) {
@@ -792,6 +802,16 @@ function OntologyGraphFlowInner({
     );
     return () => window.clearTimeout(handle);
   }, [isForce, nodeSetSig, initialNodes, fitBounds]);
+
+  // Opt-in second fit once the force layout has mostly settled (see prop doc).
+  useEffect(() => {
+    if (!isForce || !refitAfterLayout || initialNodes.length === 0) return;
+    const handle = window.setTimeout(
+      () => void fitView({ padding: 0.1, duration: 400 }),
+      REFIT_AFTER_LAYOUT_MS,
+    );
+    return () => window.clearTimeout(handle);
+  }, [isForce, refitAfterLayout, nodeSetSig, initialNodes.length, fitView]);
 
   // Re-fit after the user toggles standalone classes: the graph's extent
   // changes substantially and the old viewport would show half of it.

@@ -24,6 +24,15 @@ const mockNamespace: Record<string, unknown> = {
   updatedAt: "2026-05-01T00:00:00Z",
 };
 
+// The Overview hides its technical rows behind a UX switch; pin it on so those
+// rows stay covered, and flip it off in the test that checks they are hidden.
+const mockUx = vi.hoisted(() => ({ showTechnical: true }));
+vi.mock("@constants/ux", () => ({
+  get SHOW_GRAPH_TECHNICAL_DETAILS() {
+    return mockUx.showTechnical;
+  },
+}));
+
 vi.mock("../api-hooks/use-get-namespace", () => ({
   useGetNamespace: () => ({
     data: {

@@ -237,13 +237,6 @@ describe("BusinessMapPage", () => {
     );
     expect(screen.getByText("Rules (0)")).toBeInTheDocument();
   });
-
-  it("counts things, rules, document collections and data connections", async () => {
-    renderPage();
-    await screen.findByText("circle Officer");
-    expect(screen.getByText("business things")).toBeInTheDocument();
-    expect(screen.getByText("document collections")).toBeInTheDocument();
-  });
 });
 
 describe("BusinessMapPage rule filter", () => {

@@ -24,6 +24,15 @@ const baseNamespace = {
 // Mutable so individual tests can set vkgHealth; reset in beforeEach.
 let mockNamespace: Record<string, unknown> = { ...baseNamespace };
 
+// The Overview hides its technical rows behind a UX switch; pin it on so those
+// rows stay covered, and flip it off in the test that checks they are hidden.
+const mockUx = vi.hoisted(() => ({ showTechnical: true }));
+vi.mock("@constants/ux", () => ({
+  get SHOW_GRAPH_TECHNICAL_DETAILS() {
+    return mockUx.showTechnical;
+  },
+}));
+
 vi.mock("../api-hooks/use-get-namespace", () => ({
   useGetNamespace: () => ({
     data: {
@@ -117,6 +126,19 @@ describe("GetNamespace", () => {
     expect(
       screen.getByRole("heading", { name: "Graph details" }),
     ).toBeInTheDocument();
+  });
+
+  it("hides the technical rows when the switch is off", () => {
+    mockUx.showTechnical = false;
+    try {
+      render(<GetNamespace />, { wrapper });
+      expect(screen.getByText("admin@example.com")).toBeInTheDocument();
+      expect(screen.queryByText("Namespace ID")).not.toBeInTheDocument();
+      expect(screen.queryByText("ns-1")).not.toBeInTheDocument();
+      expect(screen.queryByText("VKG health")).not.toBeInTheDocument();
+    } finally {
+      mockUx.showTechnical = true;
+    }
   });
 
   it("renders the summary section", () => {
@@ -214,5 +236,4 @@ describe("GetNamespace", () => {
     const link = screen.getByRole("link", { name: "My Database" });
     expect(link).toHaveAttribute("href", "/namespaces/ns-1/sources/src-1");
   });
-
 });

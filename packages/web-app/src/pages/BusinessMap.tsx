@@ -92,13 +92,6 @@ export const BusinessMapPage: React.FC = () => {
         .filter((s) => s.sourceType === "DATABASE" && s.sourceId),
     [sources.data],
   );
-  const docSourceCount = useMemo(
-    () =>
-      (sources.data?.pages ?? [])
-        .flatMap((p) => p.items ?? [])
-        .filter((s) => s.sourceType === "DOCUMENTS").length,
-    [sources.data],
-  );
   const tableLists = useQueries({
     queries: dbSources.map((s) => ({
       queryKey: ["sourceTables-firstPage", namespaceId, s.sourceId],
@@ -284,10 +277,11 @@ export const BusinessMapPage: React.FC = () => {
 
   return (
     <SpaceBetween size="m">
+      {/* Map and data card side by side at every width. */}
       <Grid
         gridDefinition={[
-          { colspan: { default: 12, l: 8 } },
-          { colspan: { default: 12, l: 4 } },
+          { colspan: { default: 7, l: 8 } },
+          { colspan: { default: 5, l: 4 } },
         ]}
       >
         <SpaceBetween size="m">
@@ -321,6 +315,7 @@ export const BusinessMapPage: React.FC = () => {
                   edges={graph.edges}
                   layout="force"
                   collapseStandalone={false}
+                  refitAfterLayout
                   onNodeSelect={(n) => n && setSelected(n.id)}
                 />
               </div>
@@ -340,7 +335,15 @@ export const BusinessMapPage: React.FC = () => {
           )}
         </SpaceBetween>
 
-        <SpaceBetween size="m">
+        {/* Stays in view while the map scrolls; long cards scroll inside. */}
+        <div
+          style={{
+            position: "sticky",
+            top: 16,
+            maxHeight: "calc(100vh - 32px)",
+            overflowY: "auto",
+          }}
+        >
           {current && (
             <DataCard
               namespaceId={namespaceId}
@@ -359,22 +362,7 @@ export const BusinessMapPage: React.FC = () => {
               }
             />
           )}
-          <Container header={<Header variant="h2">In this graph</Header>}>
-            <Grid
-              gridDefinition={[
-                { colspan: 6 },
-                { colspan: 6 },
-                { colspan: 6 },
-                { colspan: 6 },
-              ]}
-            >
-              <Count n={model.entities.length} label="business things" />
-              <Count n={model.rules.length} label="rules" />
-              <Count n={docSourceCount} label="document collections" />
-              <Count n={dbSources.length} label="data connections" />
-            </Grid>
-          </Container>
-        </SpaceBetween>
+        </div>
       </Grid>
       {editing && current && currentRef && (
         <EditDescriptionModal
@@ -400,16 +388,3 @@ export const BusinessMapPage: React.FC = () => {
     </SpaceBetween>
   );
 };
-
-function Count({ n, label }: { n: number; label: string }) {
-  return (
-    <div>
-      <Box fontSize="heading-l" fontWeight="bold">
-        {n}
-      </Box>
-      <Box variant="small" color="text-body-secondary">
-        {label}
-      </Box>
-    </div>
-  );
-}

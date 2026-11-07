@@ -40,3 +40,10 @@ export const SHOW_DASHBOARD = false;
 /** Show the Business map tab (a plain-language picture of the graph's things,
  * relationships and rules) on each context graph. */
 export const SHOW_BUSINESS_MAP = true;
+
+/**
+ * Technical rows in a context graph's Overview "Graph details": the namespace
+ * ID, the internal name and VKG health. Display name, owner, status, sources,
+ * dates and description stay visible.
+ */
+export const SHOW_GRAPH_TECHNICAL_DETAILS = false;

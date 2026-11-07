@@ -43,6 +43,7 @@ import {
   localizeNamespaceStatus,
   localizeVkgHealth,
 } from "@utils/namespace-status";
+import { SHOW_GRAPH_TECHNICAL_DETAILS } from "@constants/ux";
 import { useAppI18n } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
@@ -139,8 +140,12 @@ export const GetNamespace: React.FC = () => {
         <KeyValuePairs
           columns={3}
           items={[
-            { label: t("Namespace ID"), value: ns.namespaceId },
-            { label: t("Name"), value: ns.name },
+            ...(SHOW_GRAPH_TECHNICAL_DETAILS
+              ? [
+                  { label: t("Namespace ID"), value: ns.namespaceId },
+                  { label: t("Name"), value: ns.name },
+                ]
+              : []),
             { label: t("Owner"), value: ns.owner },
             {
               label: t("Language"),
@@ -178,40 +183,45 @@ export const GetNamespace: React.FC = () => {
                 </StatusIndicator>
               ),
             },
-            {
-              label: t("VKG health"),
-              value: (() => {
-                const vkgHealth = ns.vkgHealth ?? VkgHealthStatus.UNKNOWN;
-                // Prefer the server-provided reason (the live cause) when
-                // present; fall back to the static per-status description.
-                const vkgHealthContent =
-                  ns.vkgHealthReason ?? t(VKG_HEALTH_DESCRIPTIONS[vkgHealth]);
-                return (
-                  <Popover
-                    dismissButton={false}
-                    position="top"
-                    triggerType="text"
-                    header={t("VKG health")}
-                    content={vkgHealthContent}
-                  >
-                    <StatusIndicator
-                      type={
-                        vkgHealth === VkgHealthStatus.HEALTHY
-                          ? "success"
-                          : vkgHealth === VkgHealthStatus.UNAVAILABLE ||
-                              vkgHealth === VkgHealthStatus.DEGRADED
-                            ? "error"
-                            : vkgHealth === VkgHealthStatus.PROVISIONING
-                              ? "in-progress"
-                              : "stopped"
-                      }
-                    >
-                      {localizeVkgHealth(vkgHealth, t)}
-                    </StatusIndicator>
-                  </Popover>
-                );
-              })(),
-            },
+            ...(SHOW_GRAPH_TECHNICAL_DETAILS
+              ? [
+                  {
+                    label: t("VKG health"),
+                    value: (() => {
+                      const vkgHealth = ns.vkgHealth ?? VkgHealthStatus.UNKNOWN;
+                      // Prefer the server-provided reason (the live cause) when
+                      // present; fall back to the static per-status description.
+                      const vkgHealthContent =
+                        ns.vkgHealthReason ??
+                        t(VKG_HEALTH_DESCRIPTIONS[vkgHealth]);
+                      return (
+                        <Popover
+                          dismissButton={false}
+                          position="top"
+                          triggerType="text"
+                          header={t("VKG health")}
+                          content={vkgHealthContent}
+                        >
+                          <StatusIndicator
+                            type={
+                              vkgHealth === VkgHealthStatus.HEALTHY
+                                ? "success"
+                                : vkgHealth === VkgHealthStatus.UNAVAILABLE ||
+                                    vkgHealth === VkgHealthStatus.DEGRADED
+                                  ? "error"
+                                  : vkgHealth === VkgHealthStatus.PROVISIONING
+                                    ? "in-progress"
+                                    : "stopped"
+                            }
+                          >
+                            {localizeVkgHealth(vkgHealth, t)}
+                          </StatusIndicator>
+                        </Popover>
+                      );
+                    })(),
+                  },
+                ]
+              : []),
             {
               label: t("Sources"),
               value: String(ns.sourceCount ?? 0),
