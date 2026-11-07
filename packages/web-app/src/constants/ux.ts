@@ -47,3 +47,10 @@ export const SHOW_BUSINESS_MAP = true;
  * dates and description stay visible.
  */
 export const SHOW_GRAPH_TECHNICAL_DETAILS = false;
+
+/**
+ * The "Graph explorer" tab on each context graph. When hidden, the explorer is
+ * still reachable from the Business map ("View the full ontology") and by URL,
+ * and its tab shows while it is open.
+ */
+export const SHOW_GRAPH_EXPLORER_TAB = false;

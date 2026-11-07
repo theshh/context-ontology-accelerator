@@ -290,6 +290,17 @@ export const BusinessMapPage: React.FC = () => {
               <Header
                 variant="h2"
                 description="Hover a circle to see its fields. Click it for details."
+                actions={
+                  <Link
+                    href={`${base}/ontology/graph`}
+                    onFollow={(e) => {
+                      e.preventDefault();
+                      navigate(`${base}/ontology/graph`);
+                    }}
+                  >
+                    View the full ontology
+                  </Link>
+                }
               >
                 Business map
               </Header>

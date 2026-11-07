@@ -17,7 +17,7 @@ import Header from "@cloudscape-design/components/header";
 import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
-import { SHOW_BUSINESS_MAP } from "@constants/ux";
+import { SHOW_BUSINESS_MAP, SHOW_GRAPH_EXPLORER_TAB } from "@constants/ux";
 import Tabs from "@cloudscape-design/components/tabs";
 import { NamespaceStatus } from "@coa/control-plane-client";
 import { useGetNamespace } from "@api-hooks/use-get-namespace";
@@ -120,7 +120,11 @@ export const ContextGraphShell: React.FC = () => {
           { id: "overview", label: "Overview" },
           ...(SHOW_BUSINESS_MAP ? [{ id: "map", label: "Business map" }] : []),
           { id: "curation", label: "Curation" },
-          { id: "explorer", label: "Graph explorer" },
+          // When hidden, the tab still shows while the explorer is open (it is
+          // reached from the Business map's "View the full ontology" link).
+          ...(SHOW_GRAPH_EXPLORER_TAB || tab === "explorer"
+            ? [{ id: "explorer", label: "Graph explorer" }]
+            : []),
           { id: "settings", label: "Settings" },
         ]}
       />

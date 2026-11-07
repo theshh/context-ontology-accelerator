@@ -227,6 +227,13 @@ describe("BusinessMapPage", () => {
     expect(screen.getByDisplayValue("job")).toBeInTheDocument();
   });
 
+  it("links to the full ontology in the Graph explorer", async () => {
+    renderPage();
+    expect(
+      await screen.findByRole("link", { name: "View the full ontology" }),
+    ).toHaveAttribute("href", expect.stringMatching(/\/ontology\/graph$/));
+  });
+
   it("switches the panel when a circle is clicked", async () => {
     renderPage();
     await userEvent.click(await screen.findByText("circle Officer"));
