@@ -67,6 +67,7 @@ import Badge from "@cloudscape-design/components/badge";
 import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import FileUpload from "@cloudscape-design/components/file-upload";
 import Input from "@cloudscape-design/components/input";
+import { SHOW_REFERENCE_ONTOLOGIES_TAB } from "@constants/ux";
 import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
@@ -912,9 +913,15 @@ export function OntologyPage() {
                       <Link variant="info">{t("Info")}</Link>
                     </Popover>
                   }
-                  description={t(
-                    "Pick the ontologies to ground against for this run. Accepted induced ontologies are pre-selected (deselect to skip). Load foundational/uploaded ontologies from the Reference ontologies tab first.",
-                  )}
+                  description={
+                    SHOW_REFERENCE_ONTOLOGIES_TAB
+                      ? t(
+                          "Pick the ontologies to ground against for this run. Accepted induced ontologies are pre-selected (deselect to skip). Load foundational/uploaded ontologies from the Reference ontologies tab first.",
+                        )
+                      : t(
+                          "Pick the ontologies to ground against for this run. Accepted induced ontologies are pre-selected (deselect to skip).",
+                        )
+                  }
                   constraintText={t(
                     "Ontologies still embedding or failed to ingest are shown but not selectable.",
                   )}
@@ -1077,26 +1084,37 @@ export function OntologyPage() {
         </Modal>
       )}
 
-      <Tabs
-        activeTabId={activeTab}
-        onChange={({ detail }) => setActiveTab(detail.activeTabId)}
-        tabs={[
-          {
-            id: "proposals",
-            label: t("Proposals"),
-            content: (
-              <ProposalsTab apiClient={apiClient} namespace={namespaceId} />
-            ),
-          },
-          {
-            id: "ontologies",
-            label: t("Reference ontologies"),
-            content: (
-              <OntologiesTab apiClient={apiClient} namespace={namespaceId} />
-            ),
-          },
-        ]}
-      />
+      {!SHOW_REFERENCE_ONTOLOGIES_TAB ? (
+        // Proposals only, with no tab strip. The key follows activeTab so the
+        // completed-run refresh (a brief switch to "ontologies" and back)
+        // still remounts the list, as it does inside the Tabs.
+        <ProposalsTab
+          key={activeTab === "proposals" ? "proposals" : "refresh"}
+          apiClient={apiClient}
+          namespace={namespaceId}
+        />
+      ) : (
+        <Tabs
+          activeTabId={activeTab}
+          onChange={({ detail }) => setActiveTab(detail.activeTabId)}
+          tabs={[
+            {
+              id: "proposals",
+              label: t("Proposals"),
+              content: (
+                <ProposalsTab apiClient={apiClient} namespace={namespaceId} />
+              ),
+            },
+            {
+              id: "ontologies",
+              label: t("Reference ontologies"),
+              content: (
+                <OntologiesTab apiClient={apiClient} namespace={namespaceId} />
+              ),
+            },
+          ]}
+        />
+      )}
     </SpaceBetween>
   );
 }

@@ -183,6 +183,17 @@ const getOntologyIngestStatus = vi.fn();
 const listAllProposals = vi.fn();
 const triggerInduction = vi.fn();
 const deleteOntology = vi.fn();
+// The Reference ontologies tab is behind a UX switch (off by default); pin it
+// on so the tab's tests can reach it, and flip it off in the test that checks
+// the page shows proposals alone.
+const mockUx = vi.hoisted(() => ({ referenceTab: true }));
+vi.mock("@constants/ux", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@constants/ux")>()),
+  get SHOW_REFERENCE_ONTOLOGIES_TAB() {
+    return mockUx.referenceTab;
+  },
+}));
+
 vi.mock("../services/ontology-engine", () => ({
   listOntologies: (...args: unknown[]) => listOntologies(...args),
   listFoundationalOntologies: (...args: unknown[]) =>
@@ -266,6 +277,28 @@ async function renderReferenceOntologiesTab() {
   fireEvent.click(await view.findByText("Reference ontologies"));
   return view;
 }
+
+describe("Ontology induction page with the Reference ontologies tab hidden", () => {
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    listAllProposals.mockResolvedValue([]);
+    mockApiGet.mockResolvedValue({ items: [] });
+  });
+
+  it("shows the proposals list with no tab strip", async () => {
+    mockUx.referenceTab = false;
+    try {
+      const result = renderPage();
+      const view = within(result.container);
+      await waitFor(() => expect(listAllProposals).toHaveBeenCalled());
+      expect(view.queryByText("Reference ontologies")).not.toBeInTheDocument();
+      expect(view.queryByRole("tablist")).not.toBeInTheDocument();
+    } finally {
+      mockUx.referenceTab = true;
+    }
+  });
+});
 
 describe("OntologiesTab Actions cell", () => {
   beforeEach(() => {

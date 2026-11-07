@@ -1186,6 +1186,8 @@ export const MESSAGES_JA = {
     "この実行では、ここで選択したオントロジーだけをグラウンディング先にします。名前空間で承認済みの誘導オントロジーは既定で選択されますが、解除できます。何も選択しない場合、すべてのテーブルと概念を新規として扱います。",
   "Pick the ontologies to ground against for this run. Accepted induced ontologies are pre-selected (deselect to skip). Load foundational/uploaded ontologies from the Reference ontologies tab first.":
     "この実行のグラウンディング先を選択します。承認済みの誘導オントロジーは事前に選択されています。基盤またはアップロード済みオントロジーは、先に「参照オントロジー」タブから読み込んでください。",
+  "Pick the ontologies to ground against for this run. Accepted induced ontologies are pre-selected (deselect to skip).":
+    "この実行のグラウンディング先を選択します。承認済みの誘導オントロジーは事前に選択されています。",
   "Ontologies still embedding or failed to ingest are shown but not selectable.":
     "埋め込み処理中または取り込みに失敗したオントロジーは表示されますが、選択できません。",
   "Could not load ontologies: {error}":

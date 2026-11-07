@@ -61,3 +61,10 @@ export const SHOW_GRAPH_EXPLORER_TAB = false;
  * and opens the rule's lineage as before.
  */
 export const SHOW_BUSINESS_MAP_RULE_FILTER = false;
+
+/**
+ * Curation -> Ontology induction: the "Reference ontologies" tab (load and
+ * manage foundational/uploaded ontologies). When hidden, the page shows the
+ * proposals list alone with no tab strip.
+ */
+export const SHOW_REFERENCE_ONTOLOGIES_TAB = false;
