@@ -39,6 +39,7 @@ import {
   DEFAULT_GRAPH_URI_BASE,
 } from "../../constants";
 import { TABLE_NAMES } from "@coa/shared";
+import { API_LAMBDA_MEMORY_MB } from "../../utils/snapstart";
 
 export interface ServeStackProps extends cdk.StackProps {
   /** VPC for AgentCore Runtime network interfaces. */
@@ -336,7 +337,7 @@ export class ServeStack extends SCLStack {
       handler: "index.handler",
       code: proxyCode,
       timeout: cdk.Duration.seconds(30),
-      memorySize: 512,
+      memorySize: API_LAMBDA_MEMORY_MB,
       environment: {
         OPENSEARCH_ENDPOINT: opensearchEndpoint,
       },

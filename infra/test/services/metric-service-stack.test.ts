@@ -59,8 +59,10 @@ describe("MetricServiceStack", () => {
     template.hasResourceProperties("AWS::Lambda::Function", {
       Runtime: "python3.12",
       Timeout: 30,
-      MemorySize: 512,
+      MemorySize: 1024,
+      SnapStart: { ApplyOn: "PublishedVersions" },
     });
+    template.hasResourceProperties("AWS::Lambda::Alias", { Name: "live" });
   });
 
   test("Lambda is placed in VPC with private subnets", () => {

@@ -39,6 +39,12 @@ import {
   PathLambdaMap,
   MethodLambdaMap,
 } from "../../utils/api-utils";
+import {
+  API_LAMBDA_ALIAS,
+  API_LAMBDA_MEMORY_MB,
+  SNAPSTART_FUNCTION_PROPS,
+  addApiLiveAlias,
+} from "../../utils/snapstart";
 
 /**
  * Smithy spec paths deliberately excluded from the 501-stub guard in
@@ -195,7 +201,8 @@ export class ApiStack extends SCLStack {
         ),
       }),
       timeout: cdk.Duration.seconds(10),
-      memorySize: 256,
+      memorySize: API_LAMBDA_MEMORY_MB,
+      ...SNAPSTART_FUNCTION_PROPS,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.authorizerSecurityGroup],
@@ -211,6 +218,9 @@ export class ApiStack extends SCLStack {
         NAMESPACES_TABLE_NAME: namespacesTableName,
       },
     });
+
+    // SnapStart: API Gateway invokes the `live` alias (see utils/snapstart).
+    const authorizerAlias = addApiLiveAlias(authorizerFn);
 
     props.rolesTable.grantReadData(authorizerFn);
     props.resourceRoleMappingsTable.grantReadData(authorizerFn);
@@ -326,7 +336,7 @@ export class ApiStack extends SCLStack {
           statements: [
             new iam.PolicyStatement({
               actions: ["lambda:InvokeFunction"],
-              resources: [authorizerFn.functionArn],
+              resources: [authorizerAlias.functionArn],
             }),
           ],
         }),
@@ -370,7 +380,9 @@ export class ApiStack extends SCLStack {
     spec.info.description =
       "Context Ontology Accelerator REST API — namespace, ingestion, and query management.";
 
-    // Resolve Lambda ARNs from SSM (avoids cross-stack CF exports)
+    // Resolve Lambda ARNs from SSM (avoids cross-stack CF exports). The SSM
+    // values are unqualified; API Gateway invokes the SnapStart `live` alias
+    // that each owning stack publishes (see utils/snapstart).
     const handlers: PathLambdaMap = { ...(props.pathHandlers ?? {}) };
     const resolvedSsmArns = new Map<string, string>();
     for (const [apiPath, ssmPath] of Object.entries(
@@ -382,7 +394,7 @@ export class ApiStack extends SCLStack {
           new cdk.CfnDynamicReference(
             cdk.CfnDynamicReferenceService.SSM,
             ssmPath,
-          ).toString(),
+          ).toString() + `:${API_LAMBDA_ALIAS}`,
         );
       }
       handlers[apiPath] = resolvedSsmArns.get(ssmPath)!;
@@ -498,7 +510,7 @@ export class ApiStack extends SCLStack {
     };
 
     fillAuthorizerParameters(spec, {
-      authorizerLambdaArn: authorizerFn.functionArn,
+      authorizerLambdaArn: authorizerAlias.functionArn,
       authorizerRoleArn: authorizerRole.roleArn,
       region: this.region,
       unsecuredPaths: ["/health"],

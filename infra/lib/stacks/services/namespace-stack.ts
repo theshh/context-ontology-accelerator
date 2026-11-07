@@ -21,6 +21,11 @@ import { grantIdempotencyTable } from "../../utils/idempotency";
 import { NamespaceDeletionPipeline } from "./namespace-deletion-pipeline";
 import { METRIC_API_FUNCTION_NAME } from "./metric-service-stack";
 import { TABLE_NAMES } from "@coa/shared";
+import {
+  API_LAMBDA_MEMORY_MB,
+  SNAPSTART_FUNCTION_PROPS,
+  addApiLiveAlias,
+} from "../../utils/snapstart";
 
 export interface NamespaceStackProps extends cdk.StackProps {
   /** VPC for Lambda placement. */
@@ -675,7 +680,8 @@ export class NamespaceStack extends SCLStack {
         handler: "coa_control_plane.namespace.namespace_api_handler.handler",
         code: lambdaCode,
         timeout: cdk.Duration.seconds(15),
-        memorySize: 256,
+        memorySize: API_LAMBDA_MEMORY_MB,
+        ...SNAPSTART_FUNCTION_PROPS,
         vpc: props.vpc,
         vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
         securityGroups: [props.lambdaSecurityGroup],
@@ -888,7 +894,8 @@ export class NamespaceStack extends SCLStack {
       handler: "coa_control_plane.roles.namespace_roles_handler.handler",
       code: lambdaCode,
       timeout: cdk.Duration.seconds(10),
-      memorySize: 256,
+      memorySize: API_LAMBDA_MEMORY_MB,
+      ...SNAPSTART_FUNCTION_PROPS,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       // Shared platform Lambda SG (also on the two Lambdas below): a per-function
@@ -907,7 +914,8 @@ export class NamespaceStack extends SCLStack {
       handler: "coa_control_plane.roles.list_platform_roles_handler.handler",
       code: lambdaCode,
       timeout: cdk.Duration.seconds(5),
-      memorySize: 256,
+      memorySize: API_LAMBDA_MEMORY_MB,
+      ...SNAPSTART_FUNCTION_PROPS,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.lambdaSecurityGroup],
@@ -928,7 +936,8 @@ export class NamespaceStack extends SCLStack {
       handler: "coa_control_plane.grants.grants_handler.handler",
       code: lambdaCode,
       timeout: cdk.Duration.seconds(10),
-      memorySize: 256,
+      memorySize: API_LAMBDA_MEMORY_MB,
+      ...SNAPSTART_FUNCTION_PROPS,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.lambdaSecurityGroup],
@@ -1068,6 +1077,16 @@ export class NamespaceStack extends SCLStack {
       stringValue: loginRole.roleArn,
       description: "SMUS admin login role ARN",
     });
+
+    // SnapStart: API Gateway invokes the `live` alias (see utils/snapstart).
+    for (const fn of [
+      namespaceApiFn,
+      rolesApiFn,
+      platformRolesApiFn,
+      grantsApiFn,
+    ]) {
+      addApiLiveAlias(fn);
+    }
 
     new ssm.StringParameter(this, "SsmNamespaceApiFnArn", {
       parameterName: `${ssmPrefix}/namespace/api-fn-arn`,

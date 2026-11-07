@@ -23,6 +23,11 @@ import {
   GRAPH_SOURCES_ENV,
   graphSourcesEnabled,
 } from "../../utils/graph-sources";
+import {
+  API_LAMBDA_MEMORY_MB,
+  SNAPSTART_FUNCTION_PROPS,
+  addApiLiveAlias,
+} from "../../utils/snapstart";
 
 export interface DataLayerStackProps extends cdk.StackProps {
   /** VPC for Lambda placement (AgentCore Runtime requires VPC connectivity). */
@@ -78,7 +83,8 @@ export class DataLayerStack extends SCLStack {
       handler: "coa_data_layer.handler.handler",
       code: lambdaCode,
       timeout: cdk.Duration.seconds(30),
-      memorySize: 256,
+      memorySize: API_LAMBDA_MEMORY_MB,
+      ...SNAPSTART_FUNCTION_PROPS,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.lambdaSecurityGroup],
@@ -112,6 +118,8 @@ export class DataLayerStack extends SCLStack {
     );
 
     // ── Publish Lambda ARN to SSM ──────────────────────────────────
+    // SnapStart: API Gateway invokes the `live` alias (see utils/snapstart).
+    addApiLiveAlias(this.apiFn);
     new ssm.StringParameter(this, "SsmDataLayerApiFnArn", {
       parameterName: `${ssmPrefix}/data-layer/api-fn-arn`,
       stringValue: this.apiFn.functionArn,

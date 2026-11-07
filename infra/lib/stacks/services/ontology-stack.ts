@@ -35,6 +35,11 @@ import {
   DEFAULT_BEDROCK_CHAT_MODEL_ID,
   DEFAULT_BEDROCK_INDUCTION_MODEL_ID,
 } from "../../constants";
+import {
+  API_LAMBDA_MEMORY_MB,
+  SNAPSTART_FUNCTION_PROPS,
+  addApiLiveAlias,
+} from "../../utils/snapstart";
 
 /** Name (without the `{prefix}-{env}-` prefix) of the ontology API proxy Lambda. */
 export const ONTOLOGY_API_PROXY_FUNCTION_NAME = "ontology-api-proxy";
@@ -1132,7 +1137,8 @@ export class OntologyStack extends SCLStack {
         ),
       }),
       timeout: cdk.Duration.seconds(60),
-      memorySize: 256,
+      memorySize: API_LAMBDA_MEMORY_MB,
+      ...SNAPSTART_FUNCTION_PROPS,
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.network.lambdaSecurityGroup],
@@ -1176,6 +1182,9 @@ export class OntologyStack extends SCLStack {
         resources: ["*"],
       }),
     );
+
+    // SnapStart: API Gateway invokes the `live` alias (see utils/snapstart).
+    addApiLiveAlias(apiProxyFn);
 
     new ssm.StringParameter(this, "SsmOntologyApiFnArn", {
       parameterName: `${ssmPrefix}/ontology-engine/api-fn-arn`,

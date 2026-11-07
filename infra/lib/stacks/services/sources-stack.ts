@@ -57,6 +57,11 @@ import {
   DEFAULT_BEDROCK_MODEL_ID,
 } from "../../constants";
 import type { IAlarmActionStrategy } from "cdk-monitoring-constructs/lib/common/alarm/action";
+import {
+  API_LAMBDA_MEMORY_MB,
+  SNAPSTART_FUNCTION_PROPS,
+  addApiLiveAlias,
+} from "../../utils/snapstart";
 
 export interface SourcesStackProps extends cdk.StackProps {
   readonly network: NetworkStack;
@@ -3053,7 +3058,8 @@ export class SourcesStack extends SCLStack {
         architecture: "arm64",
       }),
       timeout: cdk.Duration.seconds(30),
-      memorySize: 256,
+      memorySize: API_LAMBDA_MEMORY_MB,
+      ...SNAPSTART_FUNCTION_PROPS,
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [lambdaSecurityGroup],
@@ -4197,6 +4203,8 @@ export class SourcesStack extends SCLStack {
     // ================================================================
     // SSM Parameters
     // ================================================================
+    // SnapStart: API Gateway invokes the `live` alias (see utils/snapstart).
+    addApiLiveAlias(sourcesApiFn);
     new ssm.StringParameter(this, "SsmSourcesApiFnArn", {
       parameterName: `${ssmPrefix}/sources/api-fn-arn`,
       stringValue: sourcesApiFn.functionArn,

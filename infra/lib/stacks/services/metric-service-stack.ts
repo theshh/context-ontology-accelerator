@@ -33,6 +33,11 @@ import {
 import { bundlePython } from "../../utils/python-bundling";
 import { grantIdempotencyTable } from "../../utils/idempotency";
 import { bedrockModelArn } from "../../utils/bedrock-utils";
+import {
+  API_LAMBDA_MEMORY_MB,
+  SNAPSTART_FUNCTION_PROPS,
+  addApiLiveAlias,
+} from "../../utils/snapstart";
 
 /** Name (without the `{prefix}-{env}-` prefix) of the metric API Lambda. */
 export const METRIC_API_FUNCTION_NAME = "metric-api";
@@ -164,7 +169,8 @@ export class MetricServiceStack extends SCLStack {
       handler: "coa_metrics.api.metric_api_handler.handler",
       code: lambdaCode,
       timeout: cdk.Duration.seconds(30),
-      memorySize: 512,
+      memorySize: API_LAMBDA_MEMORY_MB,
+      ...SNAPSTART_FUNCTION_PROPS,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.lambdaSecurityGroup],
@@ -275,6 +281,8 @@ export class MetricServiceStack extends SCLStack {
     );
 
     // ── Publish Lambda ARN to SSM ──────────────────────────────────
+    // SnapStart: API Gateway invokes the `live` alias (see utils/snapstart).
+    addApiLiveAlias(this.metricApiFn);
     new ssm.StringParameter(this, "SsmMetricApiFnArn", {
       parameterName: `${ssmPrefix}/metric/api-fn-arn`,
       stringValue: this.metricApiFn.functionArn,

@@ -529,12 +529,22 @@ describe("NamespaceStack", () => {
     });
   });
 
+  test("publishes a live alias on each API Lambda for SnapStart", () => {
+    // API Gateway invokes `<arn>:live` (ApiStack); without the alias it 404s.
+    template.resourcePropertiesCountIs(
+      "AWS::Lambda::Alias",
+      { Name: "live" },
+      4,
+    );
+  });
+
   test("creates Create Namespace Lambda in VPC with private subnets", () => {
     template.hasResourceProperties("AWS::Lambda::Function", {
       FunctionName: `${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-namespace-api`,
       Runtime: "python3.12",
       Timeout: 15,
-      MemorySize: 256,
+      MemorySize: 1024,
+      SnapStart: { ApplyOn: "PublishedVersions" },
       VpcConfig: {
         SubnetIds: Match.anyValue(),
         SecurityGroupIds: Match.anyValue(),
