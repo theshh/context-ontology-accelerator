@@ -48,7 +48,10 @@ import {
 } from "@components/business-map/model";
 import { DataCard, type TableRef } from "@components/business-map/DataCard";
 import { LineageStrip } from "@components/business-map/LineageStrip";
-import { AddKindModal, EditDescriptionModal } from "@components/business-map/EditModals";
+import {
+  AddKindModal,
+  EditDescriptionModal,
+} from "@components/business-map/EditModals";
 
 export const BusinessMapPage: React.FC = () => {
   const { namespaceId = "" } = useParams<{ namespaceId: string }>();
@@ -61,7 +64,10 @@ export const BusinessMapPage: React.FC = () => {
   const metrics = useListMetrics(namespaceId, 100);
 
   const ontologyIds = useMemo(
-    () => (ontologies.data ?? []).map((o) => o.ontologyId).filter(Boolean) as string[],
+    () =>
+      (ontologies.data ?? [])
+        .map((o) => o.ontologyId)
+        .filter(Boolean) as string[],
     [ontologies.data],
   );
   const overviews = useQueries({
@@ -124,7 +130,8 @@ export const BusinessMapPage: React.FC = () => {
       const sourceId = dbSources[i]?.sourceId;
       if (!sourceId) return;
       for (const t of q.data?.items ?? []) {
-        if (t.name && t.tableId) refs[t.name.toLowerCase()] = { sourceId, tableId: t.tableId };
+        if (t.name && t.tableId)
+          refs[t.name.toLowerCase()] = { sourceId, tableId: t.tableId };
       }
     });
     return refs;
@@ -161,7 +168,13 @@ export const BusinessMapPage: React.FC = () => {
           .map((d) => d.expression ?? "")
           .join("\n"),
       }));
-    return buildBusinessMap(classes, objectProps, dataProps, rules, tableConnections);
+    return buildBusinessMap(
+      classes,
+      objectProps,
+      dataProps,
+      rules,
+      tableConnections,
+    );
   }, [overviews, tableLists, dbSources, metrics.data]);
 
   const [selected, setSelected] = useState<string | null>(null);
@@ -172,8 +185,15 @@ export const BusinessMapPage: React.FC = () => {
     [...model.entities].sort((a, b) => b.rules.length - a.rules.length)[0];
 
   const ruleByName = Object.fromEntries(model.rules.map((r) => [r.name, r]));
-  const currentRef = current && !current.members && !current.kindOf ? tableRefs[current.table] : undefined;
-  const currentTable = useGetSourceTable(namespaceId, currentRef?.sourceId ?? "", currentRef?.tableId ?? "");
+  const currentRef =
+    current && !current.members && !current.kindOf
+      ? tableRefs[current.table]
+      : undefined;
+  const currentTable = useGetSourceTable(
+    namespaceId,
+    currentRef?.sourceId ?? "",
+    currentRef?.tableId ?? "",
+  );
   const [editing, setEditing] = useState(false);
   const [addingKind, setAddingKind] = useState(false);
   const ruleOptions = useMemo(
@@ -198,10 +218,20 @@ export const BusinessMapPage: React.FC = () => {
     const keep =
       rule === "all"
         ? null
-        : new Set(model.entities.filter((e) => e.rules.includes(rule)).map((e) => e.id));
+        : new Set(
+            model.entities
+              .filter((e) => e.rules.includes(rule))
+              .map((e) => e.id),
+          );
     const nodes: GraphNodeData[] = model.entities
       .filter((e) => !keep || keep.has(e.id))
-      .map((e) => ({ id: e.id, label: e.label, kind: "class" }));
+      .map((e) => ({
+        id: e.id,
+        label: e.label,
+        kind: "class",
+        // Shown as a ring of small nodes when the circle is hovered.
+        attributes: e.fields.map((f) => ({ label: humanize(f) })),
+      }));
     const edges: GraphEdgeData[] = model.links
       .filter((l) => !keep || (keep.has(l.source) && keep.has(l.target)))
       .map((l) => ({
@@ -217,7 +247,8 @@ export const BusinessMapPage: React.FC = () => {
   if (loading) {
     return (
       <Box textAlign="center" padding="xxl">
-        <Spinner size="large" /> <Box variant="p">Drawing the business map…</Box>
+        <Spinner size="large" />{" "}
+        <Box variant="p">Drawing the business map…</Box>
       </Box>
     );
   }
@@ -237,7 +268,13 @@ export const BusinessMapPage: React.FC = () => {
             Connect data and build the ontology first. The map appears once the
             graph knows what things it holds.
           </Box>
-          <Link onFollow={(e) => { e.preventDefault(); navigate(`${base}/ontology`); }} href={`${base}/ontology`}>
+          <Link
+            onFollow={(e) => {
+              e.preventDefault();
+              navigate(`${base}/ontology`);
+            }}
+            href={`${base}/ontology`}
+          >
             Go to Curation
           </Link>
         </Box>
@@ -247,55 +284,60 @@ export const BusinessMapPage: React.FC = () => {
 
   return (
     <SpaceBetween size="m">
-      <Box color="text-body-secondary">
-        The things this context graph keeps records about, and how they connect.
-      </Box>
-      <Grid gridDefinition={[{ colspan: { default: 12, l: 8 } }, { colspan: { default: 12, l: 4 } }]}>
+      <Grid
+        gridDefinition={[
+          { colspan: { default: 12, l: 8 } },
+          { colspan: { default: 12, l: 4 } },
+        ]}
+      >
         <SpaceBetween size="m">
-        <Container
-          header={
-            <Header
-              variant="h2"
-              description="Click a circle to see what it is, where its data lives and which rules use it. Scroll to zoom; drag to move."
-            >
-              Business map
-            </Header>
-          }
-        >
-          <SpaceBetween size="s">
-            <FormField
-              label="Show only what a rule uses"
-              description="Pick a rule (governed metric) to see just the business things it reads."
-            >
-              <Select
-                selectedOption={ruleOptions.find((o) => o.value === rule) ?? ruleOptions[0]}
-                onChange={({ detail }) => setRule(detail.selectedOption.value ?? "all")}
-                options={ruleOptions}
-                filteringType={ruleOptions.length > 8 ? "auto" : "none"}
-              />
-            </FormField>
-            <div style={{ height: 600 }}>
-              <OntologyGraphFlow
-                key={rule}
-                nodes={graph.nodes}
-                edges={graph.edges}
-                layout="force"
-                collapseStandalone={false}
-                onNodeSelect={(n) => n && setSelected(n.id)}
-              />
-            </div>
-          </SpaceBetween>
-        </Container>
-        {rule !== "all" && ruleByName[rule] && (
-          <LineageStrip
-            rule={ruleByName[rule]}
-            model={model}
-            onSelect={setSelected}
-            onOpenRule={() => navigate(`${base}/metrics/${encodeURIComponent(rule)}`)}
-            onAsk={() => navigate("/playground")}
-            onClose={() => setRule("all")}
-          />
-        )}
+          <Container
+            header={
+              <Header
+                variant="h2"
+                description="Hover a circle to see its fields. Click it for details."
+              >
+                Business map
+              </Header>
+            }
+          >
+            <SpaceBetween size="s">
+              <FormField label="Show only what a rule uses">
+                <Select
+                  selectedOption={
+                    ruleOptions.find((o) => o.value === rule) ?? ruleOptions[0]
+                  }
+                  onChange={({ detail }) =>
+                    setRule(detail.selectedOption.value ?? "all")
+                  }
+                  options={ruleOptions}
+                  filteringType={ruleOptions.length > 8 ? "auto" : "none"}
+                />
+              </FormField>
+              <div style={{ height: 600 }}>
+                <OntologyGraphFlow
+                  key={rule}
+                  nodes={graph.nodes}
+                  edges={graph.edges}
+                  layout="force"
+                  collapseStandalone={false}
+                  onNodeSelect={(n) => n && setSelected(n.id)}
+                />
+              </div>
+            </SpaceBetween>
+          </Container>
+          {rule !== "all" && ruleByName[rule] && (
+            <LineageStrip
+              rule={ruleByName[rule]}
+              model={model}
+              onSelect={setSelected}
+              onOpenRule={() =>
+                navigate(`${base}/metrics/${encodeURIComponent(rule)}`)
+              }
+              onAsk={() => navigate("/playground")}
+              onClose={() => setRule("all")}
+            />
+          )}
         </SpaceBetween>
 
         <SpaceBetween size="m">
@@ -318,7 +360,14 @@ export const BusinessMapPage: React.FC = () => {
             />
           )}
           <Container header={<Header variant="h2">In this graph</Header>}>
-            <Grid gridDefinition={[{ colspan: 6 }, { colspan: 6 }, { colspan: 6 }, { colspan: 6 }]}>
+            <Grid
+              gridDefinition={[
+                { colspan: 6 },
+                { colspan: 6 },
+                { colspan: 6 },
+                { colspan: 6 },
+              ]}
+            >
               <Count n={model.entities.length} label="business things" />
               <Count n={model.rules.length} label="rules" />
               <Count n={docSourceCount} label="document collections" />
@@ -333,14 +382,20 @@ export const BusinessMapPage: React.FC = () => {
           entity={current}
           tableRef={currentRef}
           current={{
-            description: currentTable.data?.businessMetadata?.description || current.description,
+            description:
+              currentTable.data?.businessMetadata?.description ||
+              current.description,
             synonyms: currentTable.data?.businessMetadata?.synonyms ?? [],
           }}
           onClose={() => setEditing(false)}
         />
       )}
       {addingKind && current && (
-        <AddKindModal namespaceId={namespaceId} parent={current} onClose={() => setAddingKind(false)} />
+        <AddKindModal
+          namespaceId={namespaceId}
+          parent={current}
+          onClose={() => setAddingKind(false)}
+        />
       )}
     </SpaceBetween>
   );

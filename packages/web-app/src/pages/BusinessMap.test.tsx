@@ -25,7 +25,9 @@ vi.mock("@components/graph/OntologyGraphFlow", () => ({
           circle {n.label}
         </button>
       ))}
-      <span>{edges.map((l) => `${l.source}-${l.label}-${l.target}`).join(",")}</span>
+      <span>
+        {edges.map((l) => `${l.source}-${l.label}-${l.target}`).join(",")}
+      </span>
     </div>
   ),
 }));
@@ -61,9 +63,17 @@ vi.mock("@api-hooks/use-metrics", () => ({
             {
               name: "headcount",
               label: "Headcount",
-              description: "Officers with an active job. Temporary staff not counted.",
+              description:
+                "Officers with an active job. Temporary staff not counted.",
               sourceTable: "employment",
-              expression: { dialects: [{ dialect: "TRINO", expression: "SELECT … FROM mpi_hrms.employment e" }] },
+              expression: {
+                dialects: [
+                  {
+                    dialect: "TRINO",
+                    expression: "SELECT … FROM mpi_hrms.employment e",
+                  },
+                ],
+              },
             },
           ],
         },
@@ -79,10 +89,19 @@ const send = vi.fn(async (cmd: { constructor: { name: string } }) => {
     return {
       classes: [
         { uri: `${NS}officer`, label: "officer", comment: "officer" },
-        { uri: `${NS}employment`, label: "employment", comment: "One period of employment" },
+        {
+          uri: `${NS}employment`,
+          label: "employment",
+          comment: "One period of employment",
+        },
       ],
       objectProperties: [
-        { uri: `${NS}officer_id`, label: "officer_id", domain: `${NS}Employment`, range: `${NS}Officer` },
+        {
+          uri: `${NS}officer_id`,
+          label: "officer_id",
+          domain: `${NS}Employment`,
+          range: `${NS}Officer`,
+        },
       ],
       datatypeProperties: [],
     };
@@ -91,9 +110,17 @@ const send = vi.fn(async (cmd: { constructor: { name: string } }) => {
     return {
       tableId: "mpi_hrms.employment",
       name: "employment",
-      businessMetadata: { description: "One period of employment for an officer.", synonyms: ["job"] },
+      businessMetadata: {
+        description: "One period of employment for an officer.",
+        synonyms: ["job"],
+      },
       columns: [
-        { name: "employment_type", dataType: "string", description: "P Permanent, C Contract, T Temporary", distinctValues: ["P", "C", "T"] },
+        {
+          name: "employment_type",
+          dataType: "string",
+          description: "P Permanent, C Contract, T Temporary",
+          distinctValues: ["P", "C", "T"],
+        },
         { name: "end_date", dataType: "date" },
       ],
     };
@@ -116,7 +143,10 @@ function renderPage() {
     <QueryClientProvider client={new QueryClient()}>
       <MemoryRouter initialEntries={["/namespaces/ns-1/map"]}>
         <Routes>
-          <Route path="/namespaces/:namespaceId/map" element={<BusinessMapPage />} />
+          <Route
+            path="/namespaces/:namespaceId/map"
+            element={<BusinessMapPage />}
+          />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -133,33 +163,59 @@ describe("BusinessMapPage", () => {
 
   it("opens on the most-used thing and shows its data card", async () => {
     renderPage();
-    expect(await screen.findByRole("heading", { name: "Employment" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Employment" }),
+    ).toBeInTheDocument();
     expect(screen.getAllByText("Headcount").length).toBeGreaterThan(0);
-    expect(screen.getByText("From MPI HRMS")).toBeInTheDocument();
-    // Fields in business words, with their codes and technical name.
-    expect(await screen.findByText("Employment type")).toBeInTheDocument();
-    expect(screen.getByText("P Permanent, C Contract, T Temporary")).toBeInTheDocument();
+    expect(screen.getByText(/^From MPI HRMS/)).toBeInTheDocument();
+    // Fields in business words; meaning and technical name open on click.
+    const field = await screen.findByRole("button", {
+      name: /Employment type/,
+    });
+    expect(screen.queryByText("employment_type")).not.toBeInTheDocument();
+    await userEvent.click(field);
+    expect(
+      screen.getByText("P Permanent, C Contract, T Temporary"),
+    ).toBeInTheDocument();
     expect(screen.getByText("employment_type")).toBeInTheDocument();
     expect(screen.getByText("Also called: job")).toBeInTheDocument();
-    // Relationships as sentences, and the three actions.
-    expect(screen.getByText(/Each Employment is linked to an Officer/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Edit description" })).toBeEnabled();
+    // Connected things, with the relationship sentence as a tooltip, and the three actions.
+    expect(
+      screen.getByTitle(/Each Employment is linked to an Officer/),
+    ).toHaveTextContent("Officer");
+    expect(
+      screen.getByRole("button", { name: "Edit description" }),
+    ).toBeEnabled();
     expect(screen.getByRole("button", { name: /Add a rule/ })).toBeEnabled();
     expect(screen.getByRole("button", { name: /Add a kind/ })).toBeEnabled();
   });
 
   it("shows how a rule is worked out when picked from the card", async () => {
     renderPage();
-    await userEvent.click(await screen.findByRole("button", { name: /Headcount\s*See how it's worked out/ }));
-    expect(await screen.findByText('How "Headcount" is worked out')).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Ask in Playground" })).toBeInTheDocument();
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: "Headcount: see how it's worked out",
+      }),
+    );
+    expect(
+      await screen.findByText('How "Headcount" is worked out'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Ask in Playground" }),
+    ).toBeInTheDocument();
   });
 
   it("opens the description editor prefilled from the catalog", async () => {
     renderPage();
     await screen.findByText("Employment type");
-    await userEvent.click(screen.getByRole("button", { name: "Edit description" }));
-    expect(await screen.findByDisplayValue("One period of employment for an officer.")).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Edit description" }),
+    );
+    expect(
+      await screen.findByDisplayValue(
+        "One period of employment for an officer.",
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByDisplayValue("job")).toBeInTheDocument();
   });
 
@@ -167,9 +223,11 @@ describe("BusinessMapPage", () => {
     renderPage();
     await userEvent.click(await screen.findByText("circle Officer"));
     await waitFor(() =>
-      expect(screen.getByRole("heading", { name: "Officer" })).toBeInTheDocument(),
+      expect(
+        screen.getByRole("heading", { name: "Officer" }),
+      ).toBeInTheDocument(),
     );
-    expect(screen.getByText("No rule uses this yet.")).toBeInTheDocument();
+    expect(screen.getByText("Rules (0)")).toBeInTheDocument();
   });
 
   it("counts things, rules, document collections and data connections", async () => {
@@ -184,9 +242,17 @@ describe("BusinessMapPage rule filter", () => {
   it("narrows the map to the things a rule uses", async () => {
     renderPage();
     await screen.findByText("circle Officer");
-    await userEvent.click(screen.getByRole("button", { name: /All business things/ }));
-    await userEvent.click(await screen.findByText("Headcount", { selector: "[data-testid] *, span" }).catch(() => screen.getAllByText("Headcount").slice(-1)[0]));
-    await waitFor(() => expect(screen.queryByText("circle Officer")).not.toBeInTheDocument());
+    await userEvent.click(
+      screen.getByRole("button", { name: /All business things/ }),
+    );
+    await userEvent.click(
+      await screen
+        .findByText("Headcount", { selector: "[data-testid] *, span" })
+        .catch(() => screen.getAllByText("Headcount").slice(-1)[0]),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText("circle Officer")).not.toBeInTheDocument(),
+    );
     expect(screen.getByText("circle Employment")).toBeInTheDocument();
   });
 });
