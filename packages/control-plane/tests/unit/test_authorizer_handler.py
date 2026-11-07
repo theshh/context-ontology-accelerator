@@ -25,6 +25,7 @@ def _reset_handler_state():
     h._roles_cache.clear()
     h._local_cache_version = 0
     h._namespaces_dao = None
+    h._table_daos.clear()
     yield
 
 
@@ -1422,3 +1423,53 @@ class TestGetNamespaceStatus:
         dao.get.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "GetItem")
         with patch.object(h, "_get_namespaces_dao", return_value=dao), pytest.raises(ClientError):
             h._get_namespace_status(_NS)
+
+
+class TestInitTimeSetup:
+    """_prime does the first request's setup at init, and never fails init."""
+
+    def test_does_nothing_outside_lambda(self, env_vars, monkeypatch):
+        import coa_control_plane.authorization.handler as h
+
+        monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
+        with patch.object(h, "_get_token_authorizer") as get_auth, patch.object(h, "DynamoDBDAO") as dao:
+            h._prime()
+        get_auth.assert_not_called()
+        dao.assert_not_called()
+
+    def test_fetches_keys_and_builds_daos_in_lambda(self, env_vars, monkeypatch):
+        import coa_control_plane.authorization.handler as h
+
+        monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "coa-dev-authorizer")
+        with patch.object(h, "_get_token_authorizer") as get_auth, patch.object(h, "DynamoDBDAO") as dao:
+            h._prime()
+        get_auth.return_value.prefetch_keys.assert_called_once()
+        tables = sorted(c.args[0] for c in dao.call_args_list)
+        assert tables == [
+            "coa-cache-invalidation",
+            "coa-namespaces",
+            "coa-resource-role-mappings",
+            "coa-roles",
+        ]
+
+    def test_failures_are_swallowed(self, env_vars, monkeypatch):
+        import coa_control_plane.authorization.handler as h
+
+        monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "coa-dev-authorizer")
+        with (
+            patch.object(h, "_get_token_authorizer", side_effect=RuntimeError("no network")),
+            patch.object(h, "DynamoDBDAO", side_effect=RuntimeError("no region")),
+        ):
+            h._prime()  # must not raise
+        assert h._table_daos == {}
+
+    def test_role_table_daos_are_reused(self, env_vars):
+        import coa_control_plane.authorization.handler as h
+
+        with patch.object(h, "DynamoDBDAO") as dao:
+            first = h._get_table_dao("coa-roles", "us-east-1")
+            second = h._get_table_dao("coa-roles", "us-east-1")
+            other = h._get_table_dao("coa-resource-role-mappings", "us-east-1")
+        assert first is second
+        assert dao.call_count == 2
+        assert other is not None

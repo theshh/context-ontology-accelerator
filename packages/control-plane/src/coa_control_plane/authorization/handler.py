@@ -162,6 +162,27 @@ def _check_cache_version() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Role tables (ResourceRoleMappings, Roles) — one DAO per table, reused
+# ---------------------------------------------------------------------------
+
+# table name -> DAO. Reusing the DAO keeps its connection pool, so warm
+# requests skip a new TLS handshake per table. Keyed by name so a changed
+# environment variable can never be served a DAO for the old table.
+_table_daos: dict[str, DynamoDBDAO] = {}
+
+
+def _get_table_dao(table: str, region: str) -> DynamoDBDAO:
+    dao = _table_daos.get(table)
+    if dao is None:
+        # Role resolution and Cedar evaluation run on every gated request. Fail
+        # fast instead of inheriting the DAO's background 30-second/three-attempt
+        # default.
+        dao = DynamoDBDAO(table, region=region, config=sync_boto_config())
+        _table_daos[table] = dao
+    return dao
+
+
+# ---------------------------------------------------------------------------
 # Namespace status lookup (for the ARCHIVED mutation guard)
 # ---------------------------------------------------------------------------
 
@@ -795,9 +816,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     resource_roles: list[dict[str, str]] = []
 
     if rrm_table:
-        # Role resolution runs on every gated request. Fail fast instead of
-        # inheriting the DAO's background 30-second/three-attempt default.
-        rrm_dao = DynamoDBDAO(rrm_table, region=region, config=sync_boto_config())
+        rrm_dao = _get_table_dao(rrm_table, region)
         try:
             global_roles, resource_roles = _resolve_roles(principal_id, result.groups, rrm_dao)
         except Exception:
@@ -838,9 +857,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             # exist. (Configuration/DynamoDB errors raise above and fail closed.)
 
     if roles_table:
-        # Cedar evaluation runs on every gated request. Same fail-fast
-        # rationale as rrm_dao above.
-        roles_dao = DynamoDBDAO(roles_table, region=region, config=sync_boto_config())
+        roles_dao = _get_table_dao(roles_table, region)
 
         try:
             is_allowed = _evaluate_cedar(
@@ -902,3 +919,41 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     )
 
     return _build_policy(principal_id, effect, resource_arn, auth_context)
+
+
+# ---------------------------------------------------------------------------
+# Init-time setup
+# ---------------------------------------------------------------------------
+
+
+def _prime() -> None:
+    """Do the first request's one-off setup during Lambda init instead.
+
+    Builds the token authorizer, fetches the signing keys (JWKS) and creates
+    the DynamoDB DAOs, so their boto3 model loading happens before any request.
+    With SnapStart this work is captured in the snapshot; network connections
+    are not, and the JWKS cache TTL still applies after a restore. Best effort:
+    any failure here leaves the lazy path to retry on the first request, so it
+    can never deny a request or crash init. Outside Lambda (tests, local use)
+    it does nothing.
+    """
+    if not os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        return
+    try:
+        _get_token_authorizer().prefetch_keys()
+    except Exception:
+        logger.warning("Init-time JWKS fetch failed; will fetch on first request", exc_info=True)
+    try:
+        region = os.environ["AWS_REGION"]
+        for env_name in ("RESOURCE_ROLE_MAPPINGS_TABLE_NAME", "ROLES_TABLE_NAME"):
+            table = os.environ.get(env_name)
+            if table:
+                _get_table_dao(table, region)
+        _get_cache_invalidation_dao()
+        if os.environ.get("NAMESPACES_TABLE_NAME"):
+            _get_namespaces_dao()
+    except Exception:
+        logger.warning("Init-time DAO setup failed; will retry on first request", exc_info=True)
+
+
+_prime()

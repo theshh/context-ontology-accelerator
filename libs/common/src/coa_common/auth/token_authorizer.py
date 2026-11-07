@@ -126,6 +126,15 @@ class TokenAuthorizer(ABC):
         token = self._extract_bearer_token(authorization_header)
         return self._verify_and_decode(token)
 
+    def prefetch_keys(self) -> None:
+        """Fetch and cache the JWKS now rather than on the first ``validate``.
+
+        Lets a Lambda do the fetch during init (and, with SnapStart, keep it in
+        the snapshot). The normal ``jwks_cache_ttl`` still applies, so keys
+        older than the TTL are fetched again on the next ``validate``.
+        """
+        self._get_jwks()
+
     def extract_groups(self, claims: dict[str, Any]) -> list[str]:
         """Public entry point for the IdP-specific group-claim extraction.
 
