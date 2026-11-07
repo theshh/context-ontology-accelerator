@@ -87,7 +87,23 @@ const send = vi.fn(async (cmd: { constructor: { name: string } }) => {
       datatypeProperties: [],
     };
   }
-  return { items: [{ name: "officer" }, { name: "employment" }] };
+  if (cmd.constructor.name === "GetSourceTableCommand") {
+    return {
+      tableId: "mpi_hrms.employment",
+      name: "employment",
+      businessMetadata: { description: "One period of employment for an officer.", synonyms: ["job"] },
+      columns: [
+        { name: "employment_type", dataType: "string", description: "P Permanent, C Contract, T Temporary", distinctValues: ["P", "C", "T"] },
+        { name: "end_date", dataType: "date" },
+      ],
+    };
+  }
+  return {
+    items: [
+      { name: "officer", tableId: "mpi_hrms.officer" },
+      { name: "employment", tableId: "mpi_hrms.employment" },
+    ],
+  };
 });
 vi.mock("@components/ControlPlaneClientProvider", () => ({
   useControlPlaneClient: () => ({ send }),
@@ -115,11 +131,36 @@ describe("BusinessMapPage", () => {
     expect(screen.getByText("employment-officer-officer")).toBeInTheDocument();
   });
 
-  it("opens on the most-used thing and shows its rules and data connection", async () => {
+  it("opens on the most-used thing and shows its data card", async () => {
     renderPage();
     expect(await screen.findByRole("heading", { name: "Employment" })).toBeInTheDocument();
     expect(screen.getAllByText("Headcount").length).toBeGreaterThan(0);
     expect(screen.getByText("From MPI HRMS")).toBeInTheDocument();
+    // Fields in business words, with their codes and technical name.
+    expect(await screen.findByText("Employment type")).toBeInTheDocument();
+    expect(screen.getByText("P Permanent, C Contract, T Temporary")).toBeInTheDocument();
+    expect(screen.getByText("employment_type")).toBeInTheDocument();
+    expect(screen.getByText("Also called: job")).toBeInTheDocument();
+    // Relationships as sentences, and the three actions.
+    expect(screen.getByText(/Each Employment is linked to an Officer/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit description" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /Add a rule/ })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /Add a kind/ })).toBeEnabled();
+  });
+
+  it("shows how a rule is worked out when picked from the card", async () => {
+    renderPage();
+    await userEvent.click(await screen.findByRole("button", { name: /Headcount\s*See how it's worked out/ }));
+    expect(await screen.findByText('How "Headcount" is worked out')).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ask in Playground" })).toBeInTheDocument();
+  });
+
+  it("opens the description editor prefilled from the catalog", async () => {
+    renderPage();
+    await screen.findByText("Employment type");
+    await userEvent.click(screen.getByRole("button", { name: "Edit description" }));
+    expect(await screen.findByDisplayValue("One period of employment for an officer.")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("job")).toBeInTheDocument();
   });
 
   it("switches the panel when a circle is clicked", async () => {

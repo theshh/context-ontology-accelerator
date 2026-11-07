@@ -7,13 +7,16 @@
  * relationship (object property), the data connection each thing lives in, and
  * the rules (metrics) that use it.
  *
- * Pure functions only, so the mapping is unit-tested without Chart.js.
+ * Pure functions only, so the mapping is unit-tested without a renderer.
  */
 
 export interface MapClassInput {
   uri: string;
   label?: string | null;
   comment?: string | null;
+  /** Named super-classes (rdfs:subClassOf). A class whose parent is on the map
+   * is drawn as a "kind of" that parent. */
+  subClassOf?: string[] | null;
 }
 export interface MapPropertyInput {
   uri: string;
@@ -34,6 +37,8 @@ export type TableConnections = Record<string, string>;
 
 export interface MapEntity {
   id: string;
+  /** Ontology class IRI (the first one, for a grouped circle). */
+  uri: string;
   /** Business label, e.g. "Agency" for `dim_agency`. */
   label: string;
   /** The underlying table/class name, for the technical line in the panel. */
@@ -42,6 +47,10 @@ export interface MapEntity {
   connection: string;
   rules: string[];
   attributeCount: number;
+  /** Field (column) names recorded on this thing, from its datatype properties. */
+  fields: string[];
+  /** Set when this thing is a kind of another one (a sub-class): the parent's id. */
+  kindOf?: string;
   /** Tables folded into this circle when several look-alike tables were grouped. */
   members?: string[];
 }
@@ -49,6 +58,8 @@ export interface MapLink {
   source: string;
   target: string;
   label: string;
+  /** "kind" for a sub-class link (child → parent); otherwise a relationship. */
+  kind?: "relationship" | "kind";
 }
 export interface MapRule {
   name: string;
@@ -56,6 +67,8 @@ export interface MapRule {
   description: string;
   unit: string;
   entities: string[];
+  /** The rule's calculation, for the "show the calculation" fold. */
+  sql: string;
 }
 export interface BusinessMapModel {
   entities: MapEntity[];
@@ -100,6 +113,18 @@ export function classTable(c: MapClassInput): string {
   return (c.label || localName(c.uri)).toLowerCase();
 }
 
+/** Whole-word, case-insensitive test for a table or column name in SQL text. */
+function mentions(sql: string, word: string): boolean {
+  const w = word.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^a-z0-9_])${w}([^a-z0-9_]|$)`).test(sql);
+}
+
+/** The fields of `entity` a rule's SQL refers to, in the entity's field order. */
+export function fieldsUsedBy(rule: Pick<MapRule, "sql">, entity: Pick<MapEntity, "fields">): string[] {
+  const sql = (rule.sql ?? "").toLowerCase();
+  return entity.fields.filter((f) => mentions(sql, f));
+}
+
 /** Tables a rule reads, from its declared source table and its SQL text. */
 export function tablesUsedBy(rule: MapRuleInput, known: string[]): string[] {
   const hit = new Set<string>();
@@ -108,7 +133,7 @@ export function tablesUsedBy(rule: MapRuleInput, known: string[]): string[] {
   const sql = (rule.sql ?? "").toLowerCase();
   for (const t of known) {
     // Table names appear as `db.table`, `"table"` or a bare word.
-    if (new RegExp(`(^|[^a-z0-9_])${t}([^a-z0-9_]|$)`).test(sql)) hit.add(t);
+    if (mentions(sql, t)) hit.add(t);
   }
   return [...hit];
 }
@@ -143,19 +168,43 @@ export function buildBusinessMap(
     description: r.description ?? "",
     unit: r.unit ?? "",
     entities: tablesUsedBy(r, tables),
+    sql: r.sql ?? "",
   }));
 
-  const attrs = new Map<string, number>();
+  const fieldsOf = new Map<string, string[]>();
   for (const p of datatypeProperties) {
     const d = resolve(p.domain);
-    if (d) attrs.set(d, (attrs.get(d) ?? 0) + 1);
+    if (!d) continue;
+    const name = p.label || localName(p.uri);
+    const list = fieldsOf.get(d) ?? [];
+    if (!list.includes(name)) list.push(name);
+    fieldsOf.set(d, list);
   }
+
+  // A class whose named parent is another class on the map is a "kind of" it.
+  const parentOf = new Map<string, string>();
+  uniq.forEach((c, i) => {
+    for (const parent of c.subClassOf ?? []) {
+      const pid = resolve(parent);
+      if (pid && pid !== tables[i]) {
+        parentOf.set(tables[i], pid);
+        break;
+      }
+    }
+  });
+  const rootOf = (id: string): string => {
+    let cur = id;
+    for (let i = 0; i < 10 && parentOf.has(cur); i++) cur = parentOf.get(cur)!;
+    return cur;
+  };
 
   const entities: MapEntity[] = uniq.map((c, i) => {
     const t = tables[i];
     const comment = (c.comment ?? "").trim();
+    const kindOf = parentOf.get(t);
     return {
       id: t,
+      uri: c.uri,
       label: humanize(c.label || localName(c.uri)),
       table: t,
       // Induced comments often just restate the table name; drop those.
@@ -163,9 +212,12 @@ export function buildBusinessMap(
         comment && norm(comment) !== norm(t) && norm(comment) !== norm(humanize(t))
           ? comment
           : "",
-      connection: tableConnections[t] ?? "Other",
+      // A kind lives wherever its parent's data lives.
+      connection: tableConnections[t] ?? tableConnections[rootOf(t)] ?? "Other",
       rules: ruleModels.filter((r) => r.entities.includes(t)).map((r) => r.name),
-      attributeCount: attrs.get(t) ?? 0,
+      attributeCount: (fieldsOf.get(t) ?? []).length,
+      fields: fieldsOf.get(t) ?? [],
+      ...(kindOf ? { kindOf } : {}),
     };
   });
 
@@ -178,7 +230,10 @@ export function buildBusinessMap(
     const key = [s, t].sort().join("|");
     if (seen.has(key)) continue;
     seen.add(key);
-    links.push({ source: s, target: t, label: relationshipLabel(p) });
+    links.push({ source: s, target: t, label: relationshipLabel(p), kind: "relationship" });
+  }
+  for (const [child, parent] of parentOf) {
+    links.push({ source: child, target: parent, label: "kind of", kind: "kind" });
   }
 
   const grouped = groupLookAlikes(entities, links);
@@ -197,6 +252,20 @@ const GROUP_MIN = 3;
  * group shares. Typical case: a published dataset split by age, gender, tenure.
  * Keeps the picture about business things rather than how a source slices them.
  */
+/** The circles that are kinds of `id`, nearest first. */
+export function kindsOf(model: Pick<BusinessMapModel, "entities">, id: string): MapEntity[] {
+  return model.entities.filter((e) => e.kindOf === id);
+}
+
+/** A relationship as a sentence a business reader can follow. */
+export function relationshipSentence(l: MapLink, model: Pick<BusinessMapModel, "entities">): string {
+  const name = (id: string) => model.entities.find((e) => e.id === id)?.label ?? id;
+  if (l.kind === "kind") return `${name(l.source)} is a kind of ${name(l.target)}`;
+  const target = name(l.target);
+  const article = /^[aeiou]/i.test(target) ? "an" : "a";
+  return `Each ${name(l.source)} is linked to ${article} ${target}`;
+}
+
 export function groupLookAlikes(
   entities: MapEntity[],
   links: MapLink[],
@@ -211,7 +280,8 @@ export function groupLookAlikes(
   for (const e of entities) {
     const sig = neighbours.get(e.id)!;
     // Only things that connect elsewhere and nothing connects to (leaves).
-    if (sig.length === 0 || sig.some((n) => n.includes("<"))) continue;
+    // Kinds are never folded: each one is a business decision someone made.
+    if (e.kindOf || sig.length === 0 || sig.some((n) => n.includes("<"))) continue;
     const key = `${e.connection}|${[...sig].sort().join(",")}`;
     const list = buckets.get(key) ?? [];
     list.push(e);
@@ -225,6 +295,8 @@ export function groupLookAlikes(
     list.forEach((e) => folded.set(e.id, id));
     groups.push({
       id,
+      uri: list[0].uri,
+      fields: [...new Set(list.flatMap((e) => e.fields))],
       label: `${list[0].connection} (${list.length} datasets)`,
       table: list.map((e) => e.table).join(", "),
       description: list.find((e) => e.description)?.description ?? "",

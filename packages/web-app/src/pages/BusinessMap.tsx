@@ -5,9 +5,12 @@
  * graph holds records about, how they relate, which data connection each comes
  * from, and the governed rules (metrics) that use them.
  *
- * Read-only. Built from data the console already loads elsewhere: the ontology
- * overview (classes + relationships), the data connections and their tables,
- * and the metric list. Nothing here writes.
+ * Built from data the console already loads elsewhere: the ontology overview
+ * (classes, relationships, kinds), the data connections and their tables, and
+ * the metric list. Clicking a thing opens its data card; picking a rule shows
+ * how it is worked out. The card's three actions write through existing COA
+ * APIs only: table metadata (Edit description), the metric form (Add a rule)
+ * and a one-class ontology (Add a kind).
  */
 import { useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
@@ -30,6 +33,7 @@ import { useControlPlaneClient } from "@components/ControlPlaneClientProvider";
 import { useListOntologies } from "@api-hooks/use-list-ontologies";
 import { useListSources } from "@api-hooks/use-list-sources";
 import { useListMetrics } from "@api-hooks/use-metrics";
+import { useGetSourceTable } from "@api-hooks/use-get-source-table";
 import { OVERVIEW_PAGE_LIMIT } from "@api-hooks/use-ontology-overview";
 import {
   OntologyGraphFlow,
@@ -42,6 +46,9 @@ import {
   type MapClassInput,
   type MapPropertyInput,
 } from "@components/business-map/model";
+import { DataCard, type TableRef } from "@components/business-map/DataCard";
+import { LineageStrip } from "@components/business-map/LineageStrip";
+import { AddKindModal, EditDescriptionModal } from "@components/business-map/EditModals";
 
 export const BusinessMapPage: React.FC = () => {
   const { namespaceId = "" } = useParams<{ namespaceId: string }>();
@@ -110,6 +117,19 @@ export const BusinessMapPage: React.FC = () => {
   const error =
     ontologies.error ?? metrics.error ?? overviews.find((q) => q.error)?.error;
 
+  // Table name → where it lives, so the card can read and edit its metadata.
+  const tableRefs = useMemo(() => {
+    const refs: Record<string, TableRef> = {};
+    tableLists.forEach((q, i) => {
+      const sourceId = dbSources[i]?.sourceId;
+      if (!sourceId) return;
+      for (const t of q.data?.items ?? []) {
+        if (t.name && t.tableId) refs[t.name.toLowerCase()] = { sourceId, tableId: t.tableId };
+      }
+    });
+    return refs;
+  }, [tableLists, dbSources]);
+
   const model = useMemo(() => {
     const classes: MapClassInput[] = [];
     const objectProps: MapPropertyInput[] = [];
@@ -152,6 +172,10 @@ export const BusinessMapPage: React.FC = () => {
     [...model.entities].sort((a, b) => b.rules.length - a.rules.length)[0];
 
   const ruleByName = Object.fromEntries(model.rules.map((r) => [r.name, r]));
+  const currentRef = current && !current.members && !current.kindOf ? tableRefs[current.table] : undefined;
+  const currentTable = useGetSourceTable(namespaceId, currentRef?.sourceId ?? "", currentRef?.tableId ?? "");
+  const [editing, setEditing] = useState(false);
+  const [addingKind, setAddingKind] = useState(false);
   const ruleOptions = useMemo(
     () => [
       { value: "all", label: "All business things" },
@@ -185,7 +209,7 @@ export const BusinessMapPage: React.FC = () => {
         source: l.source,
         target: l.target,
         label: l.label,
-        kind: "objectProperty",
+        kind: l.kind === "kind" ? "subClassOf" : "objectProperty",
       }));
     return { nodes, edges };
   }, [model, rule]);
@@ -227,6 +251,7 @@ export const BusinessMapPage: React.FC = () => {
         The things this context graph keeps records about, and how they connect.
       </Box>
       <Grid gridDefinition={[{ colspan: { default: 12, l: 8 } }, { colspan: { default: 12, l: 4 } }]}>
+        <SpaceBetween size="m">
         <Container
           header={
             <Header
@@ -261,65 +286,36 @@ export const BusinessMapPage: React.FC = () => {
             </div>
           </SpaceBetween>
         </Container>
+        {rule !== "all" && ruleByName[rule] && (
+          <LineageStrip
+            rule={ruleByName[rule]}
+            model={model}
+            onSelect={setSelected}
+            onOpenRule={() => navigate(`${base}/metrics/${encodeURIComponent(rule)}`)}
+            onAsk={() => navigate("/playground")}
+            onClose={() => setRule("all")}
+          />
+        )}
+        </SpaceBetween>
 
         <SpaceBetween size="m">
           {current && (
-            <Container
-              header={
-                <Header variant="h2" description={`From ${current.connection}`}>
-                  {current.label}
-                </Header>
+            <DataCard
+              namespaceId={namespaceId}
+              entity={current}
+              model={model}
+              tableRef={currentRef}
+              onSelect={setSelected}
+              onPickRule={setRule}
+              onEditDescription={() => setEditing(true)}
+              onAddKind={() => setAddingKind(true)}
+              onAddRule={() =>
+                currentRef &&
+                navigate(
+                  `${base}/metrics/create?dataSourceId=${encodeURIComponent(currentRef.sourceId)}&sourceTable=${encodeURIComponent(current.table)}`,
+                )
               }
-            >
-              <SpaceBetween size="s">
-                {current.description && <Box>{current.description}</Box>}
-                {current.members && (
-                  <Box variant="small" color="text-body-secondary">
-                    Groups {current.members.length} similar datasets: {current.members.join(", ")}.
-                  </Box>
-                )}
-                <Box variant="awsui-key-label">Rules that use it</Box>
-                {current.rules.length === 0 ? (
-                  <Box color="text-body-secondary">No rule uses this yet.</Box>
-                ) : (
-                  current.rules.map((name) => {
-                    const r = ruleByName[name];
-                    return (
-                      <div
-                        key={name}
-                        style={{
-                          border: "1px solid var(--color-border-divider-default, #e9ebed)",
-                          borderRadius: 8,
-                          padding: "8px 10px",
-                        }}
-                      >
-                        <Link
-                          href={`${base}/metrics/${encodeURIComponent(name)}`}
-                          onFollow={(e) => {
-                            e.preventDefault();
-                            navigate(`${base}/metrics/${encodeURIComponent(name)}`);
-                          }}
-                        >
-                          <b>{r?.label ?? name}</b>
-                        </Link>
-                        {r?.description && (
-                          <Box variant="small" color="text-body-secondary" display="block">
-                            {r.description.length > 180
-                              ? `${r.description.slice(0, 177)}…`
-                              : r.description}
-                          </Box>
-                        )}
-                      </div>
-                    );
-                  })
-                )}
-                <Box variant="awsui-key-label">Where the data lives</Box>
-                <Box>
-                  {current.connection} · <code>{current.table}</code>
-                  {current.attributeCount > 0 && ` · ${current.attributeCount} fields`}
-                </Box>
-              </SpaceBetween>
-            </Container>
+            />
           )}
           <Container header={<Header variant="h2">In this graph</Header>}>
             <Grid gridDefinition={[{ colspan: 6 }, { colspan: 6 }, { colspan: 6 }, { colspan: 6 }]}>
@@ -331,6 +327,21 @@ export const BusinessMapPage: React.FC = () => {
           </Container>
         </SpaceBetween>
       </Grid>
+      {editing && current && currentRef && (
+        <EditDescriptionModal
+          namespaceId={namespaceId}
+          entity={current}
+          tableRef={currentRef}
+          current={{
+            description: currentTable.data?.businessMetadata?.description || current.description,
+            synonyms: currentTable.data?.businessMetadata?.synonyms ?? [],
+          }}
+          onClose={() => setEditing(false)}
+        />
+      )}
+      {addingKind && current && (
+        <AddKindModal namespaceId={namespaceId} parent={current} onClose={() => setAddingKind(false)} />
+      )}
     </SpaceBetween>
   );
 };

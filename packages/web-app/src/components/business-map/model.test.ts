@@ -2,6 +2,9 @@
 import { describe, expect, it } from "vitest";
 import {
   buildBusinessMap,
+  fieldsUsedBy,
+  kindsOf,
+  relationshipSentence,
   humanize,
   relationshipLabel,
   tablesUsedBy,
@@ -73,8 +76,8 @@ describe("buildBusinessMap", () => {
 
   it("resolves CamelCase relationship IRIs and drops duplicates and unknowns", () => {
     expect(model.links).toEqual([
-      { source: "employment", target: "officer", label: "officer" },
-      { source: "employment", target: "dim_agency", label: "agency" },
+      { source: "employment", target: "officer", label: "officer", kind: "relationship" },
+      { source: "employment", target: "dim_agency", label: "agency", kind: "relationship" },
     ]);
   });
 
@@ -102,9 +105,48 @@ describe("groupLookAlikes", () => {
     expect(group.label).toBe("PSD open (3 datasets)");
     expect(group.members).toEqual(["PSD by age", "PSD by gender", "PSD by tenure"]);
     expect(model.entities.map((e) => e.id)).not.toContain("psd_by_age");
-    expect(model.links).toContainEqual({ source: "group:PSD open", target: "dim_grade", label: "executive level" });
+    expect(model.links).toContainEqual({ source: "group:PSD open", target: "dim_grade", label: "executive level", kind: "relationship" });
     expect(model.links.filter((l) => l.source === "group:PSD open")).toHaveLength(1);
     // A lone table with its own link is left alone.
     expect(model.entities.map((e) => e.id)).toContain("officer");
+  });
+});
+
+describe("kinds and lineage", () => {
+  const classes = [
+    { uri: `${NS}separation`, label: "separation" },
+    { uri: `${NS}employment`, label: "employment" },
+    { uri: "urn:coa:kind:ns:resignation-x#resignation", label: "Resignation", comment: "Leaving where the reason is RSN", subClassOf: [`${NS}Separation`] },
+  ];
+  const model = buildBusinessMap(
+    classes,
+    [{ uri: `${NS}employment_id`, label: "employment_id", domain: `${NS}Separation`, range: `${NS}Employment` }],
+    [
+      { uri: `${NS}reason_code`, label: "reason_code", domain: `${NS}Separation` },
+      { uri: `${NS}separation_date`, label: "separation_date", domain: `${NS}separation` },
+    ],
+    [{ name: "attrition", sql: "SELECT COUNT(*) FROM mpi_hrms.separation s WHERE s.reason_code = 'RSN'" }],
+    { separation: "MPI HRMS", employment: "MPI HRMS" },
+  );
+
+  it("draws a sub-class as a kind of its parent, in the parent's connection", () => {
+    const kind = model.entities.find((e) => e.label === "Resignation")!;
+    expect(kind.kindOf).toBe("separation");
+    expect(kind.connection).toBe("MPI HRMS");
+    expect(kindsOf(model, "separation").map((e) => e.label)).toEqual(["Resignation"]);
+    const link = model.links.find((l) => l.kind === "kind")!;
+    expect(link).toMatchObject({ source: kind.id, target: "separation", label: "kind of" });
+    expect(relationshipSentence(link, model)).toBe("Resignation is a kind of Separation");
+  });
+
+  it("lists the fields a rule's SQL reads", () => {
+    const sep = model.entities.find((e) => e.id === "separation")!;
+    expect(sep.fields).toEqual(["reason_code", "separation_date"]);
+    expect(fieldsUsedBy(model.rules[0], sep)).toEqual(["reason_code"]);
+  });
+
+  it("phrases a relationship as a sentence", () => {
+    const rel = model.links.find((l) => l.kind === "relationship")!;
+    expect(relationshipSentence(rel, model)).toBe("Each Separation is linked to an Employment");
   });
 });

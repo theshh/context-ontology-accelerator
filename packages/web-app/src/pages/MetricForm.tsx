@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useNamespace } from "@api-hooks/use-namespace";
 import Form from "@cloudscape-design/components/form";
@@ -227,6 +227,19 @@ export const MetricForm: React.FC = () => {
     },
     [apiClient, namespaceId, t],
   );
+
+  // Prefill from the address when opened from another page (the Business map's
+  // "Add a rule" passes the data connection and table it was opened on). Create
+  // only, applied once; an edit always loads the saved metric instead.
+  const [searchParams] = useSearchParams();
+  useEffect(() => {
+    if (isEdit) return;
+    const src = searchParams.get("dataSourceId");
+    const table = searchParams.get("sourceTable");
+    if (src) setDataSourceId(src);
+    if (table) setSourceTable(table);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (isEdit && existingData?.metric) {
