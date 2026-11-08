@@ -128,8 +128,30 @@ const text = (id: string) => screen.getByTestId(id).textContent;
 
 describe("NamespaceProvider", () => {
   beforeEach(() => {
+    window.localStorage.clear();
     mockSend.mockReset();
     mockSend.mockImplementation(serveBothPages);
+  });
+
+  it("reopens the graph chosen before a reload", async () => {
+    window.localStorage.setItem(
+      "coa.selectedNamespaceId",
+      ON_PAGE_2.namespaceId,
+    );
+    renderAt("/");
+    await waitFor(() =>
+      expect(text("namespace-id")).toBe(ON_PAGE_2.namespaceId),
+    );
+  });
+
+  it("remembers the graph the user opened for the next reload", async () => {
+    renderAt(`/namespaces/${ON_PAGE_2.namespaceId}`);
+    await waitFor(() =>
+      expect(text("namespace-id")).toBe(ON_PAGE_2.namespaceId),
+    );
+    expect(window.localStorage.getItem("coa.selectedNamespaceId")).toBe(
+      ON_PAGE_2.namespaceId,
+    );
   });
 
   it("loads every page of the list, so the switcher can reach page 2", async () => {

@@ -59,6 +59,16 @@ function toSummary(detail: NamespaceDetail): NamespaceSummary {
   };
 }
 
+const SELECTED_NAMESPACE_KEY = "coa.selectedNamespaceId";
+
+function readStoredNamespace(): string | undefined {
+  try {
+    return window.localStorage.getItem(SELECTED_NAMESPACE_KEY) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export const NamespaceProvider: React.FC<React.PropsWithChildren> = ({
   children,
 }) => {
@@ -72,7 +82,19 @@ export const NamespaceProvider: React.FC<React.PropsWithChildren> = ({
     isFetchNextPageError,
     fetchNextPage,
   } = useListNamespaces();
-  const [selectedId, setSelectedId] = useState<string | undefined>();
+  // Remembered across reloads, so the Playground and the top-bar switcher
+  // reopen the graph the user last chose instead of the first one listed.
+  const [selectedId, setSelectedId] = useState<string | undefined>(
+    readStoredNamespace,
+  );
+  useEffect(() => {
+    if (!selectedId) return;
+    try {
+      window.localStorage.setItem(SELECTED_NAMESPACE_KEY, selectedId);
+    } catch {
+      // Storage unavailable (private mode, quota): the choice lasts this tab only.
+    }
+  }, [selectedId]);
 
   // The list API pages its results (25 per page). The switcher has to reach
   // every namespace the user can see, so load the remaining pages here; the
