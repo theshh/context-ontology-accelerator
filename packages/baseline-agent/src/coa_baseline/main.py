@@ -19,7 +19,7 @@ import boto3
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from botocore.config import Config
 
-from coa_baseline.core import AccessDenied, BadRequest, CoaApi, Deps, answer
+from coa_baseline.core import AccessDenied, BadRequest, CoaApi, Deps, NoGlueData, answer
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("coa_baseline")
@@ -72,6 +72,13 @@ def invoke(payload: dict, context=None) -> dict:
     except AccessDenied as e:
         log.info("baseline_access_denied request_id=%s reason=%s", request_id, e)
         return _error("AccessDenied", "Not allowed to query this context graph", 403, request_id)
+    except NoGlueData:
+        return _error(
+            "NoGlueData",
+            "This context graph has no AWS Glue data connections. The plain agent can only read Glue tables.",
+            422,
+            request_id,
+        )
     except BadRequest as e:
         return _error("ValidationError", str(e), 400, request_id)
     except Exception:

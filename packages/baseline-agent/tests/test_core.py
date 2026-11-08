@@ -130,9 +130,9 @@ def test_scope_fails_closed_when_coa_denies():
         core.resolve_scope(api, NS)
 
 
-def test_scope_denies_graph_without_glue_connections():
+def test_scope_reports_graph_without_glue_connections():
     api = FakeApi({f"/namespaces/{NS}": {"athenaWorkgroupName": "wg-1"}, f"/namespaces/{NS}/sources": {"items": []}})
-    with pytest.raises(core.AccessDenied):
+    with pytest.raises(core.NoGlueData):
         core.resolve_scope(api, NS)
 
 

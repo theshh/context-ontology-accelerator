@@ -39,6 +39,10 @@ class AccessDenied(Exception):
     """The caller may not query this context graph (or we could not verify it)."""
 
 
+class NoGlueData(Exception):
+    """The context graph has no approved AWS Glue connection the baseline can read."""
+
+
 class BadRequest(Exception):
     """The request payload is invalid."""
 
@@ -101,7 +105,7 @@ def resolve_scope(api: CoaApi, namespace: str) -> GraphScope:
         if name:
             databases.append(name)
     if not databases:
-        raise AccessDenied("Context graph has no approved Glue connections")
+        raise NoGlueData("Context graph has no approved Glue connections")
     return GraphScope(workgroup=workgroup, databases=sorted(set(databases)))
 
 
