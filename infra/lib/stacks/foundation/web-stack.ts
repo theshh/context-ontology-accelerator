@@ -48,6 +48,7 @@ export function buildRuntimeConfig(args: {
   apiEndpoint?: string;
   serveRuntimeArn?: string;
   mcpRuntimeArn?: string;
+  baselineRuntimeArn?: string;
   version?: string;
   graphSourcesEnabled?: boolean;
 }): RuntimeConfig {
@@ -59,6 +60,7 @@ export function buildRuntimeConfig(args: {
     apiEndpoint,
     serveRuntimeArn,
     mcpRuntimeArn,
+    baselineRuntimeArn,
     version,
     graphSourcesEnabled,
   } = args;
@@ -70,6 +72,7 @@ export function buildRuntimeConfig(args: {
     ...(apiEndpoint && { apiEndpoint }),
     ...(serveRuntimeArn && { serveRuntimeArn }),
     ...(mcpRuntimeArn && { mcpRuntimeArn }),
+    ...(baselineRuntimeArn && { baselineRuntimeArn }),
     ...(version && { version }),
     // Written only when on, so an off deployment's runtime-config is unchanged.
     ...(graphSourcesEnabled === true && { graphSourcesEnabled }),
@@ -117,6 +120,8 @@ export interface WebStackProps extends cdk.StackProps {
   readonly autoWebAclParam?: { readonly name: string; readonly region: string };
   /** AgentCore Runtime ARN for SSE streaming queries. */
   readonly serveRuntimeArn?: string;
+  /** Baseline ("without COA") agent runtime ARN, for the Playground compare view. */
+  readonly baselineRuntimeArn?: string;
   /**
    * Fully custom Content-Security-Policy header value, replacing the derived
    * one. Wired from the `content_security_policy` CDK context key in
@@ -215,6 +220,7 @@ export class WebStack extends SCLStack {
       clientId,
       apiEndpoint,
       serveRuntimeArn: props.serveRuntimeArn,
+      baselineRuntimeArn: props.baselineRuntimeArn,
       mcpRuntimeArn,
       version: readRepoVersion(),
       graphSourcesEnabled: graphSourcesEnabled(this.node),

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 export { ApiStack } from "./api-stack";
+export { BaselineStack } from "./baseline-stack";
 export { ControlPlaneStack } from "./control-plane-stack";
 export { DataLayerStack } from "./data-layer-stack";
 export { McpStack } from "./mcp-stack";

@@ -22,6 +22,12 @@ export interface RuntimeConfig {
   readonly serveRuntimeArn?: string;
   /** AgentCore Runtime ARN for the MCP Server. Frontend derives the MCP endpoint URL from this + region. */
   readonly mcpRuntimeArn?: string;
+  /**
+   * AgentCore Runtime ARN of the baseline ("without COA") text-to-SQL agent,
+   * for the Playground's side-by-side compare view. Absent when the baseline
+   * stack is not deployed; the compare toggle is then hidden.
+   */
+  readonly baselineRuntimeArn?: string;
   /** Monorepo version (repo-root VERSION file) surfaced in the UI. E.g. "0.2.2". */
   readonly version?: string;
   /** Set to true only when the deployment turns on graph sources (`graph_sources`); absent means off. */

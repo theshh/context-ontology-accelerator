@@ -41,6 +41,7 @@ import {
 // Service stacks
 import {
   ApiStack,
+  BaselineStack,
   DataLayerStack,
   McpStack,
   MetricServiceStack,
@@ -472,6 +473,14 @@ async function deploy(): Promise<void> {
     cfAutoWebAclParam = { name: cfWebAclParamName, region: "us-east-1" };
   }
 
+  // Baseline ("without COA") text-to-SQL agent for the Playground side-by-side view.
+  const baseline = new BaselineStack(app, `${stackPrefix}-baseline`, {
+    apiEndpoint: api.api.url,
+    bedrockLlmModelId: config.bedrockLlmModelId,
+    athenaResultsBucketName: storage.athenaResultsBucket.bucketName,
+  });
+  baseline.addDependency(auth); // needs /issuer, /userpool-client-id SSM params
+
   const web = new WebStack(app, `${stackPrefix}-web`, {
     // Cognito User Pool (and its callback-URL patch) only exists on the
     // COGNITO/SAML idpType path — see idp-authentication-stack.ts. Derived
@@ -490,6 +499,7 @@ async function deploy(): Promise<void> {
         ? { autoWebAclParam: cfAutoWebAclParam }
         : {}),
     serveRuntimeArn: serve.queryEndpoint,
+    baselineRuntimeArn: baseline.agentRuntimeArn,
     ...(app.node.tryGetContext("content_security_policy") && {
       contentSecurityPolicy: String(
         app.node.tryGetContext("content_security_policy"),

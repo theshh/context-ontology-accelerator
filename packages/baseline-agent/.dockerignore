@@ -1,0 +1,7 @@
+# Only what the Dockerfile copies.
+*
+!Dockerfile
+!constraints.txt
+!src/
+**/__pycache__
+**/*.pyc

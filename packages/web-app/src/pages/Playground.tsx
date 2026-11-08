@@ -19,6 +19,7 @@ import {
   SegmentedControl,
   SpaceBetween,
   StatusIndicator,
+  Toggle,
 } from "@cloudscape-design/components";
 import { RuntimeConfigContext } from "@components/RuntimeContext";
 import { useCurrentNamespace } from "@components/NamespaceProvider";
@@ -39,6 +40,12 @@ import { ONBOARDING_ICON } from "@constants/drawer-icons";
 import { scrollToBottom } from "@utils/scroll";
 
 import { buildQueryEndpoint } from "@utils/build-query-endpoint";
+import { buildBaselineEndpoint } from "@utils/build-baseline-endpoint";
+import { askBaseline } from "@api-hooks/baseline-query";
+import {
+  BaselinePanel,
+  type BaselineTurn,
+} from "@components/baseline/BaselinePanel";
 import { useAppI18n } from "../i18n/LocaleProvider";
 
 /**
@@ -100,6 +107,42 @@ export const Playground: React.FC = () => {
 
   const exampleQuestions = useExampleQuestions(namespaceId);
 
+  // Compare view: each question also goes to the baseline ("without COA")
+  // agent, shown in a column beside the chat. Offered only when deployed.
+  const baselineEndpoint = buildBaselineEndpoint(runtimeContext);
+  const [compare, setCompare] = useState(false);
+  const [baselineTurns, setBaselineTurns] = useState<BaselineTurn[]>([]);
+  const askWithoutCoa = useCallback(
+    (question: string) => {
+      if (!compare || !baselineEndpoint || !runtimeContext?.oidcConfig) return;
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      setBaselineTurns((prev) => [
+        ...prev,
+        { id, question, status: "loading" },
+      ]);
+      const finish = (result: BaselineTurn["result"]) =>
+        setBaselineTurns((prev) =>
+          prev.map((turn) =>
+            turn.id === id ? { ...turn, status: "done", result } : turn,
+          ),
+        );
+      askBaseline(
+        baselineEndpoint,
+        runtimeContext.oidcConfig,
+        namespaceId,
+        question,
+      )
+        .then(finish)
+        .catch(() =>
+          finish({
+            error: "NetworkError",
+            message: "The baseline agent did not answer.",
+          }),
+        );
+    },
+    [compare, baselineEndpoint, runtimeContext?.oidcConfig, namespaceId],
+  );
+
   // Auto-load older history when sentinel scrolls into view.
   // onChange fires only on visibility TRANSITIONS (not while staying visible),
   // which prevents the re-trigger loop after prepend.
@@ -118,6 +161,7 @@ export const Playground: React.FC = () => {
     const query = inputValue.trim();
     if (!query || !namespaceId) return;
     sendQuery(query, mode);
+    askWithoutCoa(query);
     setInputValue("");
     // Scroll to bottom after sending a query (user expects to see their message)
     requestAnimationFrame(() => {
@@ -129,9 +173,10 @@ export const Playground: React.FC = () => {
     (question: string) => {
       if (!namespaceId) return;
       sendQuery(question, mode);
+      askWithoutCoa(question);
       setInputValue("");
     },
-    [namespaceId, sendQuery, mode],
+    [namespaceId, sendQuery, mode, askWithoutCoa],
   );
 
   const findUserQuery = useCallback(
@@ -220,7 +265,15 @@ export const Playground: React.FC = () => {
       <Header
         variant="h1"
         actions={
-          <SpaceBetween direction="horizontal" size="xs">
+          <SpaceBetween direction="horizontal" size="xs" alignItems="center">
+            {baselineEndpoint && (
+              <Toggle
+                checked={compare}
+                onChange={({ detail }) => setCompare(detail.checked)}
+              >
+                Compare without COA
+              </Toggle>
+            )}
             <SegmentedControl
               selectedId={mode}
               onChange={({ detail }) => {
@@ -237,8 +290,13 @@ export const Playground: React.FC = () => {
             />
             <Button
               variant="normal"
-              onClick={newChat}
-              disabled={state.messages.length === 0}
+              onClick={() => {
+                newChat();
+                setBaselineTurns([]);
+              }}
+              disabled={
+                state.messages.length === 0 && baselineTurns.length === 0
+              }
             >
               {t("New chat")}
             </Button>
@@ -264,154 +322,178 @@ export const Playground: React.FC = () => {
       <div
         style={{
           flex: 1,
-          position: "relative",
+          display: "flex",
+          gap: 16,
           marginTop: "16px",
           minHeight: 0,
         }}
       >
-        <div style={{ position: "absolute", inset: 0 }}>
-          {restoreTimedOut && (
-            <Flashbar
-              items={[
-                {
-                  type: "warning",
-                  content: t("Previous session history may not have loaded"),
-                  dismissible: true,
-                  onDismiss: dismissRestoreWarning,
-                  id: "restore-timeout-warning",
-                },
-              ]}
-            />
-          )}
-          <ChatContainer
-            isEmpty={state.messages.length === 0 && isReady && !hasMoreHistory}
-            inputValue={inputValue}
-            onInputChange={setInputValue}
-            onSubmit={handleSubmit}
-            inputDisabled={!isReady || !namespaceId}
-            submitDisabled={!canSubmit}
-            emptyStateContent={
-              <SamplePrompts
-                questions={exampleQuestions}
-                onSelect={handleSamplePrompt}
-                disabled={!isReady || !namespaceId}
-              />
-            }
+        {compare && baselineEndpoint && (
+          <div
+            aria-label="Without COA"
+            style={{ flex: "0 0 42%", overflowY: "auto", minHeight: 0 }}
           >
-            {!isReady && !isStreaming && state.messages.length === 0 && (
-              <Box textAlign="center" padding="l">
-                <StatusIndicator type="loading">
-                  {!namespaceId ? t("Connecting") : t("Restoring session")}
-                </StatusIndicator>
-              </Box>
+            <BaselinePanel turns={baselineTurns} />
+          </div>
+        )}
+        <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
+          {compare && baselineEndpoint && (
+            <Box variant="awsui-key-label" margin={{ bottom: "xs" }}>
+              With COA
+            </Box>
+          )}
+          <div
+            style={{
+              position: "absolute",
+              inset: compare && baselineEndpoint ? "24px 0 0 0" : 0,
+            }}
+          >
+            {restoreTimedOut && (
+              <Flashbar
+                items={[
+                  {
+                    type: "warning",
+                    content: t("Previous session history may not have loaded"),
+                    dismissible: true,
+                    onDismiss: dismissRestoreWarning,
+                    id: "restore-timeout-warning",
+                  },
+                ]}
+              />
             )}
-            {hasMoreHistory && !isRestoring && (
-              <div ref={loadMoreRef}>
-                <Box
-                  textAlign="center"
-                  padding={{ vertical: "xs" }}
-                  color="text-body-secondary"
-                  fontSize="body-s"
-                >
-                  {isLoadingOlderHistory ? (
-                    <StatusIndicator type="loading">
-                      {t("Loading earlier messages")}
-                    </StatusIndicator>
-                  ) : (
-                    <Button
-                      iconName="angle-up"
-                      variant="normal"
-                      onClick={requestOlderHistory}
-                    >
-                      {t("Load earlier messages")}
-                    </Button>
-                  )}
+            <ChatContainer
+              isEmpty={
+                state.messages.length === 0 && isReady && !hasMoreHistory
+              }
+              inputValue={inputValue}
+              onInputChange={setInputValue}
+              onSubmit={handleSubmit}
+              inputDisabled={!isReady || !namespaceId}
+              submitDisabled={!canSubmit}
+              emptyStateContent={
+                <SamplePrompts
+                  questions={exampleQuestions}
+                  onSelect={handleSamplePrompt}
+                  disabled={!isReady || !namespaceId}
+                />
+              }
+            >
+              {!isReady && !isStreaming && state.messages.length === 0 && (
+                <Box textAlign="center" padding="l">
+                  <StatusIndicator type="loading">
+                    {!namespaceId ? t("Connecting") : t("Restoring session")}
+                  </StatusIndicator>
                 </Box>
-              </div>
-            )}
-            <div ref={chatScrollRef} />
-            {(isReady || state.messages.length > 0) &&
-              state.messages.map((msg) => (
-                <ChatErrorBoundary
-                  key={msg.id}
-                  onRetry={
-                    msg.role === "assistant" && !msg.isLoading
-                      ? () => retryQuery(msg, mode)
-                      : undefined
-                  }
-                >
-                  <ChatMessage
-                    role={msg.role}
-                    messageId={msg.id}
-                    state={
-                      msg.isLoading
-                        ? "loading"
-                        : msg.error
-                          ? "error"
-                          : "success"
-                    }
-                    content={msg.content}
-                    timestamp={msg.timestamp}
-                    errorMessage={msg.error?.message}
-                    errorDetails={
-                      msg.error
-                        ? {
-                            error: msg.error.error,
-                            statusCode: msg.error.statusCode,
-                            requestId: msg.error.requestId,
-                            details: msg.error.details,
-                          }
-                        : undefined
-                    }
+              )}
+              {hasMoreHistory && !isRestoring && (
+                <div ref={loadMoreRef}>
+                  <Box
+                    textAlign="center"
+                    padding={{ vertical: "xs" }}
+                    color="text-body-secondary"
+                    fontSize="body-s"
+                  >
+                    {isLoadingOlderHistory ? (
+                      <StatusIndicator type="loading">
+                        {t("Loading earlier messages")}
+                      </StatusIndicator>
+                    ) : (
+                      <Button
+                        iconName="angle-up"
+                        variant="normal"
+                        onClick={requestOlderHistory}
+                      >
+                        {t("Load earlier messages")}
+                      </Button>
+                    )}
+                  </Box>
+                </div>
+              )}
+              <div ref={chatScrollRef} />
+              {(isReady || state.messages.length > 0) &&
+                state.messages.map((msg) => (
+                  <ChatErrorBoundary
+                    key={msg.id}
                     onRetry={
-                      msg.role === "assistant" && msg.error
+                      msg.role === "assistant" && !msg.isLoading
                         ? () => retryQuery(msg, mode)
                         : undefined
                     }
-                    stage={msg.stage}
-                    streamingTokens={msg.streamingTokens}
-                    liveTraceSteps={msg.liveTraceSteps}
-                    onRationaleClick={
-                      msg.role === "assistant" &&
-                      msg.response &&
-                      (!msg.isRestored ||
-                        (msg.response.result?.trace?.length ?? 0) > 0)
-                        ? () => handleRationaleClick(msg)
-                        : undefined
-                    }
-                    response={
-                      msg.response
-                        ? {
-                            tier: msg.response.result?.tier ?? 0,
-                            confidence:
-                              msg.response.result?.confidence?.score ?? 0,
-                            rationale:
-                              msg.response.result?.confidence?.rationale ?? "",
-                            synthesizedAnswer:
-                              msg.response.result?.synthesizedAnswer,
-                            resultRows: msg.response.result?.resultRows,
-                            queryUsed: msg.response.result?.queryUsed,
-                            sparqlGenerated:
-                              msg.response.result?.sparqlGenerated,
-                            executionMode: msg.response.result?.executionMode,
-                            latencyMs: (
-                              msg.response.result?.trace ?? []
-                            ).reduce((sum, t) => sum + t.durationMs, 0),
-                            guardrailBlocked:
-                              msg.response.result?.guardrailBlocked ?? false,
-                            suppressedRows:
-                              msg.response.result?.metadata?.suppressedRows,
-                            trace: msg.response.result?.trace,
-                            supportingContent:
-                              msg.response.result?.supportingContent,
-                            graphContext: msg.response.result?.graphContext,
-                          }
-                        : undefined
-                    }
-                  />
-                </ChatErrorBoundary>
-              ))}
-          </ChatContainer>
+                  >
+                    <ChatMessage
+                      role={msg.role}
+                      messageId={msg.id}
+                      state={
+                        msg.isLoading
+                          ? "loading"
+                          : msg.error
+                            ? "error"
+                            : "success"
+                      }
+                      content={msg.content}
+                      timestamp={msg.timestamp}
+                      errorMessage={msg.error?.message}
+                      errorDetails={
+                        msg.error
+                          ? {
+                              error: msg.error.error,
+                              statusCode: msg.error.statusCode,
+                              requestId: msg.error.requestId,
+                              details: msg.error.details,
+                            }
+                          : undefined
+                      }
+                      onRetry={
+                        msg.role === "assistant" && msg.error
+                          ? () => retryQuery(msg, mode)
+                          : undefined
+                      }
+                      stage={msg.stage}
+                      streamingTokens={msg.streamingTokens}
+                      liveTraceSteps={msg.liveTraceSteps}
+                      onRationaleClick={
+                        msg.role === "assistant" &&
+                        msg.response &&
+                        (!msg.isRestored ||
+                          (msg.response.result?.trace?.length ?? 0) > 0)
+                          ? () => handleRationaleClick(msg)
+                          : undefined
+                      }
+                      response={
+                        msg.response
+                          ? {
+                              tier: msg.response.result?.tier ?? 0,
+                              confidence:
+                                msg.response.result?.confidence?.score ?? 0,
+                              rationale:
+                                msg.response.result?.confidence?.rationale ??
+                                "",
+                              synthesizedAnswer:
+                                msg.response.result?.synthesizedAnswer,
+                              resultRows: msg.response.result?.resultRows,
+                              queryUsed: msg.response.result?.queryUsed,
+                              sparqlGenerated:
+                                msg.response.result?.sparqlGenerated,
+                              executionMode: msg.response.result?.executionMode,
+                              latencyMs: (
+                                msg.response.result?.trace ?? []
+                              ).reduce((sum, t) => sum + t.durationMs, 0),
+                              guardrailBlocked:
+                                msg.response.result?.guardrailBlocked ?? false,
+                              suppressedRows:
+                                msg.response.result?.metadata?.suppressedRows,
+                              trace: msg.response.result?.trace,
+                              supportingContent:
+                                msg.response.result?.supportingContent,
+                              graphContext: msg.response.result?.graphContext,
+                            }
+                          : undefined
+                      }
+                    />
+                  </ChatErrorBoundary>
+                ))}
+            </ChatContainer>
+          </div>
         </div>
       </div>
     </div>
