@@ -85,10 +85,19 @@ function BaselineSide({ turn }: { turn: CompareTurn }) {
       }
       error={r?.error ? (r.message ?? r.error) : undefined}
       answer={r?.answer}
-      howTitle="What it assumed"
-      howOpen
-      how={r?.assumptions ? <Box variant="p">{r.assumptions}</Box> : undefined}
-      sql={r?.sql}
+      howTitle="How it was worked out"
+      how={
+        r?.assumptions || r?.sql ? (
+          <SpaceBetween size="xs">
+            {r?.assumptions && (
+              <Box variant="p">
+                <b>Assumed:</b> {r.assumptions}
+              </Box>
+            )}
+            {r?.sql && <SqlText sql={r.sql} />}
+          </SpaceBetween>
+        ) : undefined
+      }
       columns={r?.columns}
       rows={r?.rows}
       footer={
@@ -141,7 +150,6 @@ function CoaSide({
       side="with"
       answer={coaAnswerText(result, rows, rules)}
       howTitle="How it was worked out"
-      howOpen
       how={<Steps steps={explainCoa(result, rules, links)} />}
       sql={result.queryUsed}
       columns={columns}
@@ -206,5 +214,23 @@ function Steps({ steps }: { steps: ExplainStep[] }) {
         </li>
       ))}
     </ol>
+  );
+}
+
+function SqlText({ sql }: { sql: string }) {
+  return (
+    <div>
+      <b>SQL it wrote:</b>
+      <pre
+        style={{
+          whiteSpace: "pre-wrap",
+          fontSize: 12,
+          margin: "4px 0 0",
+          fontFamily: "monospace",
+        }}
+      >
+        {sql}
+      </pre>
+    </div>
   );
 }
