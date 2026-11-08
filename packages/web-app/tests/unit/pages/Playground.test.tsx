@@ -57,6 +57,10 @@ vi.mock("../../../src/api-hooks/use-playground-chat-sse", () => ({
 }));
 
 // Rule units (for showing ratio answers as percentages); none needed here.
+vi.mock("../../../src/api-hooks/use-ontology-overview", () => ({
+  useOntologyOverview: () => ({ data: undefined }),
+}));
+
 vi.mock("../../../src/api-hooks/use-metrics", () => ({
   useListMetrics: () => ({ data: undefined }),
 }));

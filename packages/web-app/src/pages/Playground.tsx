@@ -45,10 +45,10 @@ import { buildBaselineEndpoint } from "@utils/build-baseline-endpoint";
 import { askBaseline } from "@api-hooks/baseline-query";
 import { useListMetrics } from "@api-hooks/use-metrics";
 import { formatMetricRows } from "@utils/format-metric-rows";
-import {
-  BaselinePanel,
-  type BaselineTurn,
-} from "@components/baseline/BaselinePanel";
+import type { BaselineTurn } from "@components/baseline/BaselinePanel";
+import { CompareList, type CompareTurn } from "@components/compare/CompareList";
+import { graphLinks, type RuleInfo } from "@components/compare/explain-coa";
+import { useOntologyOverview } from "@api-hooks/use-ontology-overview";
 import { useAppI18n } from "../i18n/LocaleProvider";
 
 /**
@@ -122,6 +122,19 @@ export const Playground: React.FC = () => {
       ),
     [metrics.data],
   );
+  const rules = useMemo<Record<string, RuleInfo>>(
+    () =>
+      Object.fromEntries(
+        (metrics.data?.pages ?? [])
+          .flatMap((p) => p.metrics ?? [])
+          .filter((m) => m.name)
+          .map((m) => [
+            m.name as string,
+            { label: m.label, description: m.description, unit: m.unit },
+          ]),
+      ),
+    [metrics.data],
+  );
 
   // Compare view: each question also goes to the baseline ("without COA")
   // agent, shown in a column beside the chat. Offered only when deployed.
@@ -172,6 +185,39 @@ export const Playground: React.FC = () => {
   });
 
   const chatScrollRef = useRef<HTMLDivElement>(null);
+
+  // Relationships between business things, to explain how COA used the graph.
+  // The induced ontology's id is fixed per context graph.
+  const overview = useOntologyOverview(
+    compare ? namespaceId : undefined,
+    namespaceId
+      ? `http://coa.amazon.com/namespace/${namespaceId}/ontology/induced#`
+      : undefined,
+  );
+  const links = useMemo(() => graphLinks(overview.data), [overview.data]);
+
+  // Pair each "without COA" question with COA's answer to the same question,
+  // in order, so the two cards sit side by side.
+  const compareTurns = useMemo<CompareTurn[]>(() => {
+    const users = state.messages.filter((m) => m.role === "user");
+    let from = 0;
+    return baselineTurns.map((turn) => {
+      const idx = users.findIndex(
+        (u, k) => k >= from && u.content.trim() === turn.question.trim(),
+      );
+      const user = idx >= 0 ? users[idx] : undefined;
+      if (idx >= 0) from = idx + 1;
+      const coa = user
+        ? state.messages.find((m) => m.replyToId === user.id)
+        : undefined;
+      return {
+        id: turn.id,
+        question: turn.question,
+        baseline: { status: turn.status, result: turn.result },
+        coa,
+      };
+    });
+  }, [baselineTurns, state.messages]);
 
   const handleSubmit = () => {
     const query = inputValue.trim();
@@ -344,24 +390,11 @@ export const Playground: React.FC = () => {
           minHeight: 0,
         }}
       >
-        {compare && baselineEndpoint && (
-          <div
-            aria-label="Without COA"
-            style={{ flex: "0 0 42%", overflowY: "auto", minHeight: 0 }}
-          >
-            <BaselinePanel turns={baselineTurns} />
-          </div>
-        )}
         <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
-          {compare && baselineEndpoint && (
-            <Box variant="awsui-key-label" margin={{ bottom: "xs" }}>
-              With COA
-            </Box>
-          )}
           <div
             style={{
               position: "absolute",
-              inset: compare && baselineEndpoint ? "24px 0 0 0" : 0,
+              inset: 0,
             }}
           >
             {restoreTimedOut && (
@@ -426,7 +459,22 @@ export const Playground: React.FC = () => {
                 </div>
               )}
               <div ref={chatScrollRef} />
-              {(isReady || state.messages.length > 0) &&
+              {compare && baselineEndpoint && baselineTurns.length > 0 && (
+                <CompareList
+                  turns={compareTurns}
+                  rules={rules}
+                  links={links}
+                  formatRows={(result) =>
+                    formatMetricRows(
+                      result.resultRows,
+                      result.trace,
+                      unitByMetric,
+                    )
+                  }
+                />
+              )}
+              {!(compare && baselineEndpoint && baselineTurns.length > 0) &&
+                (isReady || state.messages.length > 0) &&
                 state.messages.map((msg) => (
                   <ChatErrorBoundary
                     key={msg.id}
