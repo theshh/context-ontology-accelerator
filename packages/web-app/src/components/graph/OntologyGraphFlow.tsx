@@ -127,6 +127,11 @@ interface Props {
    * the labels read larger.
    */
   linkDistance?: number;
+  /**
+   * Hide relationship labels until the line (or one of its classes) is
+   * hovered, instead of showing them once zoomed in. Off by default.
+   */
+  edgeLabelsOnHover?: boolean;
   onNodeSelect?: (node: GraphNodeData | null) => void;
   /**
    * Called when a node is double-clicked. Used to lazily expand a class's
@@ -621,6 +626,7 @@ function OntologyGraphFlowInner({
   collapseStandalone = true,
   refitAfterLayout = false,
   linkDistance = DEFAULT_LINK_DISTANCE,
+  edgeLabelsOnHover = false,
   onNodeSelect,
   onNodeExpand,
 }: Props) {
@@ -653,7 +659,8 @@ function OntologyGraphFlowInner({
   // Edge labels only when zoomed in enough to read them. Selecting the boolean
   // (not the zoom) means the graph re-renders only when the threshold is
   // crossed, not on every pan/zoom frame.
-  const showEdgeLabels = useStore((s) => s.transform[2] >= EDGE_LABEL_MIN_ZOOM);
+  const zoomedIn = useStore((s) => s.transform[2] >= EDGE_LABEL_MIN_ZOOM);
+  const showEdgeLabels = zoomedIn && !edgeLabelsOnHover;
 
   const { t } = useAppI18n();
   // React Flow's own control and minimap labels are English defaults; route

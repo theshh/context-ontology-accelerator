@@ -328,6 +328,7 @@ export const BusinessMapPage: React.FC = () => {
                   collapseStandalone={false}
                   refitAfterLayout
                   linkDistance={MAP_LINK_DISTANCE}
+                  edgeLabelsOnHover
                   onNodeSelect={(n) => n && setSelected(n.id)}
                 />
               </div>
