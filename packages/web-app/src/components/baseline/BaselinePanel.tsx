@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * "Without COA" column of the Playground compare view: what a plain
+ * "Without context" column of the Playground compare view: what a plain
  * text-to-SQL assistant answers when it sees only the raw table and column
  * names. One card per question, newest last, so it lines up with the chat.
  */
@@ -25,7 +25,7 @@ const ROWS_SHOWN = 5;
 export function BaselinePanel({ turns }: { turns: BaselineTurn[] }) {
   return (
     <SpaceBetween size="s">
-      <Box variant="awsui-key-label">Without COA</Box>
+      <Box variant="awsui-key-label">Without context</Box>
       <Box variant="small" color="text-body-secondary">
         A plain AI assistant that sees only the raw table and column names. No
         business definitions, governed rules or policy documents.

@@ -333,7 +333,7 @@ export const Playground: React.FC = () => {
                 checked={compare}
                 onChange={({ detail }) => setCompare(detail.checked)}
               >
-                Compare without COA
+                Compare with and without context
               </Toggle>
             )}
             <SegmentedControl

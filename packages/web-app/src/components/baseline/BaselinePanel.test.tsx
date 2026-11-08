@@ -6,7 +6,7 @@ import { BaselinePanel } from "./BaselinePanel";
 describe("BaselinePanel", () => {
   it("explains what the baseline sees before any question", () => {
     render(<BaselinePanel turns={[]} />);
-    expect(screen.getByText("Without COA")).toBeInTheDocument();
+    expect(screen.getByText("Without context")).toBeInTheDocument();
     expect(screen.getByText(/raw table and column names/)).toBeInTheDocument();
   });
 

@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from "vitest";
 import type { QueryResult } from "@app-types";
-import { coaAnswerText, explainCoa, graphLinks } from "./explain-coa";
+import {
+  coaAnswerText,
+  explainCoa,
+  firstSentence,
+  graphLinks,
+} from "./explain-coa";
 
 const NS = "http://coa.amazon.com/namespace/n/ontology/induced#";
 
@@ -118,8 +123,8 @@ describe("explainCoa", () => {
       "Checked access",
       "Ran the query",
     ]);
-    expect(steps[0]!.text).toContain(
-      "“vacancy rate” means the rule Vacancy rate: Funded posts",
+    expect(steps[0]!.text).toBe(
+      "“vacancy rate” → Vacancy rate. Funded posts with no active employment / funded posts.",
     );
     expect(steps[1]!.things).toEqual(["Employment", "Establishment position"]);
     expect(steps[1]!.text).toBe(
@@ -154,7 +159,7 @@ describe("explainCoa", () => {
       ],
     };
     expect(explainCoa(viaSynonym, rules, [])[0]!.text).toContain(
-      "“open posts” (one of its synonyms) means",
+      "“open posts” (a synonym) → Vacancy rate.",
     );
   });
 
@@ -194,5 +199,23 @@ describe("coaAnswerText", () => {
         rules,
       ),
     ).toBe("It was 12.7%.");
+  });
+});
+
+describe("firstSentence", () => {
+  it("keeps a long rule definition to its first sentence", () => {
+    expect(
+      firstSentence(
+        "Distinct officers with an active employment on as_of_date (start_date on or before the date, end_date null or on/after it), excluding Temporary staff (employment_type 'T'). Counts Permanent, Contract and Re-employed officers.",
+      ),
+    ).toBe(
+      "Distinct officers with an active employment on as_of_date, excluding Temporary staff.",
+    );
+    expect(
+      firstSentence(
+        "Share of funded posts that are empty. Expired posts are not vacancies.",
+      ),
+    ).toBe("Share of funded posts that are empty.");
+    expect(firstSentence(undefined)).toBe("");
   });
 });

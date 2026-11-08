@@ -68,6 +68,16 @@ export function graphLinks(overview: OverviewLike | undefined): GraphLink[] {
   return links;
 }
 
+/** The first sentence of a rule's definition, without bracketed detail, so the step stays short. */
+export function firstSentence(text: string | undefined, max = 140): string {
+  if (!text) return "";
+  // Bracketed detail (column names, codes) is for the full definition.
+  const t = text.replace(/\s*\([^)]*\)/g, "").trim();
+  const end = t.search(/[.!?](\s|$)/);
+  const first = end >= 0 ? t.slice(0, end + 1) : t;
+  return first.length > max ? `${first.slice(0, max - 1).trimEnd()}…` : first;
+}
+
 function detailOf(
   trace: readonly TraceStep[],
   step: string,
@@ -102,11 +112,11 @@ export function explainCoa(
       typeof match?.matchedText === "string"
         ? `“${match.matchedText}”`
         : "The question";
-    const via =
-      match?.matchSource === "synonym" ? " (one of its synonyms)" : "";
+    const via = match?.matchSource === "synonym" ? " (a synonym)" : "";
+    const summary = firstSentence(rule?.description);
     steps.push({
       title: "Matched a governed rule",
-      text: `${words}${via} means the rule ${rule?.label ?? humanize(ruleName)}${rule?.description ? `: ${rule.description}` : "."}`,
+      text: `${words}${via} → ${rule?.label ?? humanize(ruleName)}.${summary ? ` ${summary}` : ""}`,
     });
   }
 

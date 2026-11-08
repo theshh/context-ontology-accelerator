@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Compare view: one row per question, "Without COA" and "With COA" side by
+ * Compare view: one row per question, "Without context" and "With context" side by
  * side in the same card layout, so the two answers line up.
  */
 import Box from "@cloudscape-design/components/box";
@@ -36,8 +36,8 @@ export function CompareList({ turns, rules, links, formatRows }: Props) {
     <SpaceBetween size="l">
       <Box variant="small" color="text-body-secondary">
         Left: a plain AI assistant that sees only the raw table and column
-        names. Right: COA, which answers from the context graph, its governed
-        rules and policy documents.
+        names. Right: the same question answered with context: the context
+        graph, its governed rules and policy documents.
       </Box>
       {turns.map((turn) => (
         <section key={turn.id} aria-label={turn.question}>
@@ -70,7 +70,11 @@ function BaselineSide({ turn }: { turn: CompareTurn }) {
   const b = turn.baseline;
   if (!b)
     return (
-      <AnswerCard side="without" howTitle="" error="Not asked without COA." />
+      <AnswerCard
+        side="without"
+        howTitle=""
+        error="Not asked without context."
+      />
     );
   const r = b.result;
   return (
@@ -104,7 +108,9 @@ function CoaSide({
 }: Omit<Props, "turns"> & { turn: CompareTurn }) {
   const msg = turn.coa;
   if (!msg)
-    return <AnswerCard side="with" howTitle="" loading="Waiting for COA" />;
+    return (
+      <AnswerCard side="with" howTitle="" loading="Waiting for the answer" />
+    );
   if (msg.isLoading) {
     return (
       <AnswerCard
@@ -134,7 +140,7 @@ function CoaSide({
     <AnswerCard
       side="with"
       answer={coaAnswerText(result, rows, rules)}
-      howTitle="How COA worked it out"
+      howTitle="How it was worked out"
       howOpen
       how={<Steps steps={explainCoa(result, rules, links)} />}
       sql={result.queryUsed}
