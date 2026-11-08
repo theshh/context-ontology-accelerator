@@ -5,6 +5,7 @@ import React, {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -42,6 +43,8 @@ import { scrollToBottom } from "@utils/scroll";
 import { buildQueryEndpoint } from "@utils/build-query-endpoint";
 import { buildBaselineEndpoint } from "@utils/build-baseline-endpoint";
 import { askBaseline } from "@api-hooks/baseline-query";
+import { useListMetrics } from "@api-hooks/use-metrics";
+import { formatMetricRows } from "@utils/format-metric-rows";
 import {
   BaselinePanel,
   type BaselineTurn,
@@ -106,6 +109,19 @@ export const Playground: React.FC = () => {
   });
 
   const exampleQuestions = useExampleQuestions(namespaceId);
+
+  // Rule (metric) units, so a ratio rule's answer shows as a percentage.
+  const metrics = useListMetrics(namespaceId, 100);
+  const unitByMetric = useMemo(
+    () =>
+      Object.fromEntries(
+        (metrics.data?.pages ?? [])
+          .flatMap((p) => p.metrics ?? [])
+          .filter((m) => m.name)
+          .map((m) => [m.name as string, m.unit]),
+      ),
+    [metrics.data],
+  );
 
   // Compare view: each question also goes to the baseline ("without COA")
   // agent, shown in a column beside the chat. Offered only when deployed.
@@ -470,7 +486,11 @@ export const Playground: React.FC = () => {
                                 "",
                               synthesizedAnswer:
                                 msg.response.result?.synthesizedAnswer,
-                              resultRows: msg.response.result?.resultRows,
+                              resultRows: formatMetricRows(
+                                msg.response.result?.resultRows,
+                                msg.response.result?.trace,
+                                unitByMetric,
+                              ),
                               queryUsed: msg.response.result?.queryUsed,
                               sparqlGenerated:
                                 msg.response.result?.sparqlGenerated,

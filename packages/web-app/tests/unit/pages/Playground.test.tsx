@@ -56,6 +56,11 @@ vi.mock("../../../src/api-hooks/use-playground-chat-sse", () => ({
   }),
 }));
 
+// Rule units (for showing ratio answers as percentages); none needed here.
+vi.mock("../../../src/api-hooks/use-metrics", () => ({
+  useListMetrics: () => ({ data: undefined }),
+}));
+
 vi.mock("../../../src/components/SplitPanelProvider", () => ({
   useSplitPanel: () => ({
     state: { content: null, isOpen: false, header: "" },
@@ -88,9 +93,7 @@ function renderPlayground() {
 describe("Playground", () => {
   it("renders the playground header", () => {
     renderPlayground();
-    expect(
-      screen.getByText("Playground"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Playground")).toBeInTheDocument();
   });
 
   it("renders the chat container with empty state", () => {
