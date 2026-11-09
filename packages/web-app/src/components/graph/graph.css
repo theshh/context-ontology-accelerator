@@ -41,6 +41,13 @@
  * drop shadow makes the label read as a block that masks the edge beneath
  * it, so a hovered edge's label visually interrupts the line instead of
  * floating on top as a tiny chip. */
+/* Hovered edges get zIndex 1, which React Flow draws in an elevated SVG layer
+   above the label layer, so their lines ran across the white label boxes.
+   Lift the label layer over the edges (still below attribute nodes, z 5). */
+.react-flow__edgelabel-renderer {
+  z-index: 4;
+}
+
 .coa-graph-edge-label {
   position: absolute;
   /* Pointer-interactive so hovering the label can light up its edge + endpoints. */
