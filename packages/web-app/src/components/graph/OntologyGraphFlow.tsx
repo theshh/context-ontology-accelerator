@@ -147,6 +147,8 @@ type OntologyFlowNode = Node<GraphNodeData>;
 const NODE_SIZE = 64;
 /** Force layout: preferred edge length in px (see the `linkDistance` prop). */
 const DEFAULT_LINK_DISTANCE = 330;
+/** How far a lifted edge label sits from its line (see `labelsAboveLine`). */
+const LABEL_LIFT_PX = 12;
 
 /**
  * Shortest chord where the inner-stagger t ≈ 0.35 still lands the label
@@ -325,6 +327,8 @@ const HoverContext = createContext<{
   hoveredId: string | null;
   neighbourIds: ReadonlySet<string> | null;
   setHoveredEdgeId: (id: string | null) => void;
+  /** Draw each edge label just above its line instead of on top of it. */
+  labelsAboveLine?: boolean;
 }>({ hoveredId: null, neighbourIds: null, setHoveredEdgeId: () => {} });
 
 function OntologyNode({ data }: { data: GraphNodeData }) {
@@ -487,7 +491,7 @@ function FloatingEdge({
 }: EdgeProps<Edge<FloatingEdgeData>>) {
   const sourceNode = useInternalNode(source);
   const targetNode = useInternalNode(target);
-  const { setHoveredEdgeId } = useContext(HoverContext);
+  const { setHoveredEdgeId, labelsAboveLine } = useContext(HoverContext);
   if (!sourceNode || !targetNode) return null;
 
   const centre = (n: InternalNode) => ({
@@ -519,8 +523,23 @@ function FloatingEdge({
   let path: string;
   const labelT = data?.labelT ?? 0.5;
   const labelPoint = projectEdgeLabel(sx, sy, tx, ty, curve, labelT);
-  const labelX = labelPoint.x;
-  const labelY = labelPoint.y;
+  // Optionally lift the label off the line along the normal that points up the
+  // screen, so the line stays visible under the text.
+  let labelX = labelPoint.x;
+  let labelY = labelPoint.y;
+  if (labelsAboveLine) {
+    const ex = tx - sx;
+    const ey = ty - sy;
+    const elen = Math.hypot(ex, ey) || 1;
+    let ox = -ey / elen;
+    let oy = ex / elen;
+    if (oy > 0) {
+      ox = -ox;
+      oy = -oy;
+    }
+    labelX += ox * LABEL_LIFT_PX;
+    labelY += oy * LABEL_LIFT_PX;
+  }
   if (curve === 0) {
     path = `M ${sx} ${sy} L ${tx} ${ty}`;
   } else {
@@ -972,8 +991,14 @@ function OntologyGraphFlowInner({
     return null;
   }, [edges, hoveredId, hoveredEdgeId]);
   const hoverContext = useMemo(
-    () => ({ hoveredId, neighbourIds, setHoveredEdgeId }),
-    [hoveredId, neighbourIds],
+    () => ({
+      hoveredId,
+      neighbourIds,
+      setHoveredEdgeId,
+      // Hover-only labels sit above their line so the line stays readable.
+      labelsAboveLine: edgeLabelsOnHover,
+    }),
+    [hoveredId, neighbourIds, edgeLabelsOnHover],
   );
 
   // Per-edge label `t` value (position along the chord as a fraction).
