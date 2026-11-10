@@ -175,6 +175,32 @@ def test_extract_sql_from_json_and_fences():
     assert core.extract_sql("```sql\nSELECT 2\n```")[0] == "SELECT 2"
 
 
+def test_extract_sql_accepts_raw_newlines_inside_the_json_string():
+    reply = '{"sql": "SELECT 1\n  FROM t\n  WHERE x = \'a\'", "assumptions": "Multi-line."}'
+    sql, assumptions = core.extract_sql(reply)
+    assert sql.startswith("SELECT 1") and "WHERE x = 'a'" in sql
+    assert assumptions == "Multi-line."
+
+
+def test_extract_sql_unwraps_a_json_code_fence():
+    reply = 'Here you go:\n```json\n{"sql": "SELECT 2", "assumptions": "Fenced."}\n```'
+    assert core.extract_sql(reply) == ("SELECT 2", "Fenced.")
+
+
+def test_extract_sql_recovers_the_field_from_almost_json():
+    # An unescaped quote in "assumptions" breaks json.loads; the sql field is still recoverable.
+    reply = '{"sql": "SELECT \\"a\\" FROM t", "assumptions": "uses "quotes" badly"}'
+    sql, _ = core.extract_sql(reply)
+    assert sql == 'SELECT "a" FROM t'
+
+
+def test_extract_sql_never_returns_the_json_object_as_sql():
+    reply = '{"sql": "WITH d AS (SELECT DATE \'2026-10-01\' AS as_of)\nSELECT * FROM d", "assumptions": "x"}'
+    sql, _ = core.extract_sql(reply)
+    assert not sql.startswith("{")
+    assert core.ensure_read_only(sql)
+
+
 def test_answer_runs_generated_sql_and_phrases_result():
     athena = FakeAthena()
     out = core.answer(

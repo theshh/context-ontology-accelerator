@@ -202,15 +202,38 @@ ANSWER_SYSTEM_PROMPT = (
 def extract_sql(model_text: str) -> tuple[str, str]:
     """Pull {"sql", "assumptions"} out of the model reply (tolerates code fences)."""
     text = model_text.strip()
-    match = re.search(r"\{.*\}", text, re.S)
-    if match:
+    # Models often wrap the JSON in a ```json fence; unwrap it before looking for the object.
+    json_fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S | re.I)
+    candidate = json_fence.group(1) if json_fence else None
+    if candidate is None:
+        match = re.search(r"\{.*\}", text, re.S)
+        candidate = match.group(0) if match else None
+    if candidate is not None:
         try:
-            obj = json.loads(match.group(0))
-            return str(obj.get("sql", "")).strip(), str(obj.get("assumptions", "")).strip()
+            # strict=False accepts raw newlines and tabs inside strings, which models
+            # emit when the SQL spans several lines.
+            obj = json.loads(candidate, strict=False)
+            if isinstance(obj, dict):
+                return str(obj.get("sql", "")).strip(), str(obj.get("assumptions", "")).strip()
         except json.JSONDecodeError:
             pass
+        # Still not valid JSON (e.g. an unescaped quote): pull the two fields out directly.
+        sql = _json_string_field(candidate, "sql")
+        if sql:
+            return sql, _json_string_field(candidate, "assumptions")
     fence = re.search(r"```(?:sql)?\s*(.*?)```", text, re.S | re.I)
     return (fence.group(1) if fence else text).strip(), ""
+
+
+def _json_string_field(text: str, key: str) -> str:
+    """Best-effort read of ``"key": "..."`` from almost-JSON, honouring backslash escapes."""
+    m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.S)
+    if not m:
+        return ""
+    try:
+        return str(json.loads(f'"{m.group(1)}"', strict=False)).strip()
+    except json.JSONDecodeError:
+        return m.group(1).strip()
 
 
 def ensure_read_only(sql: str) -> str:
