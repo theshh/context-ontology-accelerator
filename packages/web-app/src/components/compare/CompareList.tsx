@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Compare view: one row per question, "Without context" and "With context" side by
- * side in the same card layout, so the two answers line up.
+ * Compare view: one row per question, "Agent with skills" and "With context
+ * (COA)" side by side in the same card layout, so the two answers line up.
  */
 import Box from "@cloudscape-design/components/box";
 import SpaceBetween from "@cloudscape-design/components/space-between";
@@ -35,9 +35,10 @@ export function CompareList({ turns, rules, links, formatRows }: Props) {
   return (
     <SpaceBetween size="l">
       <Box variant="small" color="text-body-secondary">
-        Left: a plain AI assistant that sees only the raw table and column
-        names. Right: the same question answered with context: the context
-        graph, its governed rules and policy documents.
+        Left: an AI agent with the raw table and column names plus a
+        hand-written skill file of MPI&apos;s business rules. Right: the same
+        question answered with context: the context graph, its governed rules
+        and policy documents.
       </Box>
       {turns.map((turn) => (
         <section key={turn.id} aria-label={turn.question}>
@@ -70,25 +71,29 @@ function BaselineSide({ turn }: { turn: CompareTurn }) {
   const b = turn.baseline;
   if (!b)
     return (
-      <AnswerCard
-        side="without"
-        howTitle=""
-        error="Not asked without context."
-      />
+      <AnswerCard side="without" howTitle="" error="Not asked to the agent." />
     );
   const r = b.result;
+  const usedSkills = (r?.skills?.length ?? 0) > 0;
   return (
     <AnswerCard
       side="without"
       loading={
-        b.status === "loading" ? "Writing SQL from the raw schema" : undefined
+        b.status === "loading"
+          ? "Reading its skills and writing SQL"
+          : undefined
       }
       error={r?.error ? (r.message ?? r.error) : undefined}
       answer={r?.answer}
       howTitle="How it was worked out"
       how={
-        r?.assumptions || r?.sql ? (
+        r?.assumptions || r?.sql || r?.skills?.length ? (
           <SpaceBetween size="xs">
+            {usedSkills && (
+              <Box variant="p">
+                <b>Skills used:</b> {r?.skills?.join(", ")}
+              </Box>
+            )}
             {r?.assumptions && (
               <Box variant="p">
                 <b>Assumed:</b> {r.assumptions}
@@ -102,7 +107,11 @@ function BaselineSide({ turn }: { turn: CompareTurn }) {
       rows={r?.rows}
       footer={
         r?.elapsedMs !== undefined
-          ? `${(r.elapsedMs / 1000).toFixed(1)} s · guessed from column names`
+          ? `${(r.elapsedMs / 1000).toFixed(1)} s · ${
+              usedSkills
+                ? "rules from a skill file"
+                : "guessed from column names"
+            }`
           : undefined
       }
     />

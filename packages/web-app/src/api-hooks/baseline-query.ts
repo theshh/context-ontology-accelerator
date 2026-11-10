@@ -16,6 +16,8 @@ export interface BaselineResult {
   rows?: (string | null)[][];
   model?: string;
   databases?: string[];
+  /** Names of the skill files the agent was given for this graph. */
+  skills?: string[];
   elapsedMs?: number;
   error?: string;
   message?: string;

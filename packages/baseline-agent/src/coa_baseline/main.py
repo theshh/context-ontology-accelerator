@@ -19,7 +19,7 @@ import boto3
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from botocore.config import Config
 
-from coa_baseline.core import AccessDenied, BadRequest, CoaApi, Deps, NoGlueData, answer
+from coa_baseline.core import AccessDenied, BadRequest, CoaApi, Deps, NoGlueData, answer, load_skills
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("coa_baseline")
@@ -32,6 +32,9 @@ _cfg = Config(connect_timeout=5, read_timeout=60, retries={"mode": "standard", "
 _glue = boto3.client("glue", region_name=REGION, config=_cfg)
 _athena = boto3.client("athena", region_name=REGION, config=_cfg)
 _bedrock = boto3.client("bedrock-runtime", region_name=REGION, config=_cfg)
+
+_skills = load_skills()
+log.info("baseline_skills_loaded names=%s", [s.name for s in _skills])
 
 app = BedrockAgentCoreApp()
 
@@ -64,7 +67,14 @@ def invoke(payload: dict, context=None) -> dict:
     token = _bearer(context)
     if not token:
         return _error("AccessDenied", "Missing bearer token", 401, request_id)
-    deps = Deps(api=CoaApi(API_ENDPOINT, token), glue=_glue, athena=_athena, converse=_converse, model_id=MODEL_ID)
+    deps = Deps(
+        api=CoaApi(API_ENDPOINT, token),
+        glue=_glue,
+        athena=_athena,
+        converse=_converse,
+        model_id=MODEL_ID,
+        skills=_skills,
+    )
     try:
         out = answer(payload or {}, deps)
         out["requestId"] = request_id

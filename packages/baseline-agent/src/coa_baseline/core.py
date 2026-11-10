@@ -24,6 +24,7 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import sqlglot
@@ -133,6 +134,48 @@ def render_schema(glue: Any, databases: list[str]) -> str:
     return "\n\n".join(lines)
 
 
+# ── Agent skills (hand-written business rules) ─────────────────────────────
+
+SKILLS_DIR = Path(__file__).parent / "skills"
+
+
+@dataclass(frozen=True)
+class Skill:
+    """A SKILL.md file: a name, the Glue databases it covers, and its markdown body."""
+
+    name: str
+    databases: frozenset[str]
+    body: str
+
+
+def parse_skill(text: str) -> Skill | None:
+    """Read the front matter (name, databases) and body of a SKILL.md; None if malformed."""
+    m = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.S)
+    if not m:
+        return None
+    meta: dict[str, str] = {}
+    for line in m.group(1).splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            meta[k.strip()] = v.strip()
+    dbs = frozenset(x.strip() for x in meta.get("databases", "").strip("[]").split(",") if x.strip())
+    if not meta.get("name") or not dbs:
+        return None
+    return Skill(name=meta["name"], databases=dbs, body=m.group(2).strip())
+
+
+def load_skills(directory: Path = SKILLS_DIR) -> list[Skill]:
+    """Every valid skills/*/SKILL.md, sorted by name."""
+    skills = [parse_skill(p.read_text()) for p in sorted(directory.glob("*/SKILL.md"))]
+    return [s for s in skills if s is not None]
+
+
+def skills_for(skills: list[Skill], databases: list[str]) -> list[Skill]:
+    """Skills whose databases overlap the context graph's Glue databases."""
+    have = set(databases)
+    return [s for s in skills if s.databases & have]
+
+
 # ── SQL generation and safety ──────────────────────────────────────────────
 
 SQL_SYSTEM_PROMPT = """You are a data analyst. Write ONE Amazon Athena (Trino SQL) SELECT query
@@ -140,9 +183,15 @@ that answers the user's question from the tables below.
 Use fully qualified names (database.table). Use only tables and columns that appear in the schema.
 Return only JSON: {{"sql": "<the query>", "assumptions": "<one short sentence>"}}.
 Today's date is {today}.
-
+{skills}
 Schema:
 {schema}"""
+
+SKILLS_PREAMBLE = """
+Follow these skills. They are the organisation's business rules and override
+your own assumptions about what the columns mean.
+
+"""
 
 ANSWER_SYSTEM_PROMPT = (
     "Answer the user's question in one or two plain sentences using only the query result given. "
@@ -223,6 +272,7 @@ class Deps:
     converse: Callable[[str, str], str]  # (system, user) -> text
     model_id: str
     today: date = field(default_factory=date.today)
+    skills: list[Skill] = field(default_factory=list)
 
 
 def answer(payload: dict[str, Any], deps: Deps) -> dict[str, Any]:
@@ -237,9 +287,18 @@ def answer(payload: dict[str, Any], deps: Deps) -> dict[str, Any]:
 
     scope = resolve_scope(deps.api, namespace)
     schema = render_schema(deps.glue, scope.databases)
-    reply = deps.converse(SQL_SYSTEM_PROMPT.format(today=deps.today.isoformat(), schema=schema), question)
+    used = skills_for(deps.skills, scope.databases)
+    skills_text = SKILLS_PREAMBLE + "\n\n".join(f"## Skill: {s.name}\n{s.body}" for s in used) + "\n" if used else ""
+    prompt = SQL_SYSTEM_PROMPT.format(today=deps.today.isoformat(), schema=schema, skills=skills_text)
+    reply = deps.converse(prompt, question)
     sql, assumptions = extract_sql(reply)
-    out: dict[str, Any] = {"sql": sql, "assumptions": assumptions, "model": deps.model_id, "databases": scope.databases}
+    out: dict[str, Any] = {
+        "sql": sql,
+        "assumptions": assumptions,
+        "model": deps.model_id,
+        "databases": scope.databases,
+        "skills": [s.name for s in used],
+    }
     try:
         sql = ensure_read_only(sql)
     except UnsafeSql as e:

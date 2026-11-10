@@ -55,7 +55,7 @@ export function AnswerCard(props: AnswerCardProps) {
       <Container fitHeight>
         <SpaceBetween size="s">
           <Box variant="awsui-key-label">
-            {side === "with" ? "With context" : "Without context"}
+            {side === "with" ? "With context (COA)" : "Agent with skills"}
           </Box>
           {loading ? (
             <StatusIndicator type="loading">{loading}</StatusIndicator>

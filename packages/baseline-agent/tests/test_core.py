@@ -213,3 +213,67 @@ def test_answer_reports_athena_failure():
 def test_answer_validates_payload(payload):
     with pytest.raises(core.BadRequest):
         core.answer(payload, deps(graph_api(), FakeAthena(), "{}"))
+
+
+def test_bundled_mpi_skill_loads():
+    skills = core.load_skills()
+    mpi = next(s for s in skills if s.name == "mpi-workforce")
+    assert "mpi_hrms" in mpi.databases
+    assert "RSN" in mpi.body and "grade_rank 10" in mpi.body
+
+
+def test_parse_skill_rejects_missing_front_matter():
+    assert core.parse_skill("# no front matter") is None
+    assert core.parse_skill("---\nname: x\n---\nbody") is None  # no databases
+
+
+def test_skills_for_matches_by_glue_database():
+    a = core.Skill("a", frozenset({"mpi_hrms"}), "A")
+    b = core.Skill("b", frozenset({"other_db"}), "B")
+    assert core.skills_for([a, b], ["mpi_hrms", "mpi_finance"]) == [a]
+
+
+def test_answer_puts_matching_skills_in_the_prompt():
+    prompts: list[str] = []
+    replies = iter(['{"sql": "SELECT 1"}', "One."])
+
+    def converse(system: str, user: str) -> str:
+        prompts.append(system)
+        return next(replies)
+
+    skill = core.Skill("mpi-workforce", frozenset({"mpi_hrms"}), "Headcount excludes type T.")
+    d = core.Deps(
+        api=graph_api(),
+        glue=FakeGlue(),
+        athena=FakeAthena(),
+        converse=converse,
+        model_id="m",
+        today=date(2026, 11, 7),
+        skills=[skill],
+    )
+    out = core.answer({"namespace": NS, "query": "How many officers?"}, d)
+    assert "Headcount excludes type T." in prompts[0]
+    assert out["skills"] == ["mpi-workforce"]
+
+
+def test_answer_without_matching_skill_has_no_skill_text():
+    prompts: list[str] = []
+    replies = iter(['{"sql": "SELECT 1"}', "One."])
+
+    def converse(system: str, user: str) -> str:
+        prompts.append(system)
+        return next(replies)
+
+    skill = core.Skill("other", frozenset({"other_db"}), "SECRET RULE")
+    d = core.Deps(
+        api=graph_api(),
+        glue=FakeGlue(),
+        athena=FakeAthena(),
+        converse=converse,
+        model_id="m",
+        today=date(2026, 11, 7),
+        skills=[skill],
+    )
+    out = core.answer({"namespace": NS, "query": "q"}, d)
+    assert "SECRET RULE" not in prompts[0]
+    assert out["skills"] == []
