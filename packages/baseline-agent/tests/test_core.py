@@ -222,6 +222,24 @@ def test_extract_sql_does_not_accept_sql_cut_off_mid_string():
         core.ensure_read_only(sql)
 
 
+def test_extract_sql_takes_the_last_of_two_json_answers():
+    reply = (
+        '```json\n{"sql": "SELECT 1 FROM t WHERE d >= DATE \'2026-10-01\'", "assumptions": "draft"}\n```\n'
+        'Correction:\n```json\n{"sql": "SELECT 2 FROM t", "assumptions": "final"}\n```'
+    )
+    assert core.extract_sql(reply) == ("SELECT 2 FROM t", "final")
+
+
+def test_extract_sql_never_merges_two_almost_json_answers():
+    reply = (
+        '{"sql": "SELECT "a" FROM t", "assumptions": "draft"}\n'
+        '{"sql": "SELECT "b" FROM t", "assumptions": "final with "quotes""}'
+    )
+    sql, assumptions = core.extract_sql(reply)
+    assert sql == 'SELECT "b" FROM t'
+    assert "assumptions" not in sql
+
+
 def test_extract_sql_never_returns_the_json_object_as_sql():
     reply = '{"sql": "WITH d AS (SELECT DATE \'2026-10-01\' AS as_of)\nSELECT * FROM d", "assumptions": "x"}'
     sql, _ = core.extract_sql(reply)

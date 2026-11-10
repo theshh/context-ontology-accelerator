@@ -202,35 +202,30 @@ ANSWER_SYSTEM_PROMPT = (
 def extract_sql(model_text: str) -> tuple[str, str]:
     """Pull {"sql", "assumptions"} out of the model reply (tolerates code fences)."""
     text = model_text.strip()
-    # Models often wrap the JSON in a ```json fence; unwrap it before looking for the object.
-    json_fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S | re.I)
-    candidate = json_fence.group(1) if json_fence else None
-    if candidate is None:
-        match = re.search(r"\{.*\}", text, re.S)
-        candidate = match.group(0) if match else None
-    if candidate is not None:
+    # 1. Every well-formed JSON object in the reply, decoded one at a time. A model
+    #    sometimes writes a draft and then a corrected answer; the last one wins.
+    #    strict=False accepts raw newlines inside strings (multi-line SQL).
+    decoder = json.JSONDecoder(strict=False)
+    found: tuple[str, str] | None = None
+    for m in re.finditer(r"\{", text):
         try:
-            # strict=False accepts raw newlines and tabs inside strings, which models
-            # emit when the SQL spans several lines.
-            obj = json.loads(candidate, strict=False)
-            if isinstance(obj, dict):
-                return str(obj.get("sql", "")).strip(), str(obj.get("assumptions", "")).strip()
+            obj, _end = decoder.raw_decode(text, m.start())
         except json.JSONDecodeError:
-            pass
-        # Still not valid JSON (e.g. an unescaped quote): pull the two fields out directly.
-        # Prefer slicing between the "sql" and "assumptions" keys, which survives
-        # unescaped double quotes inside the SQL (quoted identifiers).
-        between = re.search(r'"sql"\s*:\s*"(.*)"\s*,\s*"assumptions"\s*:\s*"(.*)"\s*\}', candidate, re.S)
-        if between:
-            return _unescape(between.group(1)), _unescape(between.group(2))
-    # A reply cut off after the SQL (mid "assumptions") still carries a complete query.
-    cut = re.search(r'"sql"\s*:\s*"(.*)"\s*,\s*"assumptions"\s*:\s*"(.*)$', text, re.S)
-    if cut:
-        return _unescape(cut.group(1)), _unescape(cut.group(2).rstrip("`\n }"))
-    if candidate is not None:
-        sql = _json_string_field(candidate, "sql")
-        if sql:
-            return sql, _json_string_field(candidate, "assumptions")
+            continue
+        if isinstance(obj, dict) and str(obj.get("sql", "")).strip():
+            found = (str(obj["sql"]).strip(), str(obj.get("assumptions", "")).strip())
+    if found:
+        return found
+    # 2. Almost-JSON (an unescaped quote, or a reply cut off inside "assumptions"):
+    #    slice the last "sql" value up to the "assumptions" key that follows it.
+    #    Non-greedy, so a second copy of the object is never swallowed into the SQL.
+    pairs = list(re.finditer(r'"sql"\s*:\s*"(.*?)"\s*,\s*"assumptions"\s*:\s*"(.*?)(?:"\s*\}|$)', text, re.S))
+    if pairs:
+        last = pairs[-1]
+        return _unescape(last.group(1)), _unescape(last.group(2).rstrip("`\n }"))
+    sql = _json_string_field(text, "sql")
+    if sql:
+        return sql, _json_string_field(text, "assumptions")
     fence = re.search(r"```(?:sql)?\s*(.*?)```", text, re.S | re.I)
     return (fence.group(1) if fence else text).strip(), ""
 
