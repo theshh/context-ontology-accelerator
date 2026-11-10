@@ -194,6 +194,20 @@ def test_extract_sql_recovers_the_field_from_almost_json():
     assert sql == 'SELECT "a" FROM t'
 
 
+def test_extract_sql_keeps_unescaped_quoted_identifiers():
+    # The model wrote Trino quoted identifiers without escaping them inside the JSON string.
+    reply = '{"sql": "SELECT COUNT(*) FROM "mpi_hrms".employment WHERE x = 1", "assumptions": "Counts "rows"."}'
+    sql, assumptions = core.extract_sql(reply)
+    assert sql == 'SELECT COUNT(*) FROM "mpi_hrms".employment WHERE x = 1'
+    assert assumptions == 'Counts "rows".'
+    assert core.ensure_read_only(sql)
+
+
+def test_unbalanced_quote_is_a_clean_refusal_not_a_crash():
+    with pytest.raises(core.UnsafeSql):
+        core.ensure_read_only('SELECT "a FROM t')
+
+
 def test_extract_sql_never_returns_the_json_object_as_sql():
     reply = '{"sql": "WITH d AS (SELECT DATE \'2026-10-01\' AS as_of)\nSELECT * FROM d", "assumptions": "x"}'
     sql, _ = core.extract_sql(reply)

@@ -218,11 +218,22 @@ def extract_sql(model_text: str) -> tuple[str, str]:
         except json.JSONDecodeError:
             pass
         # Still not valid JSON (e.g. an unescaped quote): pull the two fields out directly.
+        # Prefer slicing between the "sql" and "assumptions" keys, which survives
+        # unescaped double quotes inside the SQL (quoted identifiers).
+        between = re.search(r'"sql"\s*:\s*"(.*)"\s*,\s*"assumptions"\s*:\s*"(.*)"\s*\}', candidate, re.S)
+        if between:
+            return _unescape(between.group(1)), _unescape(between.group(2))
         sql = _json_string_field(candidate, "sql")
         if sql:
             return sql, _json_string_field(candidate, "assumptions")
     fence = re.search(r"```(?:sql)?\s*(.*?)```", text, re.S | re.I)
     return (fence.group(1) if fence else text).strip(), ""
+
+
+def _unescape(raw: str) -> str:
+    """Undo JSON string escapes where possible, keeping unescaped quotes as they are."""
+    out = raw.replace('\\"', '"').replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\")
+    return out.strip()
 
 
 def _json_string_field(text: str, key: str) -> str:
@@ -243,7 +254,7 @@ def ensure_read_only(sql: str) -> str:
         raise UnsafeSql("The model returned no SQL")
     try:
         statements = [s for s in sqlglot.parse(cleaned, read="trino") if s is not None]
-    except sqlglot.errors.ParseError as e:
+    except sqlglot.errors.SqlglotError as e:  # ParseError and TokenError
         raise UnsafeSql(f"SQL did not parse: {e}") from e
     if len(statements) != 1:
         raise UnsafeSql("Only a single statement is allowed")
