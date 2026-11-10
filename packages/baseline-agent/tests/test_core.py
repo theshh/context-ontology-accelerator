@@ -208,6 +208,20 @@ def test_unbalanced_quote_is_a_clean_refusal_not_a_crash():
         core.ensure_read_only('SELECT "a FROM t')
 
 
+def test_extract_sql_reads_a_reply_cut_off_inside_assumptions():
+    reply = '```json\n{"sql": "SELECT a.fy FROM t a ORDER BY a.fy",\n  "assumptions": "FY2024 is 1 Apr'
+    sql, assumptions = core.extract_sql(reply)
+    assert sql == "SELECT a.fy FROM t a ORDER BY a.fy"
+    assert assumptions == "FY2024 is 1 Apr"
+
+
+def test_extract_sql_does_not_accept_sql_cut_off_mid_string():
+    reply = '{"sql": "SELECT a.fy FROM t WHERE x ='
+    sql, _ = core.extract_sql(reply)
+    with pytest.raises(core.UnsafeSql):
+        core.ensure_read_only(sql)
+
+
 def test_extract_sql_never_returns_the_json_object_as_sql():
     reply = '{"sql": "WITH d AS (SELECT DATE \'2026-10-01\' AS as_of)\nSELECT * FROM d", "assumptions": "x"}'
     sql, _ = core.extract_sql(reply)

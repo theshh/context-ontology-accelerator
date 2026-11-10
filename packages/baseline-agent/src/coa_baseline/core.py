@@ -223,6 +223,11 @@ def extract_sql(model_text: str) -> tuple[str, str]:
         between = re.search(r'"sql"\s*:\s*"(.*)"\s*,\s*"assumptions"\s*:\s*"(.*)"\s*\}', candidate, re.S)
         if between:
             return _unescape(between.group(1)), _unescape(between.group(2))
+    # A reply cut off after the SQL (mid "assumptions") still carries a complete query.
+    cut = re.search(r'"sql"\s*:\s*"(.*)"\s*,\s*"assumptions"\s*:\s*"(.*)$', text, re.S)
+    if cut:
+        return _unescape(cut.group(1)), _unescape(cut.group(2).rstrip("`\n }"))
+    if candidate is not None:
         sql = _json_string_field(candidate, "sql")
         if sql:
             return sql, _json_string_field(candidate, "assumptions")

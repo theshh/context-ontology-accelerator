@@ -27,6 +27,7 @@ log = logging.getLogger("coa_baseline")
 REGION = os.environ["AWS_REGION"]
 MODEL_ID = os.environ["MODEL_ID"]
 API_ENDPOINT = os.environ["COA_API_ENDPOINT"]
+MAX_TOKENS = 8000
 
 _cfg = Config(connect_timeout=5, read_timeout=60, retries={"mode": "standard", "max_attempts": 2})
 _glue = boto3.client("glue", region_name=REGION, config=_cfg)
@@ -45,8 +46,12 @@ def _converse(system: str, user: str) -> str:
         system=[{"text": system}],
         messages=[{"role": "user", "content": [{"text": user}]}],
         # No temperature: newer Claude models reject it (deprecated parameter).
-        inferenceConfig={"maxTokens": 1500},
+        # The model reasons before it answers and that reasoning counts toward
+        # maxTokens, so 1500 cut multi-period SQL off mid-reply.
+        inferenceConfig={"maxTokens": MAX_TOKENS},
     )
+    if resp.get("stopReason") == "max_tokens":
+        log.warning("baseline_reply_truncated max_tokens=%s", MAX_TOKENS)
     return "".join(b.get("text", "") for b in resp["output"]["message"]["content"])
 
 
