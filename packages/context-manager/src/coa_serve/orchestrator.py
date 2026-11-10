@@ -914,13 +914,34 @@ class Orchestrator:
         # handle it (DoD: "match_count > 1 → bypasses Tier 1, routes to Tier 2/3").
         # Checked before .found so we never execute just the first of several.
         if metric_match.match_count > 1:
+            # Tier 1 still never executes here, but the governed definitions are
+            # forwarded to Tier 2 so it extends them instead of re-deriving each
+            # metric from the schema. Only metrics the principal's
+            # ``allowedMetrics`` grant permits are forwarded; a forbidden one is
+            # left out (the question still proceeds, as it did before forwarding).
+            candidates = [metric_match, *metric_match.others]
+            permitted = [m for m in candidates if self._metric_allowed(m, profile)]
+            declined_multi = DeclinedMetricContext.from_matches(permitted, metric_match.combined_residual)
+            forwarded = bool(declined_multi and declined_multi.prompt_block)
             trace.record(
                 StepId.T1_METRIC_MATCH,
                 "multi_metric_bypass",
                 t1_ms,
-                detail=f"{metric_match.match_count} metrics",
+                detail={
+                    "metricCount": metric_match.match_count,
+                    "metricNames": [m.metric_name for m in permitted],
+                    "withheldByGrant": len(candidates) - len(permitted),
+                    "governedDefinitionForwarded": forwarded,
+                },
             )
-            return None, None
+            logger.info(
+                "tier1_multi_metric_bypass",
+                namespace=namespace,
+                metrics=[m.metric_name for m in permitted],
+                withheld=len(candidates) - len(permitted),
+                governed_definition_forwarded=forwarded,
+            )
+            return None, (declined_multi if forwarded else None)
 
         # Grant-profile authorization runs HERE, before the residual-qualifier
         # gate — so a metric the principal may not use is denied whether the
@@ -1209,6 +1230,18 @@ class Orchestrator:
         trace.record(StepId.T1_METRIC_MATCH, "miss", t1_ms, detail={"query_length": len(query)})
         return None, None
 
+    @staticmethod
+    def _metric_allowed(metric_match: MetricMatch, profile: dict) -> bool:
+        """Whether the principal's ``allowedMetrics`` grant permits this metric.
+
+        Fail closed: ``is not None`` (not truthiness). An ABSENT ``allowedMetrics``
+        means "no metric constraint", an explicitly EMPTY one means "no metrics".
+        """
+        allowed_metrics = profile.get("allowedMetrics")
+        return allowed_metrics is None or (
+            metric_match.metric_id in allowed_metrics or metric_match.metric_name in allowed_metrics
+        )
+
     def _enforce_allowed_metrics(
         self,
         metric_match: MetricMatch,
@@ -1231,10 +1264,7 @@ class Orchestrator:
         fail OPEN — the same empty-vs-absent bug fixed for tableAllowlist in
         sql_firewall.py.
         """
-        allowed_metrics = profile.get("allowedMetrics")
-        if allowed_metrics is not None and (
-            metric_match.metric_id not in allowed_metrics and metric_match.metric_name not in allowed_metrics
-        ):
+        if not self._metric_allowed(metric_match, profile):
             principal_id = profile.get("userId", "unknown")
             # Trace details are rendered verbatim in the rationale panel ("Access
             # denied for principal X"), so they carry the display label; the log

@@ -374,6 +374,27 @@ class TestMultiMetricDetection:
         assert result.found
         assert result.match_count == 2
 
+    async def test_multi_metric_match_carries_every_metric_and_combined_residual(self):
+        """Every matched metric rides on the result so the orchestrator can forward
+        all their definitions; the residual is what NO matched metric consumed."""
+        resolver = _make_resolver()
+
+        result = resolver.exact_name_synonym_match("compare claims_count and total_premium for 2024", "insurance")
+
+        names = [result.metric_name, *(o.metric_name for o in result.others)]
+        assert sorted(names) == ["claims_count", "total_premium"]
+        assert all(o.sql_template for o in result.others)
+        assert "2024" in result.combined_residual
+        assert "claims" not in result.combined_residual and "premium" not in result.combined_residual
+
+    async def test_single_metric_match_has_no_others(self):
+        resolver = _make_resolver()
+
+        result = resolver.exact_name_synonym_match("what is total_revenue?", "finance")
+
+        assert result.others == []
+        assert result.combined_residual == ""
+
     async def test_multi_metric_via_synonyms(self):
         resolver = _make_resolver()
 
@@ -1825,6 +1846,46 @@ class TestDeclinedMetricContext:
         assert declined.description == "Claims not yet settled, per the claims-ops definition."
         assert declined.dimensions == ("region", "tier")
         assert declined.unhandled_qualifier == "anycompany"
+
+    def test_from_matches_renders_every_definition_in_one_block(self):
+        other = self._match(
+            metric_id="demo:premium", metric_name="total_premium", sql_template="SELECT sum(p) FROM pol"
+        )
+        declined = DeclinedMetricContext.from_matches([self._match(), other], "for 2024")
+
+        assert declined is not None
+        assert declined.metric_names == ["open_claim_count", "total_premium"]
+        block = declined.prompt_block
+        assert "2 authored, authoritative metrics" in block
+        assert "SELECT count(*) FROM claims WHERE status = 'OPEN'" in block
+        assert "SELECT sum(p) FROM pol" in block
+        assert "'for 2024'" in block
+
+    def test_from_matches_of_nothing_is_none(self):
+        assert DeclinedMetricContext.from_matches([], "x") is None
+
+    def test_multi_block_falls_back_to_single_when_one_has_a_formula(self):
+        """A companion without SQL forwards nothing for itself; the block reads as
+        the ordinary single-metric definition, not a one-item list."""
+        other = self._match(metric_id="demo:x", metric_name="no_formula", sql_template="")
+        declined = DeclinedMetricContext.from_matches([self._match(), other], "anycompany")
+
+        block = declined.prompt_block
+        assert block.startswith("GOVERNED METRIC DEFINITION — 'open_claim_count'")
+        assert "no_formula" not in block
+
+    def test_for_source_keeps_only_metrics_on_the_resolved_source(self):
+        a = self._match(data_source_id="ds-1")
+        b = self._match(metric_id="demo:b", metric_name="b_metric", data_source_id="ds-2", sql_template="SELECT 2")
+        declined = DeclinedMetricContext.from_matches([a, b], "for 2024")
+
+        kept = declined.for_source("ds-2")
+
+        assert kept is not None
+        assert kept.metric_names == ["b_metric"]
+        assert kept.unhandled_qualifier == "for 2024"
+        assert declined.for_source("ds-3") is None
+        assert declined.for_source("").metric_names == ["open_claim_count", "b_metric"]
 
     def test_dimensions_are_copied_not_aliased(self):
         """The carrier is frozen, so its dimensions must not alias the match's mutable list."""

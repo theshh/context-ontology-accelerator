@@ -78,18 +78,20 @@ def _governed_metric_block(declined: DeclinedMetricContext | None, resolved_sour
     """
     if declined is None:
         return ""
-    block = declined.prompt_block
-    if not block:
+    if not declined.prompt_block:
         return ""
-    if declined.data_source_id and resolved_source_id and declined.data_source_id != resolved_source_id:
+    # Per metric: a multi-metric carrier keeps only the definitions authored
+    # against the resolved source, so one cross-source metric does not drop the rest.
+    kept = declined.for_source(resolved_source_id)
+    dropped = [n for n in declined.metric_names if kept is None or n not in kept.metric_names]
+    if dropped:
         logger.info(
             "governed_metric_suppressed_source_mismatch",
-            metric=declined.metric_name,
+            metric=", ".join(dropped),
             metric_source=declined.data_source_id,
             resolved_source=resolved_source_id,
         )
-        return ""
-    return block
+    return kept.prompt_block if kept is not None else ""
 
 
 # Total NL→SQL attempts per query, INCLUDING the first shot. 2 = one generate +

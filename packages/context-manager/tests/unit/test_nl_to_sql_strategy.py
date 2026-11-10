@@ -207,6 +207,38 @@ class TestNLtoSQLStrategyResolve:
         assert "claims" in sql_generator.generate.call_args.kwargs["governed_metric"]
 
     @pytest.mark.asyncio
+    async def test_multi_metric_block_drops_only_the_cross_source_metric(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        """One metric authored against another source must not take the others down with it."""
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.return_value = _make_exec_result()
+        context = _make_context()  # options pins dataSourceId="ds-1"
+        context.declined_metric = DeclinedMetricContext(
+            metric_id="demo:open_claim_count",
+            metric_name="open_claim_count",
+            sql_template="SELECT count(*) FROM claims",
+            unhandled_qualifier="for 2024",
+            data_source_id="ds-1",
+            others=(
+                DeclinedMetricContext(
+                    metric_id="demo:premium",
+                    metric_name="premium",
+                    sql_template="SELECT sum(p) FROM policies",
+                    unhandled_qualifier="",
+                    data_source_id="ds-other",
+                ),
+            ),
+        )
+
+        await strategy.resolve("open claims and premium for 2024", "ns", context)
+
+        block = sql_generator.generate.call_args.kwargs["governed_metric"]
+        assert "FROM claims" in block
+        assert "policies" not in block
+
+    @pytest.mark.asyncio
     async def test_success_path_returns_strategy_result(self, strategy, sql_generator, firewall, query_executor):
         sql_generator.generate.return_value = _make_nl_to_sql_result()
         firewall.evaluate.return_value = _make_firewall_result()

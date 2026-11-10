@@ -999,13 +999,58 @@ class TestTier1ResidualQualifierGate:
         assert context.declined_metric is None
 
     @pytest.mark.asyncio
-    async def test_multi_metric_bypass_forwards_no_governed_definition(self):
-        """An ambiguous multi-metric question has no single authored definition to
-        forward — picking the first would be arbitrary."""
+    async def test_multi_metric_bypass_forwards_every_governed_definition(self):
+        """A question naming several governed metrics still never runs Tier 1, but
+        every definition reaches Tier 2 so none is re-derived from the schema."""
         orch, parts = _make_orchestrator(metric_found=True, return_parts=True)
-        orch._metric_resolver.match.return_value = _qualified_match("compare last year", match_count=2)
+        cost = _qualified_match("", metric_id="demo:cost", metric_name="cost", sql_template="SELECT sum(c) FROM costs")
+        orch._metric_resolver.match.return_value = _qualified_match(
+            "compare", match_count=2, others=[cost], combined_residual="compare last year"
+        )
 
-        await orch.resolve(InvokeRequest(query="compare revenue and cost last year", namespace="demo"))
+        response = await orch.resolve(InvokeRequest(query="compare revenue and cost last year", namespace="demo"))
+
+        orch._query_executor.execute.assert_not_awaited()
+        context = parts["strategy_resolve"].await_args.args[2]
+        declined = context.declined_metric
+        assert declined is not None
+        assert declined.metric_names == ["revenue", "cost"]
+        assert declined.unhandled_qualifier == "compare last year"
+        block = declined.prompt_block
+        assert "SELECT sum(amount) FROM orders" in block
+        assert "SELECT sum(c) FROM costs" in block
+        step = _find_step(response.result.trace, "t1.metric_match")
+        assert step.detail["metricNames"] == ["revenue", "cost"]
+        assert step.detail["governedDefinitionForwarded"] is True
+
+    @pytest.mark.asyncio
+    async def test_multi_metric_bypass_withholds_metrics_outside_the_grant(self):
+        """SECURITY: a forbidden metric named alongside a permitted one must not have
+        its formula forwarded. The question still proceeds, as before forwarding."""
+        orch, parts = _make_orchestrator(metric_found=True, return_parts=True)
+        cost = _qualified_match("", metric_id="demo:cost", metric_name="cost", sql_template="SELECT secret FROM costs")
+        orch._metric_resolver.match.return_value = _qualified_match("", match_count=2, others=[cost])
+        request = InvokeRequest(
+            query="compare revenue and cost", namespace="demo", profile={"allowedMetrics": ["revenue"]}
+        )
+
+        response = await orch.resolve(request)
+
+        context = parts["strategy_resolve"].await_args.args[2]
+        assert context.declined_metric is not None
+        assert context.declined_metric.metric_names == ["revenue"]
+        assert "secret" not in context.declined_metric.prompt_block
+        step = _find_step(response.result.trace, "t1.metric_match")
+        assert step.detail["withheldByGrant"] == 1
+
+    @pytest.mark.asyncio
+    async def test_multi_metric_bypass_forwards_nothing_when_no_metric_is_permitted(self):
+        orch, parts = _make_orchestrator(metric_found=True, return_parts=True)
+        cost = _qualified_match("", metric_id="demo:cost", metric_name="cost")
+        orch._metric_resolver.match.return_value = _qualified_match("", match_count=2, others=[cost])
+        request = InvokeRequest(query="compare revenue and cost", namespace="demo", profile={"allowedMetrics": []})
+
+        await orch.resolve(request)
 
         context = parts["strategy_resolve"].await_args.args[2]
         assert context.declined_metric is None
